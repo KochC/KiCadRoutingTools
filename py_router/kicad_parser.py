@@ -1804,6 +1804,73 @@ def _layer_table(content: str) -> Tuple[Dict[int, str], List[str]]:
     return layers, copper_layers
 
 
+def _stackup_block_span(content: str) -> Optional[Tuple[int, int]]:
+    """``(start, end)`` of the ``(stackup ...)`` block, paren-balanced, or None
+    when the content has none. ``end`` is ``len(content)`` when the block does
+    not close inside ``content`` (a truncated head of the file)."""
+    m = re.search(r'\(stackup(?=[\s)])', content)
+    if not m:
+        return None
+    return m.start(), find_matching_paren(content, m.start())
+
+
+def _stackup_number(text: str, token: str) -> float:
+    """The number of ``(token N)`` in ``text``, else 0.0. A dielectric whose
+    thickness the user locked is written ``(thickness 0.2104 locked)`` (#1222);
+    reading only the bare form parsed every locked dielectric as 0 mm."""
+    m = re.search(r'\(' + token + r'\s+([-+\d.eE]+)(?:\s+locked)?\s*\)', text)
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return 0.0
+
+
+def _combine_stackup_sheets(sheets: List[Tuple[float, float, float, str]]
+                            ) -> Tuple[float, float, float, str]:
+    """One ``(thickness, epsilon_r, loss_tangent, material)`` for a stackup
+    layer built from several sheets (#1222).
+
+    KiCad writes a core/prepreg made of several sheets (JLCPCB's 3 x 2116) as
+    ONE layer whose sheets are joined by ``addsublayer``; a consumer that sees
+    one `StackupLayer` per dielectric needs the whole layer. Thickness is the
+    sum. epsilon_r is the SERIES value ``sum(t) / sum(t / er)``: the field of a
+    trace crosses the sheets one after another, which is what the impedance
+    model prices. The loss tangent is weighted the same way, by ``t / er``.
+
+    Only DECLARED values are averaged. KiCad starts a sheet added with
+    ``addsublayer`` at epsilon_r 1.0 and loss tangent 0 (``DIELECTRIC_PRMS``'s
+    defaults; the layer's first sheet starts at FR4's 4.5 / 0.02) and writes
+    them as if they were values, so ``(epsilon_r 1)`` on a sheet named "2116"
+    is a field nobody filled in, not vacuum (stm32h7_hdmi: averaging it in
+    gives 2.3 for a 2116/7628/2116 prepreg). A sheet with epsilon_r <= 1, or
+    none, sits out of the epsilon_r average -- the same as taking the declared
+    sheets' value for it -- and a sheet with no positive loss tangent sits out
+    of that one. The material is the sheets' common name, or every sheet's
+    name joined by ``" + "`` when they differ. A single sheet comes back
+    exactly as read.
+    """
+    if len(sheets) == 1:
+        return sheets[0]
+    thickness = sum(s[0] for s in sheets)
+    rated = [s for s in sheets if s[0] > 0 and s[1] > 1.0]
+    if rated:
+        epsilon_r = sum(s[0] for s in rated) / sum(s[0] / s[1] for s in rated)
+    else:
+        epsilon_r = next((s[1] for s in sheets if s[1] > 0), 0.0)
+    lossy = [s for s in sheets if s[0] > 0 and s[2] > 0]
+    if lossy:
+        weights = [s[0] / (s[1] if s[1] > 1.0 else max(epsilon_r, 1.0))
+                   for s in lossy]
+        loss_tangent = sum(w * s[2] for w, s in zip(weights, lossy)) / sum(weights)
+    else:
+        loss_tangent = next((s[2] for s in sheets if s[2] > 0), 0.0)
+    names = [s[3] for s in sheets if s[3]]
+    material = names[0] if len(set(names)) == 1 else " + ".join(names)
+    return thickness, epsilon_r, loss_tangent, material
+
+
 def extract_stackup(content: str) -> List[StackupLayer]:
     """Extract board stackup information for impedance calculation and via barrel length.
 
@@ -1812,56 +1879,53 @@ def extract_stackup(content: str) -> List[StackupLayer]:
     - epsilon_r: dielectric constant (for dielectric layers)
     - loss_tangent: loss tangent (for dielectric layers)
     - material: material name
+
+    A layer made of several sheets (``addsublayer``) is combined into one
+    entry by `_combine_stackup_sheets` (#1222).
     """
     stackup = []
 
-    # Find the stackup section
-    stackup_match = re.search(r'\(stackup\s+(.*?)\n\s*\(copper_finish', content, re.DOTALL)
-    if not stackup_match:
-        # Try alternate pattern without copper_finish
-        stackup_match = re.search(r'\(stackup\s+(.*?)\n\s*\)\s*\n', content, re.DOTALL)
-
-    if not stackup_match:
+    span = _stackup_block_span(content)
+    if span is None:
         return stackup
+    stackup_text = content[span[0]:span[1]]
 
-    stackup_text = stackup_match.group(1)
+    # Each top-level (layer "name" ...) child, paren-balanced: the block holds
+    # every sheet of the layer, and its end does not depend on what follows.
+    layer_re = re.compile(r'\(layer\s+"([^"]+)"')
+    pos = 0
+    while True:
+        m = layer_re.search(stackup_text, pos)
+        if not m:
+            break
+        end = find_matching_paren(stackup_text, m.start())
+        layer_name, layer_content = m.group(1), stackup_text[m.end():end]
+        pos = end
 
-    # Parse each layer in stackup
-    # Pattern matches: (layer "name" (type "typename") (thickness value) ...)
-    # We need to handle multi-line layer definitions
-    layer_blocks = re.findall(r'\(layer\s+"([^"]+)"(.*?)(?=\(layer\s+"|$)', stackup_text, re.DOTALL)
-
-    for layer_name, layer_content in layer_blocks:
-        # Extract type
         type_match = re.search(r'\(type\s+"([^"]+)"\)', layer_content)
         layer_type = type_match.group(1) if type_match else 'unknown'
 
-        # Extract thickness (in mm)
-        thickness_match = re.search(r'\(thickness\s+([\d.]+)\)', layer_content)
-        thickness = float(thickness_match.group(1)) if thickness_match else 0.0
-
-        # Extract dielectric constant (epsilon_r)
-        epsilon_match = re.search(r'\(epsilon_r\s+([\d.]+)\)', layer_content)
-        epsilon_r = float(epsilon_match.group(1)) if epsilon_match else 0.0
-
-        # Extract loss tangent
-        loss_match = re.search(r'\(loss_tangent\s+([\d.]+)\)', layer_content)
-        loss_tangent = float(loss_match.group(1)) if loss_match else 0.0
-
-        # Extract material name
-        material_match = re.search(r'\(material\s+"([^"]+)"\)', layer_content)
-        material = material_match.group(1) if material_match else ""
-
         # Only include copper and dielectric layers (skip mask, silk, paste)
-        if layer_type in ('copper', 'core', 'prepreg'):
-            stackup.append(StackupLayer(
-                name=layer_name,
-                layer_type=layer_type,
-                thickness=thickness,
-                epsilon_r=epsilon_r,
-                loss_tangent=loss_tangent,
-                material=material
-            ))
+        if layer_type not in ('copper', 'core', 'prepreg'):
+            continue
+
+        sheets = []
+        for sheet in re.split(r'\baddsublayer\b', layer_content):
+            material_match = re.search(r'\(material\s+"([^"]+)"\)', sheet)
+            sheets.append((_stackup_number(sheet, 'thickness'),
+                           _stackup_number(sheet, 'epsilon_r'),
+                           _stackup_number(sheet, 'loss_tangent'),
+                           material_match.group(1) if material_match else ""))
+        thickness, epsilon_r, loss_tangent, material = _combine_stackup_sheets(sheets)
+
+        stackup.append(StackupLayer(
+            name=layer_name,
+            layer_type=layer_type,
+            thickness=thickness,
+            epsilon_r=epsilon_r,
+            loss_tangent=loss_tangent,
+            material=material
+        ))
 
     return stackup
 
@@ -4084,10 +4148,86 @@ def repair_bare_teardrop_tokens(content: str) -> Tuple[str, int]:
     return ''.join(parts), len(inserts)
 
 
+def reflow_one_line_board(content: str) -> Tuple[str, bool]:
+    """A board written (almost) on one line, laid out the way KiCad's own
+    formatter writes it: one list per line, tab-indented by depth, a list of
+    atoms inline (``(at 1 2)``), a ``(pts`` list's vertices on one line, and
+    every closing paren of a multi-line list on its own line.
+
+    KiCad reads both layouts, and SolderCAD's file validator writes the
+    one-line one (``...)(zone(net 1)...(layer "F.Cu" )...``). This parser's
+    readers were written against the multi-line layout: on one line the zone
+    iterator and the ``(layers`` table need a newline that is not there, and a
+    ``(layer "F.Cu" )`` with KiCad's unprettified trailing space defeats the
+    tight ``"\\)`` field patterns. Measured on the same routed board in both
+    layouts: zones 1 -> 0, copper layers 2 -> 0, board bounds and outline
+    gone, and a footprint's copper fp_poly (8 segments) dropped -- so
+    check_connected called a poured GND net broken and the router would have
+    seen no pours and no tab copper. Reflowing at the read boundary gives
+    every reader the layout it was written for. Only whitespace between
+    tokens changes; a file that already has its lines is returned unchanged.
+    """
+    if content.count('\n') * 20 >= content.count('('):
+        return content, False
+    root: list = []
+    stack = [root]
+    for tok in _TOKEN_POS_RE.findall(content):
+        if tok == '(':
+            node: list = []
+            stack[-1].append(node)
+            stack.append(node)
+        elif tok == ')':
+            if len(stack) == 1:
+                return content, False       # unbalanced: leave it to the readers
+            stack.pop()
+        else:
+            stack[-1].append(tok)
+    if len(stack) != 1:
+        return content, False
+
+    lines: List[str] = []
+
+    def inline(node) -> str:
+        return '(' + ' '.join(inline(c) if isinstance(c, list) else c
+                              for c in node) + ')'
+
+    def emit(node, depth):
+        pad = '\t' * depth
+        if not any(isinstance(c, list) for c in node):
+            lines.append(pad + inline(node))
+            return
+        head = []
+        for c in node:
+            if isinstance(c, list):
+                break
+            head.append(c)
+        children = node[len(head):]
+        lines.append(pad + '(' + ' '.join(head))
+        if head and head[0] == 'pts':
+            lines.append(pad + '\t' + ' '.join(
+                inline(c) if isinstance(c, list) else c for c in children))
+        else:
+            for c in children:
+                if isinstance(c, list):
+                    emit(c, depth + 1)
+                else:
+                    lines.append(pad + '\t' + c)
+        lines.append(pad + ')')
+
+    for top in root:
+        if isinstance(top, list):
+            emit(top, 0)
+        else:
+            lines.append(top)
+    return '\n'.join(lines) + '\n', True
+
+
 def read_board_text(path: str, quiet: bool = False) -> str:
     """A .kicad_pcb's text as KiCad reads it: `repair_bare_teardrop_tokens`
-    applied, with a one-line note when it changed anything (#1149). For every
-    reader that walks footprint or pad blocks by their parens."""
+    applied, with a one-line note when it changed anything (#1149), and a
+    one-line board reflowed into KiCad's multi-line layout
+    (`reflow_one_line_board`). For every reader that walks footprint or pad
+    blocks by their parens."""
     with open(path, 'r', encoding='utf-8') as f:
         content = f.read()
     content, n = repair_bare_teardrop_tokens(content)
@@ -4095,6 +4235,10 @@ def read_board_text(path: str, quiet: bool = False) -> str:
         print(f"NOTE: {n} teardrop token(s) in {os.path.basename(path)} lack their "
               f"opening paren; read the way KiCad reads them (#1149).",
               file=sys.stderr)
+    content, reflowed = reflow_one_line_board(content)
+    if reflowed and not quiet:
+        print(f"NOTE: {os.path.basename(path)} is written on one line; read in "
+              f"KiCad's multi-line layout.", file=sys.stderr)
     return content
 
 
@@ -8279,6 +8423,12 @@ def _extract_stackup_kipy(board) -> List[StackupLayer]:
         try:
             with open(board_file, "r", encoding="utf-8") as f:
                 content = f.read(8192)  # stackup lives near the top of the file
+                # ...but it can start past the head (a long title block) or
+                # run out of it (a deep stackup of multi-sheet dielectrics):
+                # read on rather than parse none or half of it (#1222).
+                span = _stackup_block_span(content)
+                if (span[1] >= len(content)) if span else ('(setup' not in content):
+                    content += f.read()
             stackup = extract_stackup(content)
         except Exception:
             pass

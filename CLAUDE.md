@@ -345,9 +345,12 @@ Validate routed boards against the *real* spec, with the right checker — most
     **This is the SUITE app only; do not generalise it to "the cloud".** The
     STRESS app carries KiCad BY DEFAULT since 2026-08-23:
     `cloud_replay_sets.py --with-kicad` (default true, `--no-kicad` opts out)
-    switches `modal_sweep/modal_app.py` onto `kicad/kicad:10.0.0` and PROVES
-    both front-ends at build time (`import pcbnew` + `kicad-cli version`), so
-    the oracle legs actually run; such a wave suffixes its label `-kc`.
+    switches `modal_sweep/modal_app.py` onto the image
+    `cloud_replay_sets.DEFAULT_KICAD_IMAGE` names and PROVES both front-ends at
+    build time (`import pcbnew` + `kicad-cli version`), so the oracle legs
+    actually run; such a wave suffixes its label `-kc`, or `-kc-<tag>` when
+    `KICAD_SWEEP_KICAD_IMAGE` picks another image, so two images never share an
+    arm.
     **The two defaults differ, so name the entry point:** `modal_app.py` read
     on its own defaults `KICAD_SWEEP_WITH_KICAD` OFF, while
     `cloud_replay_sets.py` -- the CLI you actually launch -- defaults it ON.
@@ -468,6 +471,11 @@ make them trustworthy -- notably: the baseline is the RECORDED RUNS re-graded
 (not an archived wave), grade both sides on the same terms, compare only boards
 that replayed an IDENTICAL chain, and **a two-board result is not a default
 change** (per-board spread is +-2..3 nets).
+**Per-net via sizes (#530) never run in those replays**: they are live only when
+route.py is given no `--via-size`, and 396 of the 403 recorded route steps pass
+one. A change that touches per-net vias is A/B'd with
+`tests/stress/pernet_via_ab.py`, which replays each board's recorded route step
+with `--via-size` stripped (176 boards qualify).
 
 **A new PLACEMENT objective term goes through `tests/test_placement_ab.py`
 before it ships on.** It runs the same board twice (flag off, flag on), writes
@@ -748,6 +756,8 @@ verified by `tests/run_doc_examples.py`. Quick reference:
 The project uses `kicad_parser` module to parse KiCad PCB files:
 
 ```python
+import sys
+sys.path.insert(0, "py_router")
 from kicad_parser import parse_kicad_pcb, Pad, Footprint, PCBData
 
 pcb = parse_kicad_pcb('path/to/file.kicad_pcb')
@@ -779,7 +789,10 @@ pcb = parse_kicad_pcb('path/to/file.kicad_pcb')
 - `pcb.board_info.stackup` - List[StackupLayer], ordered top to bottom
   (NOT `pcb.stackup`). Empty list if the board has no stackup section.
 - StackupLayer fields: `name`, `layer_type` ('copper', 'core', 'prepreg', ...),
-  `thickness` (mm), `epsilon_r`, `loss_tangent`, `material`
+  `thickness` (mm), `epsilon_r`, `loss_tangent`, `material`. A multi-sheet
+  dielectric (`addsublayer`) is ONE entry whose values combine every sheet
+  (#1222; the rule is in `docs/api-kicad-parser.md`) -- never re-read the
+  first `(thickness ...)` of a layer block yourself
 - `pcb.board_info.pad_to_paste_clearance` / `_ratio` - the board's paste
   margin, the last term of a pad's paste-margin resolution (#962)
 - `pcb.board_info.via_protection_setup` - the board's via protection policy,

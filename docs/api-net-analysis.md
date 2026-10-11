@@ -6,6 +6,10 @@
 - **`connectivity.py`** — questions about *copper*: which segments are
   connected, where stubs end, which pads still need connecting.
 
+Examples run from the repository root with the engine directory on the
+import path: `PYTHONPATH=py_router python3 your_script.py` (see the
+[overview](python-api.md)).
+
 ## `net_queries.py`
 
 ### Pattern matching
@@ -24,11 +28,15 @@ exclusion pattern. Exclusion-only lists match everything not excluded.
 
 ```python
 expand_net_patterns(pcb_data, patterns: List[str],
-                    exclude_unconnected: bool = True) -> List[str]
+                    exclude_unconnected: bool = True,
+                    quiet: bool = False) -> List[str]
 ```
 
 Expands patterns to the sorted list of actual net names on the board,
-dropping `unconnected-*` nets by default.
+dropping `unconnected-*` nets by default. It prints how many nets each
+wildcard matched; `quiet=True` prints only what is wrong with a pattern (it
+matched nothing, or an unqualified exclusion also took a namesake), for a
+caller that resolves many patterns and reports the totals itself.
 
 ```python
 from kicad_parser import parse_kicad_pcb
