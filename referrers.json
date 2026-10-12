@@ -1402,5 +1402,57 @@
    "referrer": "hackaday.io",
    "uniques": 9
   }
+ ],
+ "2026-10-12": [
+  {
+   "count": 554,
+   "referrer": "Google",
+   "uniques": 355
+  },
+  {
+   "count": 177,
+   "referrer": "forum.kicad.info",
+   "uniques": 142
+  },
+  {
+   "count": 168,
+   "referrer": "github.com",
+   "uniques": 94
+  },
+  {
+   "count": 168,
+   "referrer": "github-com.btglss.net",
+   "uniques": 68
+  },
+  {
+   "count": 74,
+   "referrer": "linkedin.com",
+   "uniques": 48
+  },
+  {
+   "count": 70,
+   "referrer": "DuckDuckGo",
+   "uniques": 37
+  },
+  {
+   "count": 36,
+   "referrer": "youtube.com",
+   "uniques": 28
+  },
+  {
+   "count": 30,
+   "referrer": "Bing",
+   "uniques": 25
+  },
+  {
+   "count": 24,
+   "referrer": "com.linkedin.android",
+   "uniques": 18
+  },
+  {
+   "count": 17,
+   "referrer": "hackaday.io",
+   "uniques": 9
+  }
  ]
 }
