@@ -104,6 +104,8 @@ def main():
     import shutil
     import tempfile
     _tmp = tempfile.mkdtemp(prefix='layer_costs_')
+    import atexit
+    atexit.register(shutil.rmtree, _tmp, True)
     board_path = os.path.join(_tmp, os.path.basename(BOARD))
     shutil.copy(BOARD, board_path)  # the fake board flushes commits
     _install_fake_board(board_path)

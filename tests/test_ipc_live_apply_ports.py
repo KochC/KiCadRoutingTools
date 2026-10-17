@@ -358,6 +358,8 @@ def test_placement_apply():
     with open(path, 'w', encoding='utf-8') as fh:
         fh.write(RESULT % {'fps': fps})
     result = parse_kicad_pcb(path)
+    import shutil
+    shutil.rmtree(td, ignore_errors=True)
 
     live_fps = {r: _fp(r, *p[0], locked=p[1]) for r, p in plan.items()}
     b = Board(nets=('GND', 'SIG'), footprints=list(live_fps.values()))
