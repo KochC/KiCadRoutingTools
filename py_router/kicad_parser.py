@@ -180,6 +180,12 @@ LEGACY_ARC_FORMATTING = 20210925
 LEGACY_NET_TIES = 20220815
 #: Files before this version wrote overbars as ~TEXT~ rather than ~{TEXT}.
 NEW_OVERBAR_NOTATION = 20210606
+#: Up to this version a footprint property is a bare name/value pair, and
+#: pcbnew's reader takes `(property "Sheetname" ...)` / `(property "Sheet
+#: name" ...)` (and the file pair) as the footprint's SHEET; from the next
+#: version on a property is a field and those names are ordinary user fields
+#: (probed on pcbnew 10.0.0: 20230619 reads them, 20230620 does not).
+SHEET_PROPERTIES_MAX_VERSION = 20230619
 
 #: The first board format with (footprint ...) blocks ("module -> footprint",
 #: KiCad 5.99). An older file -- KiCad 5, KiCad 4 -- writes (module ...) and
@@ -443,6 +449,18 @@ class Pad:
     # but short of the drill is not connected there.
     # connectivity.pad_unflashed_layers reads it. Set by BOTH parse paths.
     unconnected_layer_mode: str = 'keep_all'
+    # #1248: KiCad's PAD-TO-DIE length (`(die_length mm)`, PAD::
+    # GetPadToDieLength) and delay (`(die_delay ps)`, GetPadToDieDelay): the
+    # bond wire / package trace inside the part, which KiCad adds to the net's
+    # length in its tuners and its length/skew DRC. 0.0 = none declared. Set by
+    # BOTH parse paths. Consumers: net_queries.pad_to_die_length/_delay.
+    die_length: float = 0.0
+    die_delay: float = 0.0
+    # #1279: the name of the protected Kelvin sense branch (a KiCad group
+    # named `sense:<REF>.<PAD>`) this pad is a SENSE pad of, '' otherwise.
+    # Set by sense_branch.resolve_sense_branches on both parse paths; the
+    # router may never attach new copper to it.
+    sense: str = ""
 
 
 _VIA_BIRTH_WATCH = None
@@ -511,6 +529,23 @@ class Via:
     # matters most for via-in-pad, where IPC-4761 Type VII filled+capped+plated
     # is what keeps solder out of the barrel.
     tenting_attrs: Dict[str, str] = field(default_factory=dict)
+    # #1279: the protected sense branch (KiCad group `sense:<REF>.<PAD>`) this
+    # via is a member of, '' otherwise (see Pad.sense).
+    sense: str = ""
+    # #1279: the `sense:` group that holds this via immutable, '' otherwise
+    # (see Segment.held_by).
+    held_by: str = ""
+    # KiCad's via type: 'through', 'blind', 'buried' or 'micro', from the
+    # block's type word (text) or GetViaType() (pcbnew). It, not `layers`,
+    # says whether the via has copper on only part of the stack: KiCad loads
+    # a via block with NO type word as a THROUGH via whatever its `(layers ...)`
+    # says, and both parse paths then report its pair as F.Cu/B.Cu (the text
+    # parser snaps it, pcbnew already has). A Via the tool builds in-run is
+    # through unless given a type, whatever pair it carries -- the back-side
+    # BGA fanout's through vias used to carry `["B.Cu", "In6.Cu"]`. Read a
+    # via's copper through geometry_utils.via_on_layer / via_copper_layers,
+    # never off this pair.
+    via_type: str = "through"
 
 
     def __post_init__(self):
@@ -588,6 +623,22 @@ class Segment:
     # check_drc graded the short clean. The obstacle map stamps this interior
     # and check_drc grades containment in it.
     graphic_ring: Optional[Tuple[Tuple[float, float], ...]] = None
+    # #1279: the protected sense branch (KiCad group `sense:<REF>.<PAD>`) this
+    # track is a member of, '' otherwise (see Pad.sense).
+    sense: str = ""
+    # #1279: the `sense:` group that holds this track immutable, '' otherwise.
+    # Set on a group's member copper whenever it resolves on the join pad's
+    # net, protected or refused, so no pass moves, rewrites or removes the
+    # declared sense copper. It is not `locked`: nothing writes it to the file,
+    # and it does not make the net never-rippable (only the net's pre-existing
+    # copper is spared from whole-net strips, protected_nets.protection_map).
+    held_by: str = ""
+
+
+def is_immutable_copper(item) -> bool:
+    """True for a track or via no pass may move, rewrite or remove: KiCad-
+    locked copper (#1261) or copper a `sense:` group holds (#1279)."""
+    return bool(getattr(item, 'locked', False) or getattr(item, 'held_by', ''))
 
 
 @dataclass
@@ -607,6 +658,30 @@ class Zone:
     in_footprint: bool = False  # #478: zone is owned by a footprint (nested in its
     # (footprint ...) block). Points are still BOARD coordinates. Consumers treat it
     # as normal copper/keep-out; plane creation must not replace or abort on it.
+    teardrop: bool = False  # #1164: KiCad's (attr (teardrop ...)) -- a GENERATED
+    # teardrop area where a track meets a pad or via. Routing output, like a
+    # track: KiCad regenerates it on refill, and it sits on its pad's old pose.
+    # #1279: the zone's CUT-OUTS. KiCad's file holds one outline per zone and
+    # every later (polygon ...) block in it is a hole in that outline (pcbnew
+    # loads it so: OutlineCount 1, HoleCount(0) = the rest; writing a second
+    # outline drops it). The fill never enters a hole. Both parse paths fill
+    # it; `polygon` stays the outline alone.
+    holes: List[List[Tuple[float, float]]] = field(default_factory=list)
+
+
+def pour_zones(zones):
+    """Every zone but KiCad's generated TEARDROP areas: the zones that say
+    "this net POURS here".
+
+    A teardrop (`Zone.teardrop`) is real copper, and the obstacle map, DRC and
+    connectivity keep reading it through `pcb.zones`. But it is routing output
+    on whatever net the track carries, not a pour, so a consumer deciding "is
+    this net a plane / poured net" must ask this instead: counted as a pour, a
+    teardropped signal net read as a plane net (never rip-eligible, skipped
+    by --force-reroute, handed to the plane finalize), and a GND teardrop on
+    F.Cu read as "GND already pours on F.Cu", so route_planes kept the pour it
+    was asked to create."""
+    return [z for z in (zones or ()) if not getattr(z, 'teardrop', False)]
 
 
 @dataclass
@@ -722,6 +797,16 @@ class Footprint:
     # parse paths fill them; APPENDED like the fields above.
     attrs: Tuple[str, ...] = ()
     has_model: bool = False
+    # #1211: the schematic sheet this footprint's symbol sits on, as the FILE
+    # spells it -- the human name beside `sheet_path`'s uuids. KiCad 8+ writes
+    # header tokens `(sheetname "/CH1/")` / `(sheetfile "strip.kicad_sch")`;
+    # KiCad 6/7 wrote `(property "Sheetname" "CH1")` / `(property "Sheetfile"
+    # ...)`, and the VALUE differs too (a full path "/CH1/" on some boards,
+    # the bare name "IO_Buffer_B" on others). Not normalised: pcbnew's
+    # GetSheetname()/GetSheetfile() return the same spelling, so both parse
+    # paths agree string for string. '' = the file names no sheet. Appended.
+    sheet_name: str = ""
+    sheet_file: str = ""
 
 
 #: The (attr ...) flags `Footprint.attrs` keeps -- the ones the text form and
@@ -776,7 +861,7 @@ class BoardInfo:
     # inside the panel frame -- dropping it outright let the router lay copper
     # straight across the milled gap between the two keyboard halves (85 items).
     board_edge_contours: List[List[Tuple[float, float]]] = field(default_factory=list)
-    keepouts: List[dict] = field(default_factory=list)  # Keep-out rule areas: {polygon, layers:set, tracks_allowed, vias_allowed, copper_pour_allowed}
+    keepouts: List[dict] = field(default_factory=list)  # Keep-out rule areas: {polygon, layers:set, tracks_allowed, vias_allowed, copper_pour_allowed, name}
     # Smallest copper clearance any routing step actually used on this board this
     # run -- e.g. a fine-pitch tap that escalated below the nominal --clearance.
     # None until a step records one. Routers fold this into the .kicad_pro DRC
@@ -848,8 +933,20 @@ class PCBData:
     # steps lowered live in pcbnew's memory (update_live_drc_floors), and a
     # PCBData the GUI built before a step's writeback is still in use after it
     # -- a value captured at build time read the pre-writeback floor there.
-    # None = read the file (parse_kicad_pcb).
+    # None = read the file (parse_kicad_pcb). It also answers
+    # min_hole_clearance, the copper-to-hole floor obstacle_map prices NPTH
+    # holes at (declared_hole_clearance). It answers only the rules the live
+    # board DECLARES (fix_kicad_drc_settings.live_declared_rules): pcbnew's
+    # factory stand-ins on a project-less board are left out, as the file
+    # leaves them out.
     live_rules_provider: object = None
+    # Callable returning the LIVE board's kicad_routing_tools records (the
+    # fab-floor origin, protected nets, impedance specs, pour promises, ...):
+    # the newer of its project's copy and the copy on the board itself
+    # (tool_records.live_namespace), read when called. The GUI keeps them on
+    # the board because KiCad's own project save drops what was written into
+    # the .kicad_pro after load. None = read the files (parse_kicad_pcb).
+    live_records_provider: object = None
     # #459: KiCad (group "name" (uuid ...) (members <uuid> ...)) blocks, as
     # {group name: [footprint reference, ...]}. The designer's own statement that
     # these parts belong together, so placement grouping ranks it above any
@@ -885,6 +982,12 @@ class PCBData:
     #: copper, which the writer relocates to silk, #146) or 'curve' (bezier).
     #: Filled by both parse paths.
     graphic_copper_unmeasured: List[dict] = field(default_factory=list)
+    #: #1279: protected Kelvin sense branches, one per KiCad group named
+    #: `sense:<REF>.<PAD>` (sense_branch.SenseBranch). Separate from `groups`,
+    #: which holds footprint members only (#459). Resolved against the parsed
+    #: tracks and vias by uuid on BOTH parse paths; a branch that cannot be
+    #: protected carries its `reason`.
+    sense_branches: list = field(default_factory=list)
 
     def net_tie_exempt_pad_ids(self, net_id: int):
         """id()s of pads whose keep-out copper of `net_id` may IGNORE.
@@ -1044,6 +1147,14 @@ _PTS_ARC_RE = (r'\((?:gr_)?arc\s+\(start\s+(-?[\d.]+)\s+(-?[\d.]+)\)\s+'
                r'\(end\s+(-?[\d.]+)\s+(-?[\d.]+)\)')
 
 
+def _rect_corner_radius(block: str, w: float, h: float) -> float:
+    """A rect primitive's KiCad 9 corner `(radius r)`, clamped (as KiCad
+    clamps it) just under half the shorter side; 0 when absent."""
+    m = re.search(r'\(radius\s+(%s)\)' % r'-?[\d.]+(?:[eE][-+]?\d+)?', block)
+    r = float(m.group(1)) if m else 0.0
+    return max(0.0, min(r, min(abs(w), abs(h)) / 2.0 - 1e-6))
+
+
 def _custom_pad_primitive_points(pad_text: str):
     """Per-primitive (points, half_stroke) tuples from a custom pad's
     (primitives ...) block, in the pad's local frame. Arcs (gr_poly pts arcs
@@ -1085,8 +1196,17 @@ def _custom_pad_primitive_points(pad_text: str):
             sm = re.search(r'\(start\s+(-?[\d.]+)\s+(-?[\d.]+)\)\s+\(end\s+(-?[\d.]+)\s+(-?[\d.]+)\)', block)
             if sm:
                 x1, y1, x2, y2 = map(float, sm.groups())
-                pts += [(x1, y1), (x2, y2)] if m2.group(1) == 'line' else \
-                       [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+                if m2.group(1) == 'line':
+                    pts += [(x1, y1), (x2, y2)]
+                else:
+                    # A rounded corner (KiCad 9 `(radius r)`): the inset
+                    # corners plus r, which is the exact extent.
+                    x1, x2 = min(x1, x2), max(x1, x2)
+                    y1, y2 = min(y1, y2), max(y1, y2)
+                    rr = _rect_corner_radius(block, x2 - x1, y2 - y1)
+                    x1, y1, x2, y2 = x1 + rr, y1 + rr, x2 - rr, y2 - rr
+                    hw += rr
+                    pts += [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
         if pts:
             out.append((pts, hw))
     return out
@@ -1130,14 +1250,147 @@ def _offset_polygon_outward(pts, hw):
     return out
 
 
+def _round_join_steps(sweep: float, r: float, eps: float = 0.001) -> int:
+    """Chords for an INSCRIBED arc of radius `r` over `sweep` radians with a
+    sagitta of at most `eps` mm (the pad-primitive budget, run-4 B6)."""
+    if r <= eps:
+        return 1
+    step = 2.0 * math.acos(max(-1.0, min(1.0, 1.0 - eps / r)))
+    return max(1, min(64, int(math.ceil(abs(sweep) / step)))) if step > 0 else 64
+
+
+def _offset_polygon_round(pts, hw):
+    """A closed polygon grown by ``hw`` with ROUND joins: its Minkowski sum
+    with a disc, which is the copper KiCad builds for a filled polygon stroked
+    at ``2*hw`` (EDA_SHAPE::TransformShapeToPolygon inflates with
+    ROUND_ALL_CORNERS). A convex vertex gets an inscribed arc between its two
+    edge offsets; a reflex vertex the offsets' intersection, which is exact
+    there. `_offset_polygon_outward`'s miter at a convex corner reached up to
+    4*hw past the real copper (laser_backplane_dvi J8.2: 18 um)."""
+    n = len(pts)
+    if n < 3 or hw <= 0:
+        return pts
+    area2 = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1]
+                for i in range(n))
+    sign = 1.0 if area2 > 0 else -1.0
+    normals = []
+    for i in range(n):
+        dx = pts[(i + 1) % n][0] - pts[i][0]
+        dy = pts[(i + 1) % n][1] - pts[i][1]
+        length = math.hypot(dx, dy)
+        normals.append((sign * dy / length, -sign * dx / length)
+                       if length > 1e-12 else None)
+    out = []
+    for i in range(n):
+        n0, n1 = normals[i - 1], normals[i]
+        if n0 is None or n1 is None:
+            v = n0 or n1
+            out.append((pts[i][0] + v[0] * hw, pts[i][1] + v[1] * hw) if v else pts[i])
+            continue
+        turn = math.atan2(n0[0] * n1[1] - n0[1] * n1[0], n0[0] * n1[0] + n0[1] * n1[1])
+        if turn * sign > 1e-9:          # convex: the disc rounds this corner
+            a0 = math.atan2(n0[1], n0[0])
+            m = _round_join_steps(turn, hw)
+            for k in range(m + 1):
+                a = a0 + turn * k / m
+                out.append((pts[i][0] + hw * math.cos(a), pts[i][1] + hw * math.sin(a)))
+        else:                           # reflex or straight: the offsets meet
+            bx, by = n0[0] + n1[0], n0[1] + n1[1]
+            length = math.hypot(bx, by)
+            if length < 1e-12:
+                out.append((pts[i][0] + n1[0] * hw, pts[i][1] + n1[1] * hw))
+                continue
+            bx, by = bx / length, by / length
+            cos_half = max(0.25, bx * n0[0] + by * n0[1])
+            out.append((pts[i][0] + bx * hw / cos_half, pts[i][1] + by * hw / cos_half))
+    return out
+
+
+def _stroke_band(pts, hw):
+    """A stroked polyline's copper as ONE ring with ROUND caps, as KiCad
+    strokes a line or an arc: both sides offset by ``hw`` (per-vertex
+    averaged normals) and an inscribed half-disc round each end. The square
+    cap this replaced reached ``hw*(sqrt(2)-1)`` past the round one at a
+    corner (cm4_baseboard H101's 0.2 mm arc strokes: 17 um past pcbnew's
+    copper)."""
+    if len(pts) < 2 or hw <= 0:
+        return None
+    normals = []
+    for i in range(len(pts)):
+        acc_x = acc_y = 0.0
+        for j in (i - 1, i):
+            if 0 <= j < len(pts) - 1:
+                dx = pts[j + 1][0] - pts[j][0]
+                dy = pts[j + 1][1] - pts[j][1]
+                L = math.hypot(dx, dy)
+                if L > 1e-12:
+                    acc_x += -dy / L
+                    acc_y += dx / L
+        L = math.hypot(acc_x, acc_y)
+        normals.append((acc_x / L, acc_y / L) if L > 1e-12 else (0.0, 1.0))
+    left = [(p[0] + n[0] * hw, p[1] + n[1] * hw) for p, n in zip(pts, normals)]
+    right = [(p[0] - n[0] * hw, p[1] - n[1] * hw) for p, n in zip(pts, normals)]
+    m = max(2, _round_join_steps(math.pi, hw))
+
+    def cap(c, nx, ny):
+        # From +n through the outward tangent to -n (n is the tangent turned
+        # +90 deg, so decreasing angle passes the tangent first).
+        a0 = math.atan2(ny, nx)
+        return [(c[0] + hw * math.cos(a0 - math.pi * k / m),
+                 c[1] + hw * math.sin(a0 - math.pi * k / m)) for k in range(1, m)]
+    return (left + cap(pts[-1], *normals[-1]) + right[::-1]
+            + cap(pts[0], -normals[0][0], -normals[0][1]))
+
+
+def _custom_anchor_kind(pad_text: str) -> str:
+    """'rect' or 'circle': a custom pad's anchor shape. KiCad's default anchor
+    is a circle; the file writes `(options ... (anchor rect))` otherwise."""
+    am = re.search(r'\(anchor\s+(\w+)\)', pad_text)
+    return 'rect' if am and am.group(1) == 'rect' else 'circle'
+
+
+def _custom_copper_is_anchor(pad_text: str, anchor_x: float, anchor_y: float,
+                             eps: float = 1e-4) -> bool:
+    """Is a custom pad's copper exactly its ANCHOR -- no primitive, or every
+    primitive inside the anchor shape?
+
+    Such a pad is its anchor rect (or circle), so it takes an ordinary pad's
+    size and residual tilt (`_resolve_pad_rect`) rather than the board-frame
+    box a custom pad with real primitives gets. awkb_36_split U1's 0.25 x 1
+    anchors at 187.5 deg and len42_filter2 SW1.3's 4.572 x 0.406 anchor at 333
+    deg carry `(primitives)` and nothing else. `build_pcb_data_from_board`
+    asks the same question of pcbnew's pad-frame merged copper. A primitive
+    this parser does not model (`gr_curve`) is never assumed inside."""
+    pm = re.search(r'\(primitives\b', pad_text)
+    if not pm:
+        return True
+    prim = pad_text[pm.start():find_matching_paren(pad_text, pm.start())]
+    if re.search(r'\(gr_(?!(?:poly|circle|rect|line|arc)\b)\w', prim):
+        return False
+    hx, hy = anchor_x / 2.0, anchor_y / 2.0
+    rect = _custom_anchor_kind(pad_text) == 'rect'
+    r = min(hx, hy)
+    for pts, hw in _custom_pad_primitive_points(pad_text):
+        for vx, vy in pts:
+            if rect:
+                if abs(vx) + hw > hx + eps or abs(vy) + hw > hy + eps:
+                    return False
+            elif math.hypot(vx, vy) + hw > r + eps:
+                return False
+    return True
+
+
 def _custom_pad_board_extent(pad_text: str, abs_rotation_deg: float,
                              anchor_x: float, anchor_y: float) -> Tuple[float, float]:
     """Board-frame half-extents (|x|, |y|) of a custom pad's copper about its
-    anchor: primitive points (per-primitive stroke half-width) plus the anchor
-    rect's corners, all rotated by the pad's ABSOLUTE angle (KiCad negate
-    convention). Matches build_pcb_data_from_board's symmetric bounding box, so
-    a 27deg/45deg custom pad models the same axis-aligned copper on both paths
-    (sofle_pico D26/LED*, eurorack_pmod U1). Returns (0, 0) with no primitives.
+    anchor: primitive points (per-primitive stroke half-width) plus the ANCHOR
+    SHAPE -- a rect's corners, a circle's radius -- all rotated by the pad's
+    ABSOLUTE angle (KiCad negate convention). Matches build_pcb_data_from_board's
+    symmetric box about the copper centre, so a 27deg/45deg custom pad models
+    the same axis-aligned copper on both paths (sofle_pico D26/LED*,
+    eurorack_pmod U1). A circle anchor used to count its bounding RECT's
+    corners, 23 um past the copper on awkb_36_split SW16 at 345 deg. Returns
+    (0, 0) with no primitives.
     """
     prims = _custom_pad_primitive_points(pad_text)
     if not prims:
@@ -1146,7 +1399,12 @@ def _custom_pad_board_extent(pad_text: str, abs_rotation_deg: float,
     cos_r, sin_r = math.cos(rad), math.sin(rad)
     ext_x = ext_y = 0.0
     hx, hy = anchor_x / 2.0, anchor_y / 2.0
-    prims = prims + [([(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)], 0.0)]
+    if _custom_anchor_kind(pad_text) == 'rect':
+        prims = prims + [([(-hx, -hy), (hx, -hy), (hx, hy), (-hx, hy)], 0.0)]
+    else:
+        # A centre point plus its radius: rotation-invariant, as the circle
+        # primitives above. Same radius as the anchor polygon.
+        prims = prims + [([(0.0, 0.0)], min(hx, hy))]
     for pts, hw in prims:
         for vx, vy in pts:
             bx = vx * cos_r - vy * sin_r
@@ -1228,35 +1486,6 @@ def _custom_pad_global_polygons(pad_text: str, global_x: float, global_y: float,
         m = re.search(r'\(width\s+(-?[\d.]+)\)', block)
         return float(m.group(1)) if m else 0.0
 
-    def _stroke_band(pts, hw):
-        """Polygon for a stroked polyline: offset +-hw using per-vertex averaged
-        normals, ends extended by hw (square cap covers the round cap)."""
-        if len(pts) < 2 or hw <= 0:
-            return None
-        # extend ends along their tangents so the cap is covered
-        (x0, y0), (x1, y1) = pts[0], pts[1]
-        d0 = math.hypot(x1 - x0, y1 - y0) or 1.0
-        pts = [(x0 - (x1 - x0) / d0 * hw, y0 - (y1 - y0) / d0 * hw)] + pts[1:]
-        (xa, ya), (xb, yb) = pts[-2], pts[-1]
-        d1 = math.hypot(xb - xa, yb - ya) or 1.0
-        pts = pts[:-1] + [(xb + (xb - xa) / d1 * hw, yb + (yb - ya) / d1 * hw)]
-        normals = []
-        for i in range(len(pts)):
-            acc_x = acc_y = 0.0
-            for j in (i - 1, i):
-                if 0 <= j < len(pts) - 1:
-                    dx = pts[j + 1][0] - pts[j][0]
-                    dy = pts[j + 1][1] - pts[j][1]
-                    L = math.hypot(dx, dy)
-                    if L > 1e-12:
-                        acc_x += -dy / L
-                        acc_y += dx / L
-            L = math.hypot(acc_x, acc_y)
-            normals.append((acc_x / L, acc_y / L) if L > 1e-12 else (0.0, 0.0))
-        left = [(p[0] + n[0] * hw, p[1] + n[1] * hw) for p, n in zip(pts, normals)]
-        right = [(p[0] - n[0] * hw, p[1] - n[1] * hw) for p, n in zip(pts, normals)]
-        return left + right[::-1]
-
     polys = []
     # Iterate primitives in order; one polygon per primitive, transformed to global.
     for pm2 in re.finditer(r'\(gr_(poly|circle|rect|line|arc)\b', prim):
@@ -1284,13 +1513,14 @@ def _custom_pad_global_polygons(pad_text: str, global_x: float, global_y: float,
             if local:
                 # KiCad strokes the gr_poly OUTLINE with its (width ...) --
                 # for filled and unfilled polys alike -- so copper reaches
-                # width/2 beyond the outline (#418). Offset the outline
-                # outward by that half-stroke. An unfilled poly's interior
-                # is not really copper, but the filled-outline model is kept
-                # (conservative, and exact for clearance to external copper).
+                # width/2 beyond the outline (#418). Grow the outline by that
+                # half-stroke with ROUND corners, as KiCad does. An unfilled
+                # poly's interior is not really copper, but the filled-outline
+                # model is kept (conservative, and exact for clearance to
+                # external copper).
                 hw = _width(block) / 2.0
                 if hw > 0:
-                    local = _offset_polygon_outward(local, hw)
+                    local = _offset_polygon_round(local, hw)
         elif kind == 'circle':
             c = _field(block, 'center', 2)
             e = _field(block, 'end', 2)
@@ -1312,16 +1542,14 @@ def _custom_pad_global_polygons(pad_text: str, global_x: float, global_y: float,
                 filled = not re.search(r'\(fill\s+(?:no|none)\b', block)
                 r_in = 0.0 if filled else max(0.0, r_mid - hw)
                 if R > 0:
-                    # REVERTED to main's fixed inscribed 32-gon. The adaptive
-                    # version (run-4 B6) was more accurate -- ~2.4um radial
-                    # error at r=0.5 vs 1um sagitta -- but it sits in the
-                    # PARSER, so it moved obstacle geometry and DRC grading
-                    # together on every board with circle-primitive custom
-                    # pads, which makes cross-era comparisons on those boards
-                    # unresolvable by re-grading (both sides shift). Restore
-                    # if the accuracy is wanted, but land it as a deliberate,
-                    # measured baseline change rather than a silent one.
-                    N = 32
+                    # An inscribed 32-gon, made finer only where it would sit
+                    # more than pcbnew's own 5 um max error inside the circle
+                    # (R > 1.038 mm): there the two parse paths disagreed by
+                    # up to 13 um (kirdy_laser_drv H1..H8's 2.75 mm rings,
+                    # reterminal_em J6/J7). Every smaller circle keeps its
+                    # 32-gon, so the geometry of most boards does not move
+                    # (run-4 B6's 1 um adaptive version moved all of them).
+                    N = _adaptive_circle_n(R, eps=0.005, lo=32, hi=128)
                     outer = [(c[0] + R * math.cos(2 * math.pi * k / N),
                               c[1] + R * math.sin(2 * math.pi * k / N))
                              for k in range(N)]
@@ -1337,9 +1565,16 @@ def _custom_pad_global_polygons(pad_text: str, global_x: float, global_y: float,
             e = _field(block, 'end', 2)
             if s and e:
                 hw = _width(block) / 2.0
-                x0, x1 = min(s[0], e[0]) - hw, max(s[0], e[0]) + hw
-                y0, y1 = min(s[1], e[1]) - hw, max(s[1], e[1]) + hw
-                local = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+                x0, x1 = min(s[0], e[0]), max(s[0], e[0])
+                y0, y1 = min(s[1], e[1]), max(s[1], e[1])
+                # The stroke rounds the corners, as on a gr_poly, and so does
+                # a KiCad 9 corner `(radius r)` (rp2350_fpga_eensy U5: r 0.05,
+                # drawn sharp it reached 21 um past pcbnew's copper): the rect
+                # inset by r, grown by r plus the half-stroke.
+                rr = _rect_corner_radius(block, x1 - x0, y1 - y0)
+                local = _offset_polygon_round(
+                    [(x0 + rr, y0 + rr), (x1 - rr, y0 + rr), (x1 - rr, y1 - rr),
+                     (x0 + rr, y1 - rr)], hw + rr)
         elif kind == 'arc':
             # 3-point arc stroke: linearize the centerline, offset into a band.
             # chord_eps: pad-primitive arcs get the same 1um chord tolerance
@@ -1359,17 +1594,9 @@ def _custom_pad_global_polygons(pad_text: str, global_x: float, global_y: float,
             e = _field(block, 'end', 2)
             if s and e:
                 hw = _width(block) / 2.0 or 1e-6
-                dx, dy = e[0] - s[0], e[1] - s[1]
-                L = math.hypot(dx, dy)
-                if L > 0:
-                    ux, uy = dx / L, dy / L          # along
-                    px, py = -uy, ux                 # perpendicular
-                    # Capsule approximated by its oriented bounding rectangle:
-                    # extend each end by hw and offset +/- hw perpendicular.
-                    sx, sy = s[0] - ux * hw, s[1] - uy * hw
-                    ex, ey = e[0] + ux * hw, e[1] + uy * hw
-                    local = [(sx + px * hw, sy + py * hw), (ex + px * hw, ey + py * hw),
-                             (ex - px * hw, ey - py * hw), (sx - px * hw, sy - py * hw)]
+                if math.hypot(e[0] - s[0], e[1] - s[1]) > 0:
+                    # The capsule itself, round caps and all.
+                    local = _stroke_band([s, e], hw)
         if local:
             polys.append(to_global(local))
 
@@ -1463,6 +1690,65 @@ def layer_list_tokens(body: str) -> List[str]:
             for quoted, bare in _LAYER_LIST_TOKEN_RE.findall(body)]
 
 
+#: Every copper layer a KiCad layer set can hold, in the order the pcbnew
+#: builder (`build_pcb_data_from_board.get_pad_layers`) lists them.
+ALL_COPPER_LAYER_NAMES = ('F.Cu', 'B.Cu') + tuple('In%d.Cu' % i for i in range(1, 31))
+#: KiCad's layer-SET tokens whose two-sided form the pcbnew builder spells
+#: as a wildcard of its own, and the members it stands for.
+_PAD_LAYER_PAIRS = {'*.Mask': ('F.Mask', 'B.Mask'), '*.Paste': ('F.Paste', 'B.Paste'),
+                    '*.SilkS': ('F.SilkS', 'B.SilkS')}
+_PAD_LAYER_PAIR_OF = {m: w for w, ms in _PAD_LAYER_PAIRS.items() for m in ms}
+#: The layer-set tokens KiCad's reader accepts that the pcbnew builder lists
+#: member by member (pcbnew's `m_layerMasks`, probed on 10.0.0).
+_PAD_LAYER_SETS = {'F&B.Cu': ('F.Cu', 'B.Cu'),
+                   '*In.Cu': ALL_COPPER_LAYER_NAMES[2:],
+                   '*.Adhes': ('F.Adhes', 'B.Adhes'),
+                   '*.Fab': ('F.Fab', 'B.Fab'),
+                   '*.CrtYd': ('F.CrtYd', 'B.CrtYd')}
+
+
+def canonical_pad_layers(tokens: Sequence[str], board_copper: Sequence[str] = (),
+                         plated_through: bool = False) -> List[str]:
+    """A pad's `(layers ...)` tokens as the layer SET pcbnew loads, spelled the
+    way the pcbnew builder lists it, so `Pad.layers` is the same set on both
+    parse paths.
+
+    - The set tokens expand: `F&B.Cu` -> F.Cu + B.Cu, `*In.Cu` -> In1..In30,
+      `*.Adhes` / `*.Fab` / `*.CrtYd` -> their F/B members. `*.Mask`,
+      `*.Paste` and `*.SilkS` stay wildcards, and two explicit members of one
+      of them collapse to it; every copper layer KiCad has collapses to `*.Cu`,
+      and a name `*.Cu` already covers is dropped (glasgow J10 lists `*.Cu`
+      and In3..In30 both).
+    - A PLATED through-hole pad also takes every copper layer of the board
+      (`board_copper`): pcbnew's loader puts a PTH pad on all of them whatever
+      the file lists (probed on 10.0.0: `(layers "B.Cu" "B.Mask")` on a
+      4-layer board loads as F.Cu, In1.Cu, In2.Cu, B.Cu, B.Mask). An NPTH pad
+      keeps what it declares.
+
+    First-appearance order is kept, so a pad that names none of these tokens
+    keeps its list exactly as the file spells it."""
+    names: List[str] = []
+    for tok in tokens:
+        if tok == '*.Cu':
+            names.extend(ALL_COPPER_LAYER_NAMES)
+        else:
+            names.extend(_PAD_LAYER_SETS.get(tok) or _PAD_LAYER_PAIRS.get(tok) or (tok,))
+    if plated_through:
+        names.extend(board_copper)
+    have = set(names)
+    all_copper = have.issuperset(ALL_COPPER_LAYER_NAMES)
+    out: List[str] = []
+    for n in names:
+        if all_copper and n in ALL_COPPER_LAYER_NAMES:
+            n = '*.Cu'
+        elif n in _PAD_LAYER_PAIR_OF and have.issuperset(
+                _PAD_LAYER_PAIRS[_PAD_LAYER_PAIR_OF[n]]):
+            n = _PAD_LAYER_PAIR_OF[n]
+        if n not in out:
+            out.append(n)
+    return out
+
+
 def map_layer_list_tokens(body: str, fn) -> str:
     """BODY with every layer name replaced by ``fn(name)``, each keeping the
     spelling it had: a quoted name stays quoted, a bare one stays bare."""
@@ -1511,6 +1797,77 @@ def unconnected_layer_mode_from_pcbnew(pad) -> str:
                 else 'remove_all')
     except Exception:
         return 'keep_all'
+
+
+_DIE_LENGTH_RE = re.compile(r'\(die_length\s+(-?[\d.]+(?:[eE][-+]?\d+)?)\s*\)')
+_DIE_DELAY_RE = re.compile(r'\(die_delay\s+(-?[\d.]+(?:[eE][-+]?\d+)?)\s*\)')
+
+
+def pad_to_die_from_text(pad_text: str) -> Tuple[float, float]:
+    """A pad block's (die_length mm, die_delay ps); (0.0, 0.0) when unset (#1248).
+
+    KiCad writes each only when non-zero (pcb_io_kicad_sexpr). `die_delay` is
+    in ps in every file version: read up to 20250926 as board units and after
+    it as TIME units, both scale the file value by 1e6 IU, and pcbIUScale's
+    IU_PER_PS is 1e6 (probed on pcbnew 10.0.0: SetPadToDieDelay(12345) saves
+    `(die_delay 0.012345)`).
+    """
+    m = _DIE_LENGTH_RE.search(pad_text)
+    d = _DIE_DELAY_RE.search(pad_text)
+    return (float(m.group(1)) if m else 0.0, float(d.group(1)) if d else 0.0)
+
+
+def pad_to_die_from_pcbnew(pad) -> Tuple[float, float]:
+    """The pcbnew twin of pad_to_die_from_text: (mm, ps). KiCad 9 has no
+    delay getter, so its delay reads 0.0, as that KiCad's file would."""
+    try:
+        length = pad.GetPadToDieLength() / 1e6
+    except Exception:
+        length = 0.0
+    try:
+        import pcbnew
+        per_ps = float(getattr(getattr(pcbnew, 'pcbIUScale', None),
+                               'IU_PER_PS', 1e6))
+        delay = pad.GetPadToDieDelay() / per_ps
+    except Exception:
+        delay = 0.0
+    return length, delay
+
+
+def _pcbnew_custom_copper_is_anchor(pad, to_mm, eps: float = 1e-4) -> bool:
+    """`_custom_copper_is_anchor` for a live pcbnew custom pad: every vertex of
+    its PAD-FRAME merged copper (`MergePrimitivesAsPolygon`: anchor plus
+    primitives, about the anchor, orientation 0) lies inside the anchor shape.
+    The farthest point of a polygon from a convex shape is a vertex, so this
+    is the text path's test asked of pcbnew's own copper. False when pcbnew
+    cannot say."""
+    try:
+        import pcbnew as _pn
+        layer = pad.GetLayer()
+        sps = _pn.SHAPE_POLY_SET()
+        pad.MergePrimitivesAsPolygon(layer, sps)
+        try:
+            a = pad.GetSize(layer)
+            circle = pad.GetAnchorPadShape(layer) == getattr(_pn, 'PAD_SHAPE_CIRCLE', 0)
+        except TypeError:       # pre-padstack API: no layer argument
+            a = pad.GetSize()
+            circle = pad.GetAnchorPadShape() == getattr(_pn, 'PAD_SHAPE_CIRCLE', 0)
+        hx, hy = to_mm(a.x) / 2.0, to_mm(a.y) / 2.0
+        r = min(hx, hy)
+        n = 0
+        for oi in range(sps.OutlineCount()):
+            ol = sps.Outline(oi)
+            for i in range(ol.PointCount()):
+                x, y = to_mm(ol.CPoint(i).x), to_mm(ol.CPoint(i).y)
+                n += 1
+                if circle:
+                    if math.hypot(x, y) > r + eps:
+                        return False
+                elif abs(x) > hx + eps or abs(y) > hy + eps:
+                    return False
+        return n > 0
+    except Exception:
+        return False
 
 
 def pad_is_plated_through(pad) -> bool:
@@ -1582,6 +1939,44 @@ def pad_drill_circles(pad, step: float = 0.0) -> List[Tuple[float, float, float]
             for i in range(n + 1)]
 
 
+def _padstack_copper_size(pad_text: str, base: Tuple[float, float],
+                          pad_layers: Sequence[str],
+                          board_copper: Sequence[str]) -> Tuple[float, float]:
+    """A pad's size (pad frame) as the per-axis MAX over the copper layers it
+    is on, each read from its KiCad 9 `(padstack ...)` entry.
+
+    The base `(size ...)` is the F.Cu geometry. `front_inner_back` adds an
+    `"Inner"` and a `"B.Cu"` entry; `custom` one entry per named layer; a
+    layer with no entry keeps the base. Only the pad's own copper layers
+    within the board's copper count -- a padstack entry for a layer the pad is
+    not on describes no copper. `build_pcb_data_from_board` takes the same
+    max over `PAD.GetSize(layer)` for the same layers."""
+    m = re.search(r'\(padstack\b', pad_text)
+    if not m:
+        return base
+    blk = pad_text[m.start():find_matching_paren(pad_text, m.start())]
+    mm = re.search(r'\(mode\s+(\w+)\)', blk)
+    mode = mm.group(1) if mm else 'normal'
+    per = {}
+    for lm in re.finditer(r'\(layer\s+"([^"]+)"', blk):
+        lb = blk[lm.start():find_matching_paren(blk, lm.start())]
+        sm = re.search(r'\(size\s+(%s)\s+(%s)\)' % (AT_NUM, AT_NUM), lb)
+        if sm:
+            per[lm.group(1)] = (float(sm.group(1)), float(sm.group(2)))
+    on = [ln for ln in board_copper if '*.Cu' in pad_layers or ln in pad_layers]
+    if not on:
+        return base
+
+    def size_on(ln):
+        if ln == 'F.Cu' or mode not in ('front_inner_back', 'custom'):
+            return base
+        if mode == 'front_inner_back':
+            return per.get('B.Cu' if ln == 'B.Cu' else 'Inner', base)
+        return per.get(ln, base)
+    got = [size_on(ln) for ln in on]
+    return max(s[0] for s in got), max(s[1] for s in got)
+
+
 def _resolve_pad_rect(size_x: float, size_y: float,
                       pad_rotation_deg: float) -> Tuple[float, float, float]:
     """Resolve a pad rectangle (given in the pad's own frame) into board space.
@@ -1629,6 +2024,40 @@ def _unescape_kicad_string(s: str) -> str:
     if '\\' not in s:
         return s
     return s.replace('\\\\', '\\').replace('\\"', '"')
+
+
+#: #1211. A footprint's schematic sheet, both spellings: KiCad 8+ header
+#: tokens `(sheetname "...")` / `(sheetfile "...")`, KiCad 6/7 properties
+#: `(property "Sheetname" "...")` / `(property "Sheetfile" "...")`.
+_SHEET_FIELD_RE = {
+    which: re.compile(r'\(%s\s+"((?:[^"\\]|\\.)*)"' % which.lower())
+    for which in ('Sheetname', 'Sheetfile')}
+#: The PROPERTY spellings pcbnew's reader honours: "Sheetname" and KiCad 6's
+#: "Sheet name" (ecp5_mini, rfswitch01), and the same pair for the file.
+_SHEET_PROPERTY_RE = {
+    which: re.compile(r'\(property\s+"(?:%s|%s %s)"\s+"((?:[^"\\]|\\.)*)"'
+                      % (which, which[:5], which[5:].lower()))
+    for which in ('Sheetname', 'Sheetfile')}
+
+
+def _footprint_sheet_fields(fp_text: str, version: int = 0) -> Tuple[str, str]:
+    """`(sheet_name, sheet_file)` of one footprint block, as the file spells
+    them ('' when absent). Read from the block header -- before the first
+    `(pad ` -- so a pad or a graphic can never lend a block a sheet.
+
+    The `(sheetname ...)` token counts at any version; the PROPERTY spellings
+    only up to SHEET_PROPERTIES_MAX_VERSION, where pcbnew stops reading them.
+    `version` 0 (unknown) reads them too."""
+    first_pad = fp_text.find('(pad ')
+    head = fp_text[:first_pad] if first_pad > 0 else fp_text
+    legacy = not version or version <= SHEET_PROPERTIES_MAX_VERSION
+    out = []
+    for which in ('Sheetname', 'Sheetfile'):
+        m = _SHEET_FIELD_RE[which].search(head)
+        if m is None and legacy:
+            m = _SHEET_PROPERTY_RE[which].search(head)
+        out.append(_unescape_kicad_string(m.group(1)) if m else '')
+    return out[0], out[1]
 
 
 _PAREN_OR_QUOTE = re.compile(r'["()]')
@@ -2004,6 +2433,96 @@ def _arc_to_segments(start: Tuple[float, float], mid: Tuple[float, float],
     for i in range(len(points) - 1):
         segments.append((points[i], points[i + 1]))
     return segments
+
+
+_PTS_XY_OR_ARC_RE = re.compile(r'\(xy\s+(-?[\d.]+)\s+(-?[\d.]+)\)|' + _PTS_ARC_RE)
+
+
+def _ring_without_repeats(pts):
+    """Consecutive duplicate points dropped, and a last point equal to the
+    first: an arc's end and the next element's start are written twice."""
+    out = []
+    for p in pts:
+        if not out or p != out[-1]:
+            out.append(p)
+    if len(out) > 1 and out[0] == out[-1]:
+        out.pop()
+    return out
+
+
+def poly_points_with_arcs(blk: str, transform) -> List[Tuple[float, float]]:
+    """The vertices of a graphic's `(pts ...)` list in file order, each
+    `(arc (start) (mid) (end))` entry linearized (`_arc_to_segments`) AFTER its
+    three control points are transformed -- the order the pcbnew builder uses
+    on the live chain's arcs (`_pcbnew_chain_points`), so both parse paths
+    emit the same points. A KiCad 7+ polygon may be arcs only (apple1_mainboard's
+    F.Cu gr_poly, zynq7020_som U9's F.Paste openings), which a reader of
+    `(xy ...)` alone saw as no shape at all. A list with no arc is returned
+    exactly as written."""
+    if '(arc' not in blk:
+        return [transform(float(x), float(y)) for x, y in
+                re.findall(r'\(xy\s+([-\d.]+)\s+([-\d.]+)\)', blk)]
+    pts = []
+    for m in _PTS_XY_OR_ARC_RE.finditer(blk):
+        if m.group(1) is not None:
+            pts.append(transform(float(m.group(1)), float(m.group(2))))
+            continue
+        s = transform(float(m.group(3)), float(m.group(4)))
+        mid = transform(float(m.group(5)), float(m.group(6)))
+        e = transform(float(m.group(7)), float(m.group(8)))
+        segs = _arc_to_segments(s, mid, e)
+        pts.append(segs[0][0])
+        pts.extend(p1 for _p0, p1 in segs)
+    return _ring_without_repeats(pts)
+
+
+def _pcbnew_chain_points(chain, to_mm) -> List[Tuple[float, float]]:
+    """A live SHAPE_LINE_CHAIN's vertices, `poly_points_with_arcs`' twin: a
+    chain with no arc is its points as pcbnew stores them; an arc in it is
+    linearized by `_arc_to_segments` from its own start / mid / end, not taken
+    from pcbnew's approximation, so the two parse paths emit the same
+    points."""
+    n = chain.PointCount()
+    pts = [(to_mm(chain.CPoint(k).x), to_mm(chain.CPoint(k).y)) for k in range(n)]
+    try:
+        n_arcs = chain.ArcCount()
+    except Exception:
+        n_arcs = 0
+    if not n_arcs:
+        return pts
+    arcs = []
+    for i in range(n_arcs):
+        a = chain.Arc(i)
+        arcs.append(((to_mm(a.GetP0().x), to_mm(a.GetP0().y)),
+                     (to_mm(a.GetArcMid().x), to_mm(a.GetArcMid().y)),
+                     (to_mm(a.GetP1().x), to_mm(a.GetP1().y))))
+    out, k, used = [], 0, set()
+    while k < n:
+        if chain.IsArcStart(k):
+            hit = next((i for i, (s, _m, _e) in enumerate(arcs)
+                        if i not in used and s == pts[k]), None)
+            if hit is None:
+                hit = next((i for i, (_s, _m, e) in enumerate(arcs)
+                            if i not in used and e == pts[k]), None)
+            if hit is not None:
+                used.add(hit)
+                s, mid, e = arcs[hit]
+                if e == pts[k] and s != pts[k]:
+                    s, e = e, s
+                segs = _arc_to_segments(s, mid, e)
+                out.append(segs[0][0])
+                out.extend(p1 for _p0, p1 in segs)
+                j = k + 1
+                while j < n and not chain.IsArcEnd(j):
+                    j += 1
+                if j >= n:
+                    break
+                # A point two arcs share is the next arc's start too.
+                k = j if chain.IsArcStart(j) else j + 1
+                continue
+        out.append(pts[k])
+        k += 1
+    return _ring_without_repeats(out)
 
 
 # Regex gap that matches anything EXCEPT the start of another graphic element,
@@ -2627,8 +3146,9 @@ def extract_board_bounds(content: str) -> Optional[Tuple[float, float, float, fl
                 max_y = max(max_y, py)
         found = True
 
-    # Look for gr_poly on Edge.Cuts (free-form board outlines)
-    for poly in _parse_gr_polys_on_layer(content, "Edge.Cuts"):
+    # Look for gr_poly on Edge.Cuts (free-form board outlines), with the
+    # points the outline scan reads (arc vertices included)
+    for poly in _edge_cuts_gr_poly_points(content):
         for px, py in poly:
             min_x = min(min_x, px)
             max_x = max(max_x, px)
@@ -2732,10 +3252,16 @@ def _collect_edge_cuts_segments(content: str) -> List[Tuple[Tuple[float, float],
         segments.append(((x2, y2), (x1, y2)))
         segments.append(((x1, y2), (x1, y1)))
 
-    # gr_poly - closed polygon outline, expand to line segments
-    for poly in _parse_gr_polys_on_layer(content, "Edge.Cuts"):
-        for i in range(len(poly)):
-            segments.append((poly[i], poly[(i + 1) % len(poly)]))
+    # gr_poly - closed polygon outline, expand to line segments. The points
+    # are pcbnew's (`kicad_poly_shape_points`: `(arc ..)` vertices too, which
+    # the old xy-only pattern did not match at all), and a ZERO-LENGTH edge is
+    # skipped as the gr_line reader above and the pcbnew builder skip it: a
+    # polygon written with its first point repeated at the end
+    # (Castor_and_Pollux's faceplate) otherwise chained into a 5-vertex ring
+    # here while the GUI saw the plain 4-edge rectangle KiCad's own board
+    # outline is.
+    for poly in _edge_cuts_gr_poly_points(content):
+        segments.extend(_closed_ring_segments(poly))
 
     # gr_curve - cubic bezier corner/edge (#304: crkbd's outline corners are
     # 100 gr_curves; without them the outline never chains closed, the halves'
@@ -2839,11 +3365,41 @@ def _collect_footprint_edge_segments_by_ref(content: str):
             poly_text = block[pm.start():p_end]
             if not re.search(r'\(layer\s+"Edge\.Cuts"\)', poly_text):
                 continue
-            pts = [to_g(float(xm.group(1)), float(xm.group(2)))
-                   for xm in re.finditer(r'\(xy\s+([\d.-]+)\s+([\d.-]+)\)', poly_text)]
-            for i in range(len(pts)):
-                out.append((pts[i], pts[(i + 1) % len(pts)]))
+            # pcbnew's points (arcs included), then the footprint transform,
+            # and no zero-length edge -- the gr_poly rule above.
+            pts = [to_g(x, y) for x, y in kicad_poly_shape_points(
+                poly_text[:find_matching_paren(poly_text, poly_text.find('(pts'))])]
+            out.extend(_closed_ring_segments(pts))
     return {r: segs for r, segs in out_by_ref.items() if segs}
+
+
+def _closed_ring_segments(pts):
+    """The edges of a closed ring of points, skipping a zero-length one
+    (under 1 um on both axes, the gr_line and pcbnew-builder rule)."""
+    segs = []
+    for i in range(len(pts)):
+        a, b = pts[i], pts[(i + 1) % len(pts)]
+        if abs(b[0] - a[0]) >= 0.001 or abs(b[1] - a[1]) >= 0.001:
+            segs.append((a, b))
+    return segs
+
+
+def _edge_cuts_gr_poly_points(content: str) -> List[List[Tuple[float, float]]]:
+    """The points of every board-level gr_poly on Edge.Cuts, as pcbnew holds
+    them (`kicad_poly_shape_points`). `content` is already pad-masked."""
+    polys = []
+    for m in re.finditer(r'\(gr_poly(?=[\s(])', content):
+        end = find_matching_paren(content, m.start())
+        blk = content[m.start():end]
+        if not re.search(r'\(layer\s+"Edge\.Cuts"\)', blk):
+            continue
+        p = blk.find('(pts')
+        if p < 0:
+            continue
+        pts = kicad_poly_shape_points(blk[p:find_matching_paren(blk, p)])
+        if pts:
+            polys.append(pts)
+    return polys
 
 
 def _parse_gr_polys_on_layer(content: str, layer: str) -> List[List[Tuple[float, float]]]:
@@ -3620,15 +4176,22 @@ def duplicate_reference_counts(raw_refs: Sequence[str]) -> Dict[str, int]:
 
 def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
                                 name_to_id: Dict[str, int] = None,
-                                duplicates: Dict[str, int] = None) -> Tuple[Dict[str, Footprint], Dict[int, List[Pad]]]:
+                                duplicates: Dict[str, int] = None,
+                                board_copper: Sequence[str] = None) -> Tuple[Dict[str, Footprint], Dict[int, List[Pad]]]:
     """Extract footprints and their pads with global coordinates.
 
     `duplicates`, when given, is FILLED with `duplicate_reference_counts` --
     an out-param rather than a third return value, because the 2-tuple is a
     documented public signature (`docs/api-kicad-parser.md`).
+
+    `board_copper` is the board's copper layer list, which a plated pad's
+    layer set takes in full (`canonical_pad_layers`); read from the file's
+    layer table when not given.
     """
     footprints = {}
     pads_by_net: Dict[int, List[Pad]] = {}
+    if board_copper is None:
+        board_copper = _layer_table(content)[1]
 
     # Find all footprints - need to handle nested parentheses properly.
     # Named through iter_footprint_blocks so this path and every writer agree
@@ -3771,6 +4334,10 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
         fp_uuid = uuid_or_tstamp(fp_text[:_uid_end])  # KiCad 6: (tstamp ...)
         _path_m = re.search(r'\(path\s+"([^"]*)"', fp_text)
         fp_path = _path_m.group(1) if _path_m else ""
+        # #1211: the sheet's NAME and FILE, either spelling (see
+        # Footprint.sheet_name), read from the header only -- before the
+        # first pad -- so a pad or graphic cannot lend a block a sheet.
+        fp_sheet_name, fp_sheet_file = _footprint_sheet_fields(fp_text, _file_version)
 
         # Reference-label geometry (#481): parsed from the Reference sub-node's
         # own slice. None for the uuid-keyed reference-less footprints above.
@@ -3798,6 +4365,8 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
             parsed_pose=(fp_x, fp_y, fp_rotation, fp_layer),
             attrs=fp_attrs,
             has_model=fp_has_model,
+            sheet_name=fp_sheet_name,
+            sheet_file=fp_sheet_file,
         )
 
         # Extract pads
@@ -3833,23 +4402,40 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
             # (size resolution below was already fixed to the absolute angle).
             total_rotation = pad_rotation % 360
 
-            # Extract size. A KiCad 9 custom PADSTACK gives per-copper-layer
-            # geometry inside the pad: e.g. an oval 2.54x1.27 on top but a larger
-            # custom 2.6416x1.778 on B.Cu (apple1_mainboard DIP pads). The base
+            # Extract layers, quoted (KiCad 7+) or bare (KiCad 6), as the SET
+            # pcbnew loads (canonical_pad_layers): `F&B.Cu` is F.Cu + B.Cu,
+            # and a plated pad is on every copper layer of the board.
+            layers_section = re.search(r'\(layers\s+([^)]+)\)', pad_text)
+            pad_layers = []
+            if layers_section:
+                pad_layers = canonical_pad_layers(
+                    layer_list_tokens(layers_section.group(1)), board_copper,
+                    plated_through=(pad_type == 'thru_hole'))
+            # pcbnew's reader blanks the number of a pad that cannot carry
+            # one -- an NPTH hole, or an SMD/connector pad with no copper (an
+            # aperture) -- whatever the file wrote (PAD::CanHaveNumber;
+            # ovc5_camera_carrier's KiCad 6 mounting holes are pad "1").
+            if pad_type == 'np_thru_hole' or (
+                    pad_type in ('smd', 'connect')
+                    and not any(ln.endswith('.Cu') for ln in pad_layers)):
+                pad_num = ''
+
+            # Extract size. A KiCad 9 PADSTACK gives per-copper-layer geometry
+            # inside the pad: e.g. an oval 2.54x1.27 on top but a larger custom
+            # 2.6416x1.778 on B.Cu (apple1_mainboard DIP pads). The base
             # (size ...) alone UNDER-models the pad on the bigger layer -- the
             # router then drops vias against that layer's copper (apple1: a via
             # 0.027mm from a B.Cu pad KiCad flags but check_drc missed, because
             # both read only the 2.54x1.27 base). Take the MAX extent over the
-            # base and every padstack layer's (size ...): DRC-safe (reserves for
-            # the largest copper on any layer), slightly conservative where a
-            # layer's copper is smaller. pad_text is the balanced pad sexpr, so
-            # these matches are all THIS pad's (base + padstack), never the next.
+            # layers the pad has COPPER on (`_padstack_copper_size`): DRC-safe,
+            # slightly conservative where a layer's copper is smaller. A layer
+            # the pad is not on has no copper, so its entry does not count --
+            # mokya_lora_phone's SW1 pads are 0.65 mm on F.Cu, their only layer,
+            # and were read as their 1.905 x 1.27 inner/back entries.
             sizes = re.findall(r'\(size\s+([\d.-]+)\s+([\d.-]+)\)', pad_text)
-            if sizes:
-                size_x = max(float(sx) for sx, _ in sizes)
-                size_y = max(float(sy) for _, sy in sizes)
-            else:
-                size_x = size_y = 0.5  # default
+            size_x, size_y = _padstack_copper_size(
+                pad_text, (float(sizes[0][0]), float(sizes[0][1])) if sizes
+                else (0.5, 0.5), pad_layers, board_copper)
             # #962: a custom pad's ANCHOR size (the base `(size ...)`), in the
             # pad frame. KiCad sizes the paste-ratio term from it.
             _anchor_size = ((float(sizes[0][0]), float(sizes[0][1]))
@@ -3860,8 +4446,11 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
             # covers the full local extent -- conservative (may over-block the
             # empty side of an asymmetric pad) but DRC-safe; modelling only the
             # anchor lets tracks graze copper that reaches past it.
+            # A custom pad whose copper IS its anchor (`_custom_copper_is_anchor`)
+            # is sized as the anchor rect, with its residual tilt, below.
             custom_resolved = False
-            if pad_shape == 'custom':
+            if pad_shape == 'custom' and not _custom_copper_is_anchor(
+                    pad_text, size_x, size_y):
                 # pad_rotation: the file's (at ...) angle is the pad's ABSOLUTE
                 # board angle (same convention as _custom_pad_global_polygons /
                 # _resolve_pad_rect).
@@ -3885,12 +4474,6 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
             # rect_rotation the obstacle/DRC geometry applies.
             if not custom_resolved:
                 size_x, size_y, rect_rotation = _resolve_pad_rect(size_x, size_y, pad_rotation)
-
-            # Extract layers, quoted (KiCad 7+) or bare (KiCad 6)
-            layers_section = re.search(r'\(layers\s+([^)]+)\)', pad_text)
-            pad_layers = []
-            if layers_section:
-                pad_layers = layer_list_tokens(layers_section.group(1))
 
             # Extract net - try KiCad 9 format first, then KiCad 10
             net_match = re.search(r'\(net\s+(\d+)\s+"%s"\)' % _ESC_STR, pad_text)
@@ -3918,7 +4501,11 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
             # Extract drill size for through-hole pads. Oval/slot drills are
             # (drill oval w h); take max(w, h) so the pad keeps drill>0 (TH)
             # semantics instead of being misread as SMD (issue #106).
-            oval_match = re.search(r'\(drill\s+oval\s+([\d.]+)(?:\s+([\d.]+))?', pad_text)
+            # Numbers in AT_NUM form: KiCad writes a value under 1e-4 with an
+            # exponent, and arty_mpw_tester's Flexypin pads carry
+            # `(drill 1e-06)`, which `[\d.]+` read as a 1 mm hole.
+            oval_match = re.search(r'\(drill\s+oval\s+(%s)(?:\s+(%s))?' % (AT_NUM, AT_NUM),
+                                   pad_text)
             drill_w = drill_h = 0.0
             if oval_match:
                 # (drill oval w) with a single value is legal and means w x w
@@ -3927,7 +4514,7 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
                 drill_h = float(oval_match.group(2)) if oval_match.group(2) else drill_w
                 drill_size = max(drill_w, drill_h)
             else:
-                drill_match = re.search(r'\(drill\s+([\d.]+)', pad_text)
+                drill_match = re.search(r'\(drill\s+(%s)' % AT_NUM, pad_text)
                 drill_size = float(drill_match.group(1)) if drill_match else 0.0
 
             # Pad copper offset (#324): (drill (offset x y)) displaces the
@@ -3959,6 +4546,8 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
             # #962: the pad's own paste overrides (raw; inheritance is resolved
             # by paste_apertures, not here, so both parse paths share it).
             _pad_paste = _paste_overrides(pad_text, _file_version)
+            # #1248: pad-to-die length/delay, parity with the pcbnew path.
+            _pad_die = pad_to_die_from_text(pad_text)
 
             # Calculate global coordinates
             global_x, global_y = local_to_global(fp_x, fp_y, fp_rotation, local_x, local_y)
@@ -4025,6 +4614,8 @@ def extract_footprints_and_pads(content: str, nets: Dict[int, Net],
                 paste_margin_ratio=_pad_paste[1],
                 anchor_size=_anchor_size,
                 unconnected_layer_mode=unconnected_layer_mode_from_text(pad_text),
+                die_length=_pad_die[0],
+                die_delay=_pad_die[1],
             )
 
             footprint.pads.append(pad)
@@ -4311,6 +4902,20 @@ _VIA_PREFIX_RE = re.compile(
 _VIA_NET_RE = re.compile(r'\(net\s+(?:"((?:[^"\\]|\\.)*)"|(\d+))\)')
 _VIA_UUID_RE = re.compile(r'\(uuid\s+"([^"]+)"\)')
 _VIA_FREE_RE = re.compile(r'\(free\s+yes\)')
+# KiCad's via type is a bare word of the via block (`(via micro (at ...`,
+# `(via buried ...`); a block with none is a THROUGH via. KiCad 9 writes
+# `blind` for its BLIND_BURIED type; KiCad 10 also writes `buried`.
+_VIA_TYPE_WORDS = ('blind', 'buried', 'micro')
+
+
+def _via_type_from_block(block: str) -> str:
+    """'blind' / 'buried' / 'micro' from a via block's bare words, else
+    'through'. KiCad reads the type from that word alone, never from
+    `(layers ...)`."""
+    if not any(w in block for w in _VIA_TYPE_WORDS):
+        return 'through'
+    return next((w for w in _sexpr_children(block)[1] if w in _VIA_TYPE_WORDS),
+                'through')
 
 
 def extract_vias(content: str, name_to_id: Dict[str, int] = None) -> List[Via]:
@@ -4382,12 +4987,32 @@ def extract_vias(content: str, name_to_id: Dict[str, int] = None) -> List[Via]:
             # against the net's own copper.
             net_id = name_to_id.get(net_name, 0)
         u = _VIA_UUID_RE.search(block)
+        via_type = _via_type_from_block(block)
+        layers = [geom[4], geom[5]]
+        if via_type == 'through':
+            # KiCad loads a via with no type word as THROUGH and snaps its pair
+            # to F.Cu/B.Cu (probed on pcbnew 10.0.3 and 9.0.6), which is what
+            # build_pcb_data_from_board then reads back. Keeping the file's
+            # pair -- this repo's writer emitted `(layers "B.Cu" "In6.Cu")` for
+            # back-side BGA fanout vias -- made every consumer that reads the
+            # pair model a through via as a blind one, and the two parse paths
+            # disagree (found reviewing #1268). A through via written
+            # `(layers "B.Cu" "F.Cu")` reads F.Cu first too: pcbnew's
+            # TopLayer()/BottomLayer() order is what the GUI path holds.
+            layers = ['F.Cu', 'B.Cu']
+        else:
+            # A typed pair top layer first, as pcbnew reads it back: the two
+            # paths then hold one tuple, which placement Apply's via key
+            # compares (a pair written bottom first was re-created there,
+            # with a new uuid, on every apply).
+            from geometry_utils import _copper_order
+            layers.sort(key=_copper_order)
         via = Via(
             x=float(geom[0]),
             y=float(geom[1]),
             size=float(geom[2]),
             drill=float(geom[3]),
-            layers=[geom[4], geom[5]],
+            layers=layers,
             net_id=net_id,
             uuid=(u.group(1) if u else uuid_or_tstamp(block)),  # KiCad 6: (tstamp ...)
             # Read from the block, not from a capture group and not from a
@@ -4396,6 +5021,7 @@ def extract_vias(content: str, name_to_id: Dict[str, int] = None) -> List[Via]:
             # linear pre-scan) and it could only reach vias that HAD a uuid.
             free=bool(_VIA_FREE_RE.search(block)),
             locked=_track_locked(block),
+            via_type=via_type,
         )
         # Protection spec per via (#489 §8): tenting/covering/plugging/capping/
         # filling were parsed by NOBODY, so a re-placed via lost whatever the
@@ -4821,6 +5447,21 @@ def _shape_filled(blk: str, kind: str, width: float) -> bool:
     return False
 
 
+#: The stroke pcbnew's reader gives an UNFILLED shape whose file stroke width
+#: is 0 (KiCad's DEFAULT_LINE_WIDTH). Probed on pcbnew 10.0.0 at file versions
+#: 20211014, 20221018 and 20241229, for lines, arcs, rects, circles and polys:
+#: unfilled -> 0.1, filled -> 0 kept. piunora's KiCad 6 MP1 paste outlines
+#: are `(width 0) (fill none)` polys, which loaded as 0.1 mm stroked openings.
+UNSTROKED_SHAPE_WIDTH = 0.1
+
+
+def _loaded_stroke_width(blk: str, kind: str, width: float) -> float:
+    """A graphic's stroke width as pcbnew loads it (UNSTROKED_SHAPE_WIDTH)."""
+    if width <= 0 and not _shape_filled(blk, kind, width):
+        return UNSTROKED_SHAPE_WIDTH
+    return width
+
+
 def _paste_shape_record(tag: str, blk: str, owner: str, transform):
     """One paste graphic as the `paste_apertures.graphic_aperture` dict, or
     None. `transform` maps a block-local point to global mm (the identity for
@@ -4837,11 +5478,12 @@ def _paste_shape_record(tag: str, blk: str, owner: str, transform):
         return (float(m.group(1)), float(m.group(2))) if m else None
 
     kind = tag.split('_', 1)[1]
-    rec = {'owner_ref': owner, 'kind': kind, 'width': width,
-           'filled': _shape_filled(blk, kind, width), 'uuid': uuid}
+    filled = _shape_filled(blk, kind, width)
+    rec = {'owner_ref': owner, 'kind': kind,
+           'width': _loaded_stroke_width(blk, kind, width),
+           'filled': filled, 'uuid': uuid}
     if kind == 'poly':
-        rec['points'] = [transform(float(x), float(y)) for x, y in
-                         re.findall(r'\(xy\s+([-\d.]+)\s+([-\d.]+)\)', blk)]
+        rec['points'] = poly_points_with_arcs(blk, transform)
     elif kind == 'rect':
         a, b = xy('start'), xy('end')
         if not (a and b):
@@ -5453,6 +6095,8 @@ def extract_segments(content: str, name_to_id: Dict[str, int] = None) -> List[Se
             layers, w, nid, uuid = _blk_fields(blk)
             if not layers:
                 continue
+            # pcbnew strokes an UNFILLED zero-width shape at 0.1 mm on load.
+            w = _loaded_stroke_width(blk, tag[3:], w)
             if tag in ('gr_line', 'gr_arc') and w <= 0:
                 continue        # unstroked line/arc: no copper to model
             for layer in layers:
@@ -5472,8 +6116,7 @@ def extract_segments(content: str, name_to_id: Dict[str, int] = None) -> List[Se
                                 width=w, layer=layer, net_id=nid, uuid=uuid, graphic=True,
                                 drawn_width=w, graphic_kind='arc'))
                 elif tag == 'gr_poly':
-                    pts = [(float(x), float(y)) for x, y in
-                           re.findall(r'\(xy\s+([-\d.]+)\s+([-\d.]+)\)', blk)]
+                    pts = poly_points_with_arcs(blk, lambda x, y: (x, y))
                     _emit_outline(pts, w, layer, nid, uuid,
                                   filled=_shape_filled(blk, 'poly', w))
                 elif tag == 'gr_rect':
@@ -5544,6 +6187,7 @@ def extract_segments(content: str, name_to_id: Dict[str, int] = None) -> List[Se
                 layers, w, nid, uuid = _blk_fields(blk)
                 if not layers:
                     continue
+                w = _loaded_stroke_width(blk, tag[3:], w)   # see the board pass
                 if tag in ('fp_line', 'fp_arc') and w <= 0:
                     continue    # unstroked line/arc: no copper to model
                 for layer in layers:
@@ -5570,9 +6214,7 @@ def extract_segments(content: str, name_to_id: Dict[str, int] = None) -> List[Se
                                     uuid=uuid, graphic=True,
                                     drawn_width=w, graphic_kind='arc'))
                     elif tag == 'fp_poly':
-                        pts = [_g(float(x), float(y)) for x, y in
-                               re.findall(r'\(xy\s+([-\d.]+)\s+([-\d.]+)\)',
-                                          blk)]
+                        pts = poly_points_with_arcs(blk, _g)
                         _emit_outline(pts, w, layer, nid, uuid,
                                       filled=_shape_filled(blk, 'poly', w))
                     elif tag == 'fp_rect':
@@ -5643,6 +6285,456 @@ def _iter_zone_blocks(content: str):
         yield content[body_start:zone_end], in_footprint
 
 
+# --- Zone outlines as pcbnew loads them ---------------------------------------
+# A zone or rule-area outline is a list of `(xy X Y)` points and
+# `(arc (start ..) (mid ..) (end ..))` vertices. pcbnew keeps the arc and hands
+# every consumer (Outline().CPoint) its polyline, built by
+# SHAPE_LINE_CHAIN::Append(SHAPE_ARC) -> SHAPE_ARC::ConvertToPolyline. The
+# helpers below port that code from KiCad 10.0.0 (shape_arc.cpp,
+# shape_line_chain.cpp, geometry_utils.cpp, trigo.cpp, eda_angle.h; unchanged
+# in 10.0.6 except for a CalcArcCenter early-out that only fires on arcs whose
+# three points lie within 5 nm, which are a single chord either way), so the
+# text parser's vertices are pcbnew's, on the nm grid.
+
+#: The max error SHAPE_LINE_CHAIN::Append(SHAPE_ARC) polygonises an outline arc
+#: at: getArcPolygonizationMaxError() = ARC_HIGH_DEF / 5 = 1000 nm in KiCad 10
+#: (KiCad 9 used ARC_HIGH_DEF itself, 5000 nm, so a KiCad 9 pcbnew holds
+#: fewer vertices on the same arc).
+ZONE_ARC_MAX_ERROR_NM = 1000
+
+_KI_DEG_TO_RAD = math.pi / 180.0
+_KI_SQRT1_2 = math.sqrt(0.5)          # M_SQRT1_2
+_KI_SQRT2 = math.sqrt(2.0)            # M_SQRT2
+_KI_DBL_EPS = sys.float_info.epsilon
+_KI_INT_MAX = 2 ** 31 - 1
+
+
+def _kiround(v: float, bits: int = 32) -> int:
+    """KiCad's KiROUND: std::llround (halves away from zero; Python's round
+    is half-to-even), clamped to the signed `bits`-bit range of its return
+    type (int unless a caller asks for an ecoord)."""
+    a = abs(v)
+    r = math.floor(a)
+    if a - r >= 0.5:
+        r += 1
+    r = int(r) if v >= 0 else -int(r)
+    return min(max(r, -(1 << (bits - 1))), (1 << (bits - 1)) - 1)
+
+
+def _board_iu(token: str) -> int:
+    """A file coordinate as pcbnew's parser stores it: KiROUND(mm * 1e6) nm,
+    clamped to INT_LIMIT (parseBoardUnits)."""
+    lim = float(_KI_INT_MAX - 10)
+    return _kiround(min(max(float(token) * 1e6, -lim), lim))
+
+
+def _ki_div(a: float, b: float) -> float:
+    """IEEE division as C++ does it: x/0 is a signed infinity and 0/0 NaN
+    (Python raises instead)."""
+    try:
+        return a / b
+    except ZeroDivisionError:
+        if a != a or a == 0.0:
+            return math.nan
+        return math.copysign(math.inf, a) * math.copysign(1.0, b)
+
+
+def _ki_floor(v: float) -> float:
+    return v if not math.isfinite(v) else float(math.floor(v))
+
+
+def _ki_norm_d(x: float, y: float) -> float:
+    """VECTOR2D::EuclideanNorm."""
+    if abs(x) == abs(y):
+        return abs(x) * _KI_SQRT2
+    if x == 0:
+        return abs(y)
+    if y == 0:
+        return abs(x)
+    return math.hypot(x, y)
+
+
+def _ki_arc_center(start, mid, end) -> Tuple[int, int]:
+    """CalcArcCenter(VECTOR2I start, mid, end): the double-precision center,
+    snapped to a round 100 / 10 nm value when that lies inside its own
+    propagated rounding uncertainty, then KiROUNDed."""
+    sx, sy = float(start[0]), float(start[1])
+    mx, my = float(mid[0]), float(mid[1])
+    ex, ey = float(end[0]), float(end[1])
+    yd21, xd21 = my - sy, mx - sx
+    yd32, xd32 = ey - my, ex - mx
+    if (xd21 == 0.0 and yd32 == 0.0) or (yd21 == 0.0 and xd32 == 0.0):
+        cx, cy = (sx + ex) / 2.0, (sy + ey) / 2.0
+    else:
+        if xd21 == 0.0:
+            xd21 = _KI_DBL_EPS
+        if xd32 == 0.0:
+            xd32 = -_KI_DBL_EPS
+        a_slope = yd21 / xd21
+        b_slope = yd32 / xd32
+        da_slope = a_slope * _ki_norm_d(_ki_div(0.5, yd21), _ki_div(0.5, xd21))
+        db_slope = b_slope * _ki_norm_d(_ki_div(0.5, yd32), _ki_div(0.5, xd32))
+        cx = cy = None
+        if a_slope == b_slope:
+            if sx == ex and sy == ey:
+                cx, cy = (sx + mx) / 2.0, (sy + my) / 2.0
+            else:
+                a_slope += _KI_DBL_EPS
+                b_slope -= _KI_DBL_EPS
+        if cx is None:
+            if a_slope == 0.0:
+                a_slope = 1e-10
+            if b_slope == 0.0:
+                b_slope = 1e-10
+            ab_y = a_slope * b_slope * (sy - ey)
+            t = _ki_div(_KI_SQRT1_2, sy - ey)
+            dab_y = ab_y * math.sqrt((da_slope / a_slope * da_slope / a_slope)
+                                     + (db_slope / b_slope * db_slope / b_slope)
+                                     + (t * t))
+            b_sm = b_slope * (sx + mx)
+            t = _ki_div(_KI_SQRT1_2, sx + mx)
+            db_sm = b_sm * math.sqrt((db_slope / b_slope * db_slope / b_slope) + (t * t))
+            a_me = a_slope * (mx + ex)
+            t = _ki_div(_KI_SQRT1_2, mx + ex)
+            da_me = a_me * math.sqrt((da_slope / a_slope * da_slope / a_slope) + (t * t))
+            twice = 2 * (b_slope - a_slope)
+            dtwice = 2 * math.sqrt(db_slope * db_slope + da_slope * da_slope)
+            num_x = ab_y + b_sm - a_me
+            dnum_x = math.sqrt(dab_y * dab_y + db_sm * db_sm + da_me * da_me)
+            cx = _ki_div(ab_y + b_sm - a_me, twice)
+            q1 = _ki_div(dnum_x, num_x)
+            q2 = _ki_div(dtwice, twice)
+            dcx = cx * math.sqrt((q1 * q1) + (q2 * q2))
+            num_y = (sx + mx) / 2.0 - cx
+            dnum_y = math.sqrt(1.0 / 8.0 + dcx * dcx)
+            first = num_y / a_slope
+            q1 = _ki_div(dnum_y, num_y)
+            q2 = da_slope / a_slope
+            dfirst = first * math.sqrt((q1 * q1) + (q2 * q2))
+            cy = first + (sy + my) / 2.0
+            dcy = math.sqrt(dfirst * dfirst + 1.0 / 8.0)
+            r100x = _ki_floor((cx + 50.0) / 100.0) * 100.0
+            r100y = _ki_floor((cy + 50.0) / 100.0) * 100.0
+            r10x = _ki_floor((cx + 5.0) / 10.0) * 10.0
+            r10y = _ki_floor((cy + 5.0) / 10.0) * 10.0
+            if abs(r100x - cx) < dcx and abs(r100y - cy) < dcy:
+                cx, cy = r100x, r100y
+            elif abs(r10x - cx) < dcx and abs(r10y - cy) < dcy:
+                cx, cy = r10x, r10y
+    lo, hi = float(-_KI_INT_MAX - 1 + 100), float(_KI_INT_MAX - 100)
+
+    def snap(v):
+        if v != v:
+            return 0
+        return _kiround(min(max(v, lo), hi))
+    return snap(cx), snap(cy)
+
+
+def _ki_angle_deg(x: float, y: float) -> float:
+    """EDA_ANGLE(VECTOR2D): exact at the eight 45-degree directions."""
+    if x == 0.0 and y == 0.0:
+        return 0.0
+    if y == 0.0:
+        return 0.0 if x >= 0 else -180.0
+    if x == 0.0:
+        return 90.0 if y >= 0.0 else -90.0
+    if x == y:
+        return 45.0 if x >= 0.0 else -180.0 + 45.0
+    if x == -y:
+        return -45.0 if x >= 0.0 else 180.0 - 45.0
+    return math.atan2(y, x) / _KI_DEG_TO_RAD
+
+
+def _ki_normalize_deg(v: float) -> float:
+    while v < -0.0:
+        v += 360.0
+    while v >= 360.0:
+        v -= 360.0
+    return v
+
+
+def _ki_cos(deg: float) -> float:
+    t = _ki_normalize_deg(deg)
+    if t == 0.0:
+        return 1.0
+    if t == 180.0:
+        return -1.0
+    if t == 90.0 or t == 270.0:
+        return 0.0
+    if t == 45.0 or t == 315.0:
+        return _KI_SQRT1_2
+    if t == 135.0 or t == 225.0:
+        return -_KI_SQRT1_2
+    return math.cos(deg * _KI_DEG_TO_RAD)
+
+
+def _ki_sin(deg: float) -> float:
+    t = _ki_normalize_deg(deg)
+    if t == 0.0 or t == 180.0:
+        return 0.0
+    if t == 45.0 or t == 135.0:
+        return _KI_SQRT1_2
+    if t == 225.0 or t == 315.0:
+        return -_KI_SQRT1_2
+    if t == 90.0:
+        return 1.0
+    if t == 270.0:
+        return -1.0
+    return math.sin(deg * _KI_DEG_TO_RAD)
+
+
+def _ki_arc_to_segment_count(radius: int, max_error: int, angle_deg: float) -> int:
+    """GetArcToSegmentCount."""
+    radius = max(1, radius)
+    max_error = max(1, max_error)
+    rel_error = max_error / radius
+    try:
+        inc = 180 / math.pi * math.acos(1.0 - rel_error) * 2
+    except ValueError:
+        inc = math.nan
+    inc = inc if inc < 360.0 / 8 else 360.0 / 8      # std::min(45, inc)
+    return max(_kiround(abs(angle_deg) / inc), 2)
+
+
+def _ki_circle_to_end_segment_delta_radius(radius: int, seg_count: int) -> int:
+    """CircleToEndSegmentDeltaRadius."""
+    if seg_count <= 2:
+        seg_count = 3
+    alpha = math.pi / seg_count
+    return _kiround(abs(radius * (1 - 1 / math.cos(alpha))))
+
+
+def _ki_seg_distance(a, b, p) -> int:
+    """SEG(a, b).Distance(p): the integer floor of the true distance."""
+    abx, aby = b[0] - a[0], b[1] - a[1]
+    apx, apy = p[0] - a[0], p[1] - a[1]
+    e = apx * abx + apy * aby
+    if e <= 0:
+        d2 = apx * apx + apy * apy
+    else:
+        f = abx * abx + aby * aby
+        if e >= f:
+            d2 = (p[0] - b[0]) ** 2 + (p[1] - b[1]) ** 2
+        else:
+            g = float(apx * apx + apy * apy) - (float(e) * e) / f
+            d2 = 0 if (g < 0 or g > float(2 ** 63 - 1)) else _kiround(g, 64)
+    return math.isqrt(d2)
+
+
+def kicad_arc_polyline(start: Tuple[int, int], mid: Tuple[int, int],
+                       end: Tuple[int, int],
+                       max_error: int = ZONE_ARC_MAX_ERROR_NM) -> List[Tuple[int, int]]:
+    """The polyline pcbnew holds for a three-point arc, in integer nm:
+    SHAPE_ARC(start, mid, end, 0).ConvertToPolyline(max_error), KiCad 10.0.0.
+
+    The start and end points are exact; between them each vertex sits at the
+    middle of its angular step, on a radius pushed out by half the effective
+    error so the chords straddle the arc."""
+    start, mid, end = tuple(start), tuple(mid), tuple(end)
+    c = _ki_arc_center(start, mid, end)
+    dx, dy = float(start[0] - c[0]), float(start[1] - c[1])
+    r = math.sqrt(dx * dx + dy * dy)
+    sa = _ki_normalize_deg(_ki_angle_deg(dx, dy))
+    if start == end:
+        ca = 360.0
+    else:
+        ca = (_ki_angle_deg(float(end[0] - c[0]), float(end[1] - c[1]))
+              - _ki_angle_deg(dx, dy))
+        v1 = (end[0] - mid[0], end[1] - mid[1])
+        v2 = (start[0] - mid[0], start[1] - mid[1])
+        if v1[0] * v2[1] - v1[1] * v2[0] > 0:        # IsCCW
+            if ca < 0.0:
+                ca += 360.0
+        elif ca > 0.0:
+            ca -= 360.0
+    half = max(1.0, max_error / 2.0)
+    if r < half or _ki_seg_distance(start, end, mid) < half:
+        n = 0
+        eff = r
+    else:
+        # The radius is passed as an int. Past 2^31 nm (a 2.1 m radius, an
+        # arc indistinguishable from its chord) that conversion is undefined
+        # in C++; arm64 saturates it, which is what this does.
+        ir = min(int(r), _KI_INT_MAX)
+        n = _ki_arc_to_segment_count(ir, max_error, ca)
+        seg360 = int(n * 360.0 / abs(ca))
+        eff = float(_ki_circle_to_end_segment_delta_radius(ir, seg360))
+    r += eff / 2
+    n *= 2
+    pts = [start]
+    for i in range(1, n, 2):
+        a = sa + (ca * i) / n
+        p = (_kiround(c[0] + r * _ki_cos(a)), _kiround(c[1] + r * _ki_sin(a)))
+        if p != pts[-1]:
+            pts.append(p)
+    if end != pts[-1]:
+        pts.append(end)
+    return pts
+
+
+_OUTLINE_VERTEX_RE = re.compile(r'\((xy|arc)(?=[\s(])')
+_OUTLINE_XY_RE = re.compile(r'\(xy\s+([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)')
+_OUTLINE_ARC_PT_RE = re.compile(r'\((start|mid|end)\s+([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)')
+
+
+class _KicadOutlineChain:
+    """The part of SHAPE_LINE_CHAIN (KiCad 10.0.0) a zone outline goes
+    through on load: Append(VECTOR2I), Append(SHAPE_ARC) and SetClosed(true).
+    Each point carries KiCad's pair of arc indices (first, second; -1 = none),
+    because closing an outline can ROTATE it: mergeFirstLastPointIfNeeded
+    drops a last point repeating the first and fixIndicesRotation then turns
+    the chain until it starts on a plain point or at an arc's start.
+
+    `closed=True` is a chain that is closed BEFORE its points arrive -- a
+    gr_poly / fp_poly's (EDA_SHAPE::SetPolyPoints -> SHAPE_POLY_SET::NewOutline
+    closes it): there the merge runs after every arc, never after an xy, so a
+    polygon whose last xy repeats its first point keeps it."""
+
+    def __init__(self, closed=False):
+        self.closed = closed
+        self.keys = []        # (x_nm, y_nm)
+        self.mm = []          # (x_mm, y_mm) as the file spells an xy point
+        self.shapes = []      # [first, second] arc index per point
+        self.arcs = []        # (start_nm, end_nm) of each arc kept as an arc
+
+    def _shared(self, i):
+        return self.shapes[i][0] != -1 and self.shapes[i][1] != -1
+
+    def _arc_index(self, i):
+        return self.shapes[i][1] if self._shared(i) else self.shapes[i][0]
+
+    def append_xy(self, key, mm):
+        if not self.keys or self.keys[-1] != key:
+            self.keys.append(key)
+            self.mm.append(mm)
+            self.shapes.append([-1, -1])
+
+    def append_arc(self, start, mid, end):
+        chain = kicad_arc_polyline(start, mid, end)
+        idx = -1
+        if len(chain) > 2:
+            idx = len(self.arcs)
+            self.arcs.append((tuple(start), tuple(end)))
+        if not self.keys or chain[0] != self.keys[-1]:
+            self.keys.append(chain[0])
+            self.mm.append((chain[0][0] / 1e6, chain[0][1] / 1e6))
+            self.shapes.append([idx, -1])
+        elif idx != -1 and len(chain) > 1:
+            # the arc's first segment hangs off the point already held
+            if self.shapes[-1] == [-1, -1]:
+                self.shapes[-1][0] = idx
+            else:
+                self.shapes[-1][1] = idx
+        for p in chain[1:]:
+            self.keys.append(p)
+            self.mm.append((p[0] / 1e6, p[1] / 1e6))
+            self.shapes.append([idx, -1])
+        if self.closed:
+            self._merge_closed()
+        # mergeFirstLastPointIfNeeded, open branch
+        elif len(self.keys) > 1 and self._shared(0):
+            self.keys.append(self.keys[0])
+            self.mm.append(self.mm[0])
+            self.shapes.append([self.shapes[0][0], -1])
+            self.shapes[0] = [self.shapes[0][1], -1]
+
+    def _is_arc_segment(self, i):
+        nxt = i + 1
+        if nxt > len(self.shapes) - 1:
+            if nxt == len(self.shapes) and self._shared(0):    # closed
+                nxt = 0
+            else:
+                return False
+        return self.shapes[i] != [-1, -1] and self._arc_index(i) == self.shapes[nxt][0]
+
+    def _is_arc_start(self, i):
+        if not self._is_arc_segment(i):
+            return False
+        if self._shared(i):
+            return True
+        return self.arcs[self._arc_index(i)][0] == self.keys[i]
+
+    def close(self):
+        """SetClosed(true)."""
+        self.closed = True
+        self._merge_closed()
+
+    def _merge_closed(self):
+        """mergeFirstLastPointIfNeeded, closed branch."""
+        if len(self.keys) > 1 and self.keys[0] == self.keys[-1]:
+            last = self._arc_index(len(self.keys) - 1)
+            if last != -1:
+                self.shapes[0] = [last, self.shapes[0][0]]
+            self.keys.pop()
+            self.mm.pop()
+            self.shapes.pop()
+            # fixIndicesRotation
+            if len(self.shapes) <= 1:
+                return
+            rotations = 0
+            while self._arc_index(0) != -1 and not self._is_arc_start(0):
+                for lst in (self.keys, self.mm, self.shapes):
+                    lst.insert(0, lst.pop())
+                if rotations > len(self.shapes):
+                    return
+                rotations += 1
+
+
+def _read_outline_chain(pts_text: str, closed: bool) -> '_KicadOutlineChain':
+    """Every `(xy ..)` / `(arc ..)` vertex of a `(pts ...)` through a
+    `_KicadOutlineChain`, as KiCad's parseOutlinePoints feeds them."""
+    chain = _KicadOutlineChain(closed=closed)
+    pos = 0
+    while True:
+        m = _OUTLINE_VERTEX_RE.search(pts_text, pos)
+        if not m:
+            break
+        if m.group(1) == 'xy':
+            xm = _OUTLINE_XY_RE.match(pts_text, m.start())
+            pos = m.end()
+            if not xm:
+                continue
+            chain.append_xy((_board_iu(xm.group(1)), _board_iu(xm.group(2))),
+                            (float(xm.group(1)), float(xm.group(2))))
+            pos = xm.end()
+            continue
+        end = find_matching_paren(pts_text, m.start())
+        body = pts_text[m.start():end]
+        pos = end
+        got = {k: (_board_iu(x), _board_iu(y))
+               for k, x, y in _OUTLINE_ARC_PT_RE.findall(body)}
+        if len(got) != 3:
+            continue          # pcbnew refuses the file; nothing to mirror
+        chain.append_arc(got['start'], got['mid'], got['end'])
+    return chain
+
+
+def zone_outline_points(pts_text: str) -> List[Tuple[float, float]]:
+    """The vertices of one zone / rule-area ``(pts ...)`` as pcbnew loads it
+    (mm): each ``(xy X Y)`` as written, each ``(arc (start) (mid) (end))``
+    replaced by `kicad_arc_polyline` (vertices on the nm grid), a point
+    equal on the nm grid to the one before it dropped, the way
+    SHAPE_LINE_CHAIN::Append skips it, and a last point repeating the first
+    dropped once: parseZONE closes the outline (SetClosed(true) ->
+    mergeFirstLastPointIfNeeded) in every file format. KiCad never writes
+    one, but a KiCad 5-converted board does on every zone, and an outline
+    can end on its own start through an arc -- after which pcbnew turns the
+    chain to start on a plain point or an arc's start (`_KicadOutlineChain`)."""
+    chain = _read_outline_chain(pts_text, closed=False)
+    chain.close()
+    return chain.mm
+
+
+def kicad_poly_shape_points(pts_text: str) -> List[Tuple[float, float]]:
+    """The vertices of a `gr_poly` / `fp_poly` ``(pts ...)`` as pcbnew holds
+    them in GetPolyShape().Outline(0) (mm, before a footprint's transform):
+    arcs as `kicad_arc_polyline`, consecutive duplicates dropped -- but the
+    chain is closed before its points arrive, so a last `xy` repeating the
+    first is KEPT (pcbnew keeps it; Castor_and_Pollux's faceplate outline)
+    and only an arc that ends on the first point merges it."""
+    return _read_outline_chain(pts_text, closed=True).mm
+
+
 def extract_zones(content: str, name_to_id: Dict[str, int] = None) -> List[Zone]:
     """Extract all filled zones from PCB file.
 
@@ -5683,8 +6775,10 @@ def extract_zones(content: str, name_to_id: Dict[str, int] = None) -> List[Zone]
                 net_name_v10 = _unescape_kicad_string(net_match_v10.group(1))
             else:
                 # No net clause at all: a NO-NET copper pour (net 0). It still
-                # pours real copper (nitrokey/vfo_ctrl decorative fills), and
-                # pcbnew keeps it -- dropping it under-modelled the board.
+                # pours real copper (nitrokey decorative fills), and pcbnew
+                # keeps it -- dropping it under-modelled the board. (vfo_ctrl's
+                # net-less zones are F.Mask / B.Mask openings, not copper; the
+                # non-copper skip below drops those on both fronts.)
                 net_id = 0
 
         # Extract net name. Unescaped like every other net_name in the model
@@ -5716,6 +6810,12 @@ def extract_zones(content: str, name_to_id: Dict[str, int] = None) -> List[Zone]
         # both spellings (#369 A5).
         layer_match = re.search(r'\(layer\s+"?([^")\s]+)"?\)', zone_header)
         if layer_match:
+            # A zone on one NON-copper layer (a mask opening, a silkscreen
+            # fill) is not copper -- pcbnew strips its net on load -- and
+            # pcb.zones is copper: skip it, as a (layers ...) zone naming no
+            # copper layer always was, and as build_pcb_data_from_board does.
+            if not layer_match.group(1).endswith('.Cu'):
+                continue
             zone_layers = [layer_match.group(1)]
         else:
             layers_match = re.search(r'\(layers\s+([^)]+)\)', zone_header)
@@ -5763,6 +6863,10 @@ def extract_zones(content: str, name_to_id: Dict[str, int] = None) -> List[Zone]
         zone_clearance_val = float(zcl_match.group(1)) if zcl_match else None
         mth_match = re.search(r'\(min_thickness\s+([\d.]+)\)', zone_header)
         zone_min_th = float(mth_match.group(1)) if mth_match else None
+        # #1164: a teardrop area is (attr (teardrop (type padvia|track_end)))
+        # in the header. A pad's own `(teardrops ...)` settings never reach a
+        # zone block.
+        is_teardrop = re.search(r'\(attr\s*\(teardrop[\s)]', zone_header) is not None
 
         # Extract polygon points - find (pts ...) and extract xy coordinates
         pts_start = zone_content.find('(pts')
@@ -5782,31 +6886,32 @@ def extract_zones(content: str, name_to_id: Dict[str, int] = None) -> List[Zone]
                     break
 
         pts_content = zone_content[pts_start:pts_end + 1]
-        # Parse all (xy x y) points
-        xy_pattern = r'\(xy\s+([\d.-]+)\s+([\d.-]+)\)'
-        polygon = [(float(m.group(1)), float(m.group(2)))
-                   for m in re.finditer(xy_pattern, pts_content)]
-
-        # Drop CONSECUTIVE coincident vertices: pcbnew never sees them --
-        # SHAPE_LINE_CHAIN::Append (aAllowDuplication=false, integer-nm
-        # compare) silently skips a point equal to the previously appended
-        # one on load, so an outline written with a redundant duplicate
-        # vertex (route_planes rewrites can emit these) loads with fewer
-        # points than the file text and parser-parity flags a phantom
-        # vertex-count mismatch. Mirror pcbnew exactly: consecutive-only,
-        # on the nm grid; collinear runs and a last==first closing vertex
-        # are KEPT (pcbnew keeps both).
-        deduped = []
-        prev_key = None
-        for pt in polygon:
-            key = (round(pt[0] * 1e6), round(pt[1] * 1e6))
-            if key != prev_key:
-                deduped.append(pt)
-                prev_key = key
-        polygon = deduped
+        # The outline as pcbnew loads it (`zone_outline_points`): an
+        # `(arc ...)` vertex becomes KiCad's own polyline -- reading only
+        # `(xy ...)` dropped an all-arc outline's zone outright (key_ripper's
+        # F&B.Cu GND pour) and cut the arcs out of a mixed one -- and a
+        # CONSECUTIVE coincident vertex is dropped, as
+        # SHAPE_LINE_CHAIN::Append (integer-nm compare) skips it on load
+        # (route_planes rewrites can emit these; parser parity used to flag a
+        # phantom vertex-count mismatch), and so is a last vertex repeating
+        # the first (pcbnew closes the outline as it parses it; a KiCad
+        # 5-converted board writes one on every zone). Collinear runs are KEPT.
+        polygon = zone_outline_points(pts_content)
 
         if not polygon:
             continue
+
+        # #1279: every later (polygon ...) block of the zone is a hole in its
+        # outline; the (filled_polygon ...) blocks after them are the fill.
+        holes = []
+        _fill_at = zone_content.find('(filled_polygon')
+        for _hm in re.finditer(r'\(polygon\b', zone_content):
+            if _hm.start() <= pts_start or (_fill_at != -1 and _hm.start() > _fill_at):
+                continue
+            _he = find_matching_paren(zone_content, _hm.start())
+            _hole = zone_outline_points(zone_content[_hm.start():_he])
+            if len(_hole) >= 3:
+                holes.append(_hole)
 
         for zl in zone_layers:
             zones.append(Zone(
@@ -5820,7 +6925,9 @@ def extract_zones(content: str, name_to_id: Dict[str, int] = None) -> List[Zone]
                 island_area_min=island_area_min,
                 clearance=zone_clearance_val,
                 min_thickness=zone_min_th,
-                in_footprint=in_footprint
+                in_footprint=in_footprint,
+                teardrop=is_teardrop,
+                holes=holes,
             ))
 
     return zones
@@ -5833,7 +6940,10 @@ def extract_keepouts(content: str) -> List[dict]:
     — e.g. an antenna-flange RF clearance. Returns a list of dicts:
         {polygon: [(x,y),...], layers: set(layer_names),
          tracks_allowed: bool, vias_allowed: bool, copper_pour_allowed: bool,
-         in_footprint: bool}
+         in_footprint: bool, name: str}
+    `name` is the area's `(name ...)` ('' when it has none): a .kicad_dru
+    condition names the area it restricts (`A.intersectsArea('corridor')`),
+    and an area that allows everything can still be one (net_keepouts).
     """
     keepouts = []
     for zc, in_footprint in _iter_zone_blocks(content):
@@ -5888,17 +6998,23 @@ def extract_keepouts(content: str) -> List[dict]:
                     if pc == 0:
                         p_end = i
                         break
-            pts = [(float(a), float(b)) for a, b in
-                   re.findall(r'\(xy\s+([\d.-]+)\s+([\d.-]+)\)', zc[p_start:p_end + 1])]
+            # As pcbnew loads it, `(arc ...)` vertices included: a rule area
+            # drawn with rounded corners kept only its straight runs, and an
+            # all-arc one (a round keep-out) was dropped.
+            pts = zone_outline_points(zc[p_start:p_end + 1])
             if len(pts) >= 3:
                 polys.append(pts)
             search = p_end + 1
         if not polys:
             continue
+        # The zone's own (name "..."): the first one in the block -- no
+        # sub-clause of a zone carries a (name ...) of its own.
+        nm = re.search(r'\(name\s+"((?:[^"\\]|\\.)*)"\s*\)', zc)
         keepouts.append({'polygon': polys[0], 'holes': polys[1:], 'layers': layers,
                          'tracks_allowed': tracks_allowed, 'vias_allowed': vias_allowed,
                          'copper_pour_allowed': copper_pour_allowed,
-                         'in_footprint': in_footprint})
+                         'in_footprint': in_footprint,
+                         'name': nm.group(1).replace('\\"', '"') if nm else ''})
     return keepouts
 
 
@@ -5934,7 +7050,8 @@ def parse_kicad_pcb(filepath: str, guide_layer: str = "User.1",
     nets, name_to_id = extract_nets(content, kicad_version)
     _dups: Dict[str, int] = {}
     footprints, pads_by_net = extract_footprints_and_pads(
-        content, nets, name_to_id, duplicates=_dups)
+        content, nets, name_to_id, duplicates=_dups,
+        board_copper=board_info.copper_layers)
     if _dups:
         # ON STDERR, not stdout: 9 shipped call sites across 4 files emit bare
         # JSON on stdout (`route.py`, `converge.py`, `check_reachability.py`,
@@ -5968,6 +7085,8 @@ def parse_kicad_pcb(filepath: str, guide_layer: str = "User.1",
     vias = extract_vias(content, name_to_id)
     segments = extract_segments(content, name_to_id)
     zones = extract_zones(content, name_to_id)
+    propagate_via_cluster_nets(content, vias, segments, footprints, zones,
+                               board_info.copper_layers)
     if kicad_version and kicad_version < NEW_OVERBAR_NOTATION:
         _apply_new_overbar_notation(nets, footprints, zones)
     board_info.keepouts = extract_keepouts(content)
@@ -5991,7 +7110,7 @@ def parse_kicad_pcb(filepath: str, guide_layer: str = "User.1",
         footprints, board_info, extract_paste_graphics(content))
     graphic_copper_unmeasured = extract_unmodelled_footprint_copper(content)
 
-    return PCBData(
+    pcb = PCBData(
         board_info=board_info,
         nets=nets,
         footprints=footprints,
@@ -6010,6 +7129,146 @@ def parse_kicad_pcb(filepath: str, guide_layer: str = "User.1",
         paste_apertures=paste_apertures,
         graphic_copper_unmeasured=graphic_copper_unmeasured,
     )
+    # #1279: KiCad groups named `sense:<REF>.<PAD>` declare protected Kelvin
+    # sense branches; resolved against the copper parsed above.
+    from sense_branch import sense_groups_from_text, resolve_sense_branches
+    pcb.sense_branches = resolve_sense_branches(pcb, sense_groups_from_text(content))
+    return pcb
+
+
+def propagate_via_cluster_nets(content: str, vias, segments, footprints, zones,
+                               copper_layers) -> int:
+    """Give a via the net of the copper it connects to, as pcbnew's
+    connectivity pass does on load: a track or via takes its cluster's ORIGIN
+    net -- the one net of the pads and zone fills it touches -- whatever net
+    the file wrote (CN_CONNECTIVITY_ALGO::propagateConnections; a via joins a
+    zone's FILL of any net, since a via can change net).
+
+    antmicro lpddr4_test_board writes nine stitching vias, seven on `(net 0)`
+    and two on `(net 9)` TMS_JTAG, inside GND fills on five inner layers with
+    nothing else on them: pcbnew's bare reader loads them as written,
+    `pcbnew.LoadBoard` and the KiCad GUI as GND, and kicad-cli grades them as
+    GND.
+
+    Bounded so an ordinary board pays almost nothing: only a via with no
+    same-net track end and no same-net pad on it is a candidate (a routed via
+    is never one), a via inside the outline of a pour of its OWN net on a
+    layer it spans is taken to be that pour's stitching via and kept (a via
+    in a void of its own pour is the one case this skips), and a zone's fills
+    are read from the file only when a remaining candidate lies inside the
+    OUTLINE of a zone of another net on a layer it spans. The origin nets are the fills containing the via's centre on its
+    layers, plus -- as conflicts, since they stand for the pads behind them --
+    the nets of other tracks ending in it and of pads whose box covers it. A
+    via with exactly one origin net takes it; otherwise it keeps its own. A
+    `(free yes)` via keeps its net, as in KiCad. Tracks are not re-netted.
+    Returns how many vias changed."""
+    if not vias:
+        return 0
+    order = {ln: i for i, ln in enumerate(copper_layers)}
+
+    def span(v):
+        ix = [order[ln] for ln in (v.layers or []) if ln in order]
+        return set(copper_layers[min(ix):max(ix) + 1]) if ix else set()
+
+    cell = 1.0
+    ends = {}
+    for s in segments:
+        if getattr(s, 'graphic', False):
+            continue
+        for ex, ey in ((s.start_x, s.start_y), (s.end_x, s.end_y)):
+            ends.setdefault((int(ex // cell), int(ey // cell)), []).append((ex, ey, s))
+    # Each netted pad in every cell its bounding square covers, so a via asks
+    # one cell: the pads whose square could hold its centre.
+    pads = {}
+    for fp in footprints.values():
+        for p in fp.pads:
+            if p.net_id:
+                h = max(p.size_x, p.size_y) / 2.0
+                for i in range(int((p.global_x - h) // cell), int((p.global_x + h) // cell) + 1):
+                    for j in range(int((p.global_y - h) // cell), int((p.global_y + h) // cell) + 1):
+                        pads.setdefault((i, j), []).append(p)
+
+    def pads_on(x, y):
+        return pads.get((int(x // cell), int(y // cell)), ())
+
+    def near(table, x, y, reach):
+        k = int(reach // cell) + 1
+        cx, cy = int(x // cell), int(y // cell)
+        for i in range(cx - k, cx + k + 1):
+            for j in range(cy - k, cy + k + 1):
+                yield from table.get((i, j), ())
+
+    copper_zones = [z for z in zones if z.net_id and not getattr(z, 'teardrop', False)
+                    and len(z.polygon) >= 3]
+    zone_box = [(z, (min(p[0] for p in z.polygon), min(p[1] for p in z.polygon),
+                     max(p[0] for p in z.polygon), max(p[1] for p in z.polygon)))
+                for z in copper_zones]
+    todo = []
+    for v in vias:
+        if getattr(v, 'free', False):
+            continue        # `(free yes)`: KiCad never re-nets a free via
+        layers = span(v)
+        r = v.size / 2.0
+        own = any(s.net_id == v.net_id and s.layer in layers
+                  and (ex - v.x) ** 2 + (ey - v.y) ** 2 <= r * r
+                  for ex, ey, s in near(ends, v.x, v.y, r)) if v.net_id else False
+        own = own or (v.net_id and any(
+            p.net_id == v.net_id and abs(p.global_x - v.x) <= max(p.size_x, p.size_y) / 2
+            and abs(p.global_y - v.y) <= max(p.size_x, p.size_y) / 2
+            for p in pads_on(v.x, v.y)))
+        if own:
+            continue
+        over = [z for z, (x0, y0, x1, y1) in zone_box
+                if z.layer in layers and x0 <= v.x <= x1 and y0 <= v.y <= y1
+                and _pt_in_ring(v.x, v.y, z.polygon)]
+        # Inside a pour of its OWN net it is that pour's stitching via: its
+        # own net is an origin, so it cannot change (this skips the GND
+        # vias every human-routed board carries, which used to cost
+        # thunderscope 22 s of fill reading for no change at all).
+        if any(z.net_id == v.net_id for z in over):
+            continue
+        if over:
+            todo.append((v, layers, over))
+    if not todo:
+        return 0
+    want = {z.uuid for _v, _l, over in todo for z in over if z.uuid}
+    fills = {}          # (zone uuid, layer) -> [rings]
+    for body, _in_fp in _iter_zone_blocks(content):
+        if '(filled_polygon' not in body:
+            continue
+        # The zone's own id, from its header, as extract_zones reads it.
+        _hdr = min([i for i in (body.find(t) for t in ('(polygon', '(filled_polygon',
+                                                       '(keepout')) if i != -1]
+                   or [len(body)])
+        um = uuid_or_tstamp(body[:_hdr])
+        if um not in want:
+            continue
+        for fm in re.finditer(r'\(filled_polygon\b', body):
+            fb = body[fm.start():find_matching_paren(body, fm.start())]
+            lm = re.search(r'\(layer\s+"([^"]+)"\)', fb)
+            ring = [(float(x), float(y)) for x, y in
+                    re.findall(r'\(xy\s+([-\d.]+)\s+([-\d.]+)\)', fb)]
+            if lm and len(ring) >= 3:
+                fills.setdefault((um, lm.group(1)), []).append(ring)
+    changed = 0
+    for v, layers, over in todo:
+        origin = {z.net_id for z in over
+                  if any(_pt_in_ring(v.x, v.y, ring)
+                         for ring in fills.get((z.uuid, z.layer), ()))}
+        if not origin:
+            continue
+        r = v.size / 2.0
+        origin |= {s.net_id for ex, ey, s in near(ends, v.x, v.y, r)
+                   if s.net_id and s.layer in layers
+                   and (ex - v.x) ** 2 + (ey - v.y) ** 2 <= r * r}
+        origin |= {p.net_id for p in pads_on(v.x, v.y)
+                   if abs(p.global_x - v.x) <= max(p.size_x, p.size_y) / 2
+                   and abs(p.global_y - v.y) <= max(p.size_x, p.size_y) / 2
+                   and ('*.Cu' in p.layers or layers & set(p.layers))}
+        if len(origin) == 1 and v.net_id not in origin:
+            v.net_id = origin.pop()
+            changed += 1
+    return changed
 
 
 def _apply_new_overbar_notation(nets, footprints, zones) -> None:
@@ -6099,19 +7358,23 @@ def stage_live_project_rules(board_path: str, board):
         rules = proj.setdefault('board', {}).setdefault(
             'design_settings', {}).setdefault('rules', {})
         bds = board.GetDesignSettings()
-        for key, attr in (('min_clearance', 'm_MinClearance'),
-                          ('min_track_width', 'm_TrackMinWidth'),
-                          ('min_via_diameter', 'm_ViasMinSize'),
-                          ('min_through_hole_diameter', 'm_MinThroughDrill'),
-                          ('min_via_annular_width', 'm_ViasMinAnnularWidth'),
-                          ('min_hole_to_hole', 'm_HoleToHoleMin'),
-                          ('min_hole_clearance', 'm_HoleClearance'),
-                          ('min_copper_edge_clearance',
-                           'm_CopperEdgeClearance')):
-            try:
-                rules[key] = getattr(bds, attr) / 1e6
-            except Exception:
-                pass
+        # The rules the live board DECLARES, not every value pcbnew holds: a
+        # project-less board sits at pcbnew's factory values (hole clearance
+        # 0.25, edge 0.5, ...), which its file does not declare, and the
+        # snapshot is parsed in-process by the oracle legs -- their hole floor
+        # (obstacle_map.resolve_hole_clearance) and edge band
+        # (effective_board_edge_clearance) read these rules, and would have
+        # priced floors the CLI reads nowhere. pcbnew loads a missing rule at
+        # that same factory value, so the snapshot's own refill is unchanged.
+        from fix_kicad_drc_settings import live_declared_rules, LIVE_RULE_ATTR
+        _declared = live_declared_rules(board) or {}
+        for key in LIVE_RULE_ATTR:
+            if key == 'min_connection':
+                continue          # never staged before; its own reader (#1187)
+            if key in _declared:
+                rules[key] = _declared[key]
+            else:
+                rules.pop(key, None)
         # Default net class: KiCad 10 accessor first (board.GetNetClasses()
         # returns an EMPTY map there), then the legacy map.
         nc = None
@@ -6515,6 +7778,31 @@ def _attach_custom_pad_polygons(board, custom_pads):
             pts = _kipy_pad_polygon_points(pwh)
             if pts:
                 pad_objs[i].polygons = pts
+                _size_custom_pad_from_copper(pad_objs[i], kpads[i])
+
+
+def _size_custom_pad_from_copper(pad_obj, kpad):
+    """#967: a custom pad whose copper is NOT just its anchor is sized by the
+    board-frame box of that copper about the copper centre (global_x/y), with
+    no residual tilt -- main's rule on both parse paths. A pad whose copper is
+    its anchor (`_kipy_custom_copper_is_anchor`) keeps the anchor rect and its
+    tilt, which `_build_pad_from_kipy` already gave it. The box comes from the
+    rendered polygon, which sits up to the board's max error inside a curve
+    (main's pcbnew builder reads the exact effective-shape box first and this
+    polygon only as its fallback; kipy has no effective-shape box)."""
+    try:
+        primary = kpad.padstack.copper_layers[0]
+    except Exception:
+        return
+    anchor = pad_obj.anchor_size or (pad_obj.size_x, pad_obj.size_y)
+    if _kipy_custom_copper_is_anchor(primary, anchor):
+        return
+    pts = [p for ring in (pad_obj.polygons or []) for p in ring]
+    if not pts:
+        return
+    pad_obj.size_x = 2 * max(abs(x - pad_obj.global_x) for x, _ in pts)
+    pad_obj.size_y = 2 * max(abs(y - pad_obj.global_y) for _, y in pts)
+    pad_obj.rect_rotation = 0.0
 
 
 def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
@@ -6597,30 +7885,15 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
         name = getattr(net_obj, "name", "") or ""
         return (net_name_to_id.get(name, 0), name)
 
-    # --- Drawings (Edge.Cuts bounding box + outline polygons) ---
+    # --- Drawings (Edge.Cuts outline, copper graphics) ---
     #
-    # Edge.Cuts ONLY. Copper GRAPHICS are a standing IPC-side gap, in both
-    # halves the text parser models: #337's board-level `gr_*` on F.Cu/B.Cu,
-    # and #908's `fp_*` copper drawn INSIDE a footprint (an SOT89 tab, a PCB
-    # antenna, a solder-jumper bridge). Neither reaches PCBData here, so the
-    # obstacle builders and check_drc are blind to it on this front while the
-    # CLI sees it.
-    #
-    # The two are one item, not two: #908 is a refinement of #337's emission
-    # (same net-0 `graphic=True` Segments, plus the owning footprint's pose and
-    # `owner_ref`), so porting #908 alone would model a part's land pattern
-    # while still running routes across a board-level logo. `get_shapes()`
-    # below already returns every board-level PCB_SHAPE, so the board half is
-    # a layer filter plus the emitter; the footprint half additionally needs
-    # each footprint's own shapes, which `get_shapes()` does NOT return (it
-    # asks for top-level KOT_PCB_SHAPE items, so footprint children are
-    # excluded -- the same reason the writer below cannot strip a part's own
-    # copper, which is the defect #908 fixed on the SWIG front).
-    #
-    # When it is ported, the pad-count decision MUST come from
-    # `footprint_copper_is_functional`, the scalar predicate the text parser,
-    # the pcbnew parser and both writers already share, so this front cannot
-    # answer it differently.
+    # `get_shapes()` returns every board-level PCB_SHAPE, but no footprint
+    # child (it asks for top-level KOT_PCB_SHAPE items). Both halves the text
+    # parser models therefore read the footprints' own shapes as well
+    # (`_kipy_fp_shapes`): a footprint's Edge.Cuts (#304) and the copper its
+    # land pattern draws (#908) -- the latter through `kipy_graphic_copper`,
+    # whose pad-count decision is `footprint_copper_is_functional`, the
+    # predicate the text parser, main's pcbnew parser and both writers share.
     edge_cuts_bl = name_to_bl.get("Edge.Cuts")
     drawings = []
     try:
@@ -6631,43 +7904,13 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
         except Exception:
             drawings = []
 
-    board_bounds = _compute_edge_cuts_bbox_kipy(drawings, edge_cuts_bl)
-    board_outline, board_cutouts = _extract_board_contours_kipy(drawings, edge_cuts_bl)
-
-    # Stackup (best-effort via kipy; falls back to parsing the file)
-    stackup = _extract_stackup_kipy(board)
-
-    board_info = BoardInfo(
-        layers=layers_dict,
-        copper_layers=copper_layers,
-        board_bounds=board_bounds,
-        stackup=stackup,
-        board_outline=board_outline,
-        # _extract_board_contours_kipy returns ONE outline plus cutouts, where
-        # the text parser returns a LIST of outers (#304 multi-outline boards).
-        # This referenced an undefined `board_outlines` and so raised NameError
-        # on EVERY call -- i.e. the IPC plugin could never build PCBData at all
-        # (ipc_entry logs "build_pcb_data_from_board failed" and the dialog
-        # never opens). Wrap the single outline so the field matches what this
-        # builder actually produces; bringing the kipy side up to the text
-        # parser's containment classification is a separate parity item.
-        board_outlines=([board_outline] if board_outline else []),
-        board_cutouts=board_cutouts
-    )
-
-    # --- Footprints and pads ---
-    footprints: Dict[str, Footprint] = {}
-    pads_by_net: Dict[int, List[Pad]] = {}
-
+    # The footprint list is read FIRST: a footprint's own Edge.Cuts count
+    # toward the bounds and the outline (#304, a board whose whole outline
+    # lives in a footprint), as on both of main's parse paths.
     try:
         fp_iter = board.get_footprints()
     except Exception:
         fp_iter = []
-
-    # (pad_obj, kipy_pad) for custom-shaped pads, resolved to their real copper
-    # outline in a batch after the loop (issue #188).
-    custom_pads: List[Tuple[Pad, object]] = []
-
     # #726: two footprint BLOCKS can claim one reference, and the ordinal that
     # separates them is a property of the ordered list rather than of any one
     # footprint -- so names are resolved for the WHOLE board first and zipped
@@ -6686,7 +7929,42 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
     _raw_refs = kipy_raw_references(_live_fps)
     _dups_live = duplicate_reference_counts(_raw_refs)
     _live_keys = disambiguate_references(_raw_refs)
+    _fp_pairs = list(zip(_live_keys, _live_fps))
 
+    # Edge.Cuts: main's pcbnew contour scan, shape for shape
+    # (`kipy_board_contours`): lines, rectangles, arcs, circles, beziers and
+    # polygons (pcbnew's points, arcs included, zero-length edges skipped --
+    # 6febcfad), footprint-drawn Edge.Cuts too, classified into OUTER rings and
+    # true cut-outs (#304). The reader this replaces matched only polygons (a
+    # kipy shape has no `shape_type`), so a line-drawn outline came back as no
+    # outline at all, and it called every ring but the largest a cut-out.
+    board_bounds = _compute_edge_cuts_bbox_kipy(drawings, edge_cuts_bl, _fp_pairs)
+    board_outlines, board_cutouts = kipy_board_contours(
+        drawings, edge_cuts_bl, _fp_pairs)
+    board_outline = board_outlines[0] if board_outlines else []
+
+    # Stackup (best-effort via kipy; falls back to parsing the file)
+    stackup = _extract_stackup_kipy(board)
+
+    board_info = BoardInfo(
+        layers=layers_dict,
+        copper_layers=copper_layers,
+        board_bounds=board_bounds,
+        stackup=stackup,
+        board_outline=board_outline,
+        board_outlines=board_outlines,
+        board_cutouts=board_cutouts
+    )
+
+    # --- Footprints and pads ---
+    footprints: Dict[str, Footprint] = {}
+    pads_by_net: Dict[int, List[Pad]] = {}
+
+    # (pad_obj, kipy_pad) for custom-shaped pads, resolved to their real copper
+    # outline in a batch after the loop (issue #188).
+    custom_pads: List[Tuple[Pad, object]] = []
+
+    # (#726: the footprints were listed and keyed above, before the outline.)
     for fp, reference in zip(_live_fps, _live_keys):
         fp_name = _fp_library_name(fp)
         fp_x, fp_y = _vec_to_xy_mm(_fp_position(fp))
@@ -6729,43 +8007,13 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
         # overrides message (None = not set; pads without their own inherit).
         _fp_paste = kipy_footprint_paste_overrides(fp)
 
-        # Net-tie pad groups — parity with the text parser (Kelvin shunts /
-        # net-tie parts; KiCad exempts the grouped pads' mutual clearance).
-        #
-        # #604: GetNetTiePadGroups() returns a raw std::vector<wxString> that
-        # this SWIG build does not wrap as a Python sequence -- iterating it
-        # raises TypeError, the except swallowed it, and every net-tie board
-        # came back with net_tie_groups=[] while the text parser read the
-        # groups fine. That is a real model gap (the GUI builds its PCBData
-        # here, so its clearance waiver was blind to net ties), and it made
-        # validate_pcb_data report a permanent false parity FAIL on 7 of the
-        # 99 sets-21-27 boards (lm399_burnin: 26 NT parts).
-        #
-        # GetNetTiePads(pad) IS wrapped -- it returns a tuple of the PADs tied
-        # to that pad, the queried pad included -- so rebuild each group from
-        # it and de-duplicate. Gated on IsNetTie() so ordinary footprints cost
-        # one bool, and the raw-vector path stays as the fallback for builds
-        # that wrap it but lack IsNetTie.
-        fp_net_tie = []
-        try:
-            if fp.IsNetTie():
-                _seen = set()
-                for _pad in fp.Pads():
-                    _grp = frozenset(str(p.GetNumber())
-                                     for p in fp.GetNetTiePads(_pad))
-                    if len(_grp) >= 2 and _grp not in _seen:
-                        _seen.add(_grp)
-                        fp_net_tie.append(sorted(_grp))
-        except Exception:
-            fp_net_tie = []
-        if not fp_net_tie:
-            try:
-                for _grp in fp.GetNetTiePadGroups():
-                    _nums = [p.strip() for p in str(_grp).split(',') if p.strip()]
-                    if len(_nums) >= 2:
-                        fp_net_tie.append(_nums)
-            except Exception:
-                pass
+        # Net-tie pad groups -- parity with the text parser (Kelvin shunts /
+        # net-tie parts; KiCad exempts the grouped pads' mutual clearance),
+        # off the kipy definition's `net_ties` (`kipy_net_tie_groups`). This
+        # read was pcbnew's IsNetTie()/GetNetTiePads(), which a kipy
+        # footprint does not have, so every IPC footprint came back with no
+        # group and the clearance waiver was blind to net ties.
+        fp_net_tie = kipy_net_tie_groups(fp)
 
         # Own uuid + sheet path (#459), the kipy mirrors of the text parser's
         # (uuid ...) / (path ...). These read `fp.m_Uuid` / `fp.GetPath()` --
@@ -6791,55 +8039,16 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
         except Exception:
             fp_path = ""
 
+        # #1211: the sheet's name and file, the text parser's
+        # `_footprint_sheet_fields` (`kipy_footprint_sheet_fields`).
+        fp_sheet_name, fp_sheet_file = kipy_footprint_sheet_fields(fp)
+
         # Reference-label geometry (#481) -- parity with the text parser's
-        # RefLabel. Probed on splitflap+ulx3s under KiCad 10:
-        # GetFPRelativePosition() IS the file's (at x y) bit-for-bit (B-side
-        # included: KiCad stores flipped children pre-mirrored), and
-        # GetTextAngle() IS the file's stored angle -- the label's ABSOLUTE
-        # board rotation (see placement/labels.py::label_world_angle for the
-        # probe record). Defensive per surrounding style: a moved accessor
-        # must not take the whole parse down.
-        fp_ref_label = None
-        try:
-            _ref = fp.Reference()
-            _rel = _ref.GetFPRelativePosition()
-            try:
-                _ref_rot = _ref.GetTextAngle().AsDegrees()
-            except AttributeError:
-                _ref_rot = _ref.GetTextAngle() / 10.0  # older: tenths of deg
-            _ref_size = _ref.GetTextSize()  # VECTOR2I: x=width, y=height
-            _just = []
-            try:
-                _hj = int(_ref.GetHorizJustify())
-                _vj = int(_ref.GetVertJustify())
-                if _hj < 0:
-                    _just.append('left')
-                elif _hj > 0:
-                    _just.append('right')
-                if _vj < 0:
-                    _just.append('top')
-                elif _vj > 0:
-                    _just.append('bottom')
-            except Exception:
-                pass
-            try:
-                if _ref.IsMirrored():
-                    _just.append('mirror')
-            except Exception:
-                pass
-            fp_ref_label = RefLabel(
-                at_x=to_mm(_rel.x),
-                at_y=to_mm(_rel.y),
-                rotation=_ref_rot % 360,
-                size_h=to_mm(_ref_size.y),  # file order is (size HEIGHT WIDTH)
-                size_w=to_mm(_ref_size.x),
-                thickness=to_mm(_ref.GetTextThickness()),
-                layer=get_layer_name(_ref.GetLayer()),
-                justify=' '.join(_just),
-                hidden=not _ref.IsVisible(),
-                is_property_node=True)
-        except Exception:
-            fp_ref_label = None
+        # RefLabel, off the kipy Reference field (`kipy_ref_label`). This
+        # read used pcbnew's Reference()/GetFPRelativePosition() and an
+        # undefined `to_mm`, so it raised on every footprint and the IPC
+        # model carried no label at all.
+        fp_ref_label = kipy_ref_label(fp, fp_x, fp_y, fp_rotation)
 
         footprint = Footprint(
             reference=reference,
@@ -6863,6 +8072,8 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
             parsed_pose=(fp_x, fp_y, fp_rotation, fp_layer),
             attrs=fp_attrs,
             has_model=fp_has_model,
+            sheet_name=fp_sheet_name,
+            sheet_file=fp_sheet_file,
         )
 
         for pad in _fp_pads(fp):
@@ -6886,6 +8097,26 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
     if custom_pads:
         _attach_custom_pad_polygons(board, custom_pads)
 
+    # #829, mirroring both of main's parse paths: which footprints draw
+    # Edge.Cuts, and which of those draw the BOARD's boundary rather than a
+    # relief that travels with the part (`kipy_footprint_outline_owners`,
+    # through the shared `classify_outline_owners`). Anything that moves a
+    # footprint gates on `owns_board_outline`; with no stamp here every IPC
+    # footprint read False and the guard was disarmed. Its own try, so a
+    # failure says so rather than leaving the guard silently off.
+    try:
+        for _okey, _structural in kipy_footprint_outline_owners(
+                drawings, edge_cuts_bl, _fp_pairs).items():
+            _ofp = footprints.get(_okey)
+            if _ofp is not None:
+                _ofp.owns_edge_cuts = True
+                _ofp.owns_board_outline = _structural
+    except Exception as _exc:                                    # noqa: BLE001
+        print(f"  WARNING: could not determine Edge.Cuts ownership from the "
+              f"live board ({type(_exc).__name__}: {_exc}); a footprint that "
+              f"draws the board outline will NOT be protected from being "
+              f"moved (#829)")
+
     # --- Segments (tracks) ---
     segments: List[Segment] = []
     try:
@@ -6903,6 +8134,9 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
             # own flag -- a locked arc is locked as a whole, and the pieces
             # are this parser's linearization, not the board's objects.
             seg_locked = kipy_locked(track)
+            # The file's (uuid ...) on every piece, as on both of main's parse
+            # paths: a `sense:` group's members resolve against it (#1279).
+            seg_uuid = _kipy_uuid(track)
             # Arc tracks: kipy models them as a distinct ArcTrack carrying a
             # `.mid` point (a straight Track has none). Linearize the bulge with
             # the SAME helper the text parser uses (three defining points), so
@@ -6918,13 +8152,13 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
                     segments.append(Segment(
                         start_x=p0[0], start_y=p0[1], end_x=p1[0], end_y=p1[1],
                         width=width, layer=layer, net_id=net_id,
-                        locked=seg_locked))
+                        uuid=seg_uuid, locked=seg_locked))
             else:
                 segments.append(Segment(
                     start_x=start_x, start_y=start_y,
                     end_x=end_x, end_y=end_y,
                     width=width, layer=layer, net_id=net_id,
-                    locked=seg_locked))
+                    uuid=seg_uuid, locked=seg_locked))
         except Exception:
             continue
 
@@ -6945,22 +8179,22 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
     for v in via_iter:
         try:
             x, y = _vec_to_xy_mm(v.position)
-            # Via layer span lives on padstack.drill, not directly on the
-            # via object. Through-hole vias fall back to F.Cu/B.Cu when
-            # the kipy version doesn't expose them.
-            top_bl = name_to_bl["F.Cu"]
-            bot_bl = name_to_bl["B.Cu"]
-            drill_obj = getattr(getattr(v, "padstack", None), "drill", None)
-            if drill_obj is not None:
-                top_bl = getattr(drill_obj, "start_layer", None) or top_bl
-                bot_bl = getattr(drill_obj, "end_layer", None) or bot_bl
+            # #1268: the via's TYPE, and the layer pair read from it -- a via
+            # spans part of the stack only when KiCad types it blind, buried or
+            # micro; a through via is F.Cu/B.Cu whatever its drill says
+            # (db60fe77), and a partial pair reads top layer first (6552e70f).
+            # The span lives on padstack.drill (`kipy_via_layers`).
+            v_type = kipy_via_type(v)
             net_id, _ = resolve_net(getattr(v, "net", None))
             vias.append(Via(
                 x=x, y=y,
                 size=_nm_to_mm(getattr(v, "diameter", 0)),
                 drill=_nm_to_mm(getattr(v, "drill_diameter", 0)),
-                layers=[get_layer_name(top_bl), get_layer_name(bot_bl)],
+                layers=kipy_via_layers(v, v_type),
                 net_id=net_id,
+                via_type=v_type,
+                # The file's (uuid ...): a `sense:` group member (#1279).
+                uuid=_kipy_uuid(v),
                 # Parity with BOTH of main's parse paths, which fill these and
                 # which this builder did not: without tenting_attrs a via the
                 # plugin RE-PLACES (the #313 cap nudge, a rip-up, a tap
@@ -6972,12 +8206,22 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
         except Exception:
             continue
 
+    # --- Copper GRAPHICS (#337) and footprint copper (#908) ---
+    # After the tracks, as main's builder orders them (`kipy_graphic_copper`).
+    # A fresh build per dialog step is how a footprint moved in the session
+    # carries its copper art (main 7b0f15d0 re-reads it in the SWIG re-sync).
+    segments.extend(kipy_graphic_copper(drawings, _fp_pairs, resolve_net))
+
     # Parity with parse_kicad_pcb: net-tagged graphics never conduct (#513).
     warn_net_tagged_graphics(segments,
                              {n.name: nid for nid, n in nets.items()})
 
     # --- Zones ---
-    zones = _extract_zones_kipy(board, get_layer_name, resolve_net)
+    # Copper only, footprint zones included (`_extract_zones_kipy`): teardrop
+    # areas flagged (#1164), holes (#1279), arc outlines (fe367f3f), the
+    # closing repeat merged (37fb1b93), mask/paste zones and rule areas out
+    # (da63ad5c).
+    zones = _extract_zones_kipy(board, get_layer_name, resolve_net, _fp_pairs)
 
     # IPC plugins only run on KiCad 10+, so unconditionally flag this as
     # K10-format data. route_planes / output_writer / route_disconnected_planes
@@ -7102,9 +8346,12 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
     # member resolution instead of maintaining a second uuid-walk against a SWIG
     # API whose accessors move between KiCad versions. Best-effort -- an unsaved
     # or missing file simply yields no groups, which is also the corpus norm.
+    # The path through `_ipc_board_path()`: this read called pcbnew's
+    # board.GetFileName(), which a kipy board does not have, so it raised and
+    # every IPC board came back with no groups.
     groups = {}
     try:
-        _bf = board.GetFileName()
+        _bf = _ipc_board_path()
         if _bf:
             with open(_bf, 'r', encoding='utf-8') as f:
                 groups = extract_groups(f.read(), footprints)
@@ -7272,7 +8519,7 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
                         pass
         return None
 
-    return PCBData(
+    pcb = PCBData(
         board_info=board_info,
         nets=nets,
         footprints=footprints,
@@ -7302,7 +8549,27 @@ def _build_pcb_data_from_board_impl(board, guide_layer: str = "User.1",
         paste_apertures=build_paste_apertures(footprints, board_info,
                                               _paste_graphics962),
         graphic_copper_unmeasured=_unmeasured962,
+        # 250f5183's `live_records_provider` (the kicad_routing_tools records
+        # the SWIG board holds as a top-level property) stays None: kipy can
+        # neither read nor write a board property, so on this front the
+        # records live in the project only. The live-rules provider (#1187,
+        # #1038 declared floors) likewise has no kipy source; readers fall
+        # back to the file, as for a board pcbnew has no settings for.
     )
+    # #1279 parity with parse_kicad_pcb and main's pcbnew builder: the LIVE
+    # board's `sense:<REF>.<PAD>` groups (a group drawn in this session counts
+    # before it is saved), resolved by the same function against the same
+    # uuids. Every fresh build re-resolves them, which is how the IPC dialog's
+    # re-sync (a fresh PCBData per step) re-reads a group edited mid-session.
+    try:
+        from sense_branch import resolve_sense_branches
+        pcb.sense_branches = resolve_sense_branches(pcb, kipy_sense_groups(board))
+    except Exception as _e1279:                                 # noqa: BLE001
+        print(f"  WARNING: could not resolve the board's sense: groups "
+              f"({type(_e1279).__name__}: {_e1279}); sense branches (#1279) "
+              f"are not protected")
+        pcb.sense_branches = []
+    return pcb
 
 
 # --- kipy helpers used by build_pcb_data_from_board ----------------------
@@ -7966,14 +9233,39 @@ def _build_pad_from_kipy(pad, reference: str, fp_x: float, fp_y: float,
         if shape_attr is None:
             shape = "rect"
         else:
+            # kipy returns the PadStackShape enum as a bare int, which has no
+            # `.name`: read through `str(int)` it labelled EVERY pad 'rect' --
+            # circles, ovals and roundrects boxed, and no custom pad ever
+            # reached the #188 polygon read below. The enum's own name first.
             name = getattr(shape_attr, "name", None)
+            if not name:
+                try:
+                    from kipy.proto.board.board_types_pb2 import PadStackShape
+                    name = _kipy_enum_name(PadStackShape, shape_attr)
+                except Exception:
+                    name = ""
             if name:
                 shape = _pad_shape_label(str(name).lower())
             else:
                 shape = _pad_shape_label(str(shape_attr).lower())
 
-        pad_layers = _pad_layer_names(pad, padstack, get_layer_name,
-                                       copper_layers, board_copper_layer_names)
+        # The pad's kind and its true layer SET (`kipy_pad_layer_names`, the
+        # spelling both of main's parse paths give, 4f3e4e6e); the old
+        # drill-based guess only when kipy gives no layer set.
+        pad_type = kipy_pad_type(pad)
+        pad_layers = (kipy_pad_layer_names(padstack, board_copper_layer_names,
+                                           pad_type)
+                      or _pad_layer_names(pad, padstack, get_layer_name,
+                                          copper_layers, board_copper_layer_names))
+        # #967 (62aace71): the size is the max over the copper layers the pad
+        # is ON -- a back-only pad of a front/inner/back stack reads its B.Cu
+        # entry, not the F.Cu base, and an inner entry counts only where the
+        # pad has inner copper.
+        _base_size = (size_x, size_y)
+        if primary_layer is not None:
+            size_x, size_y = _kipy_padstack_on_size(
+                padstack, copper_layers, _base_size, pad_layers,
+                board_copper_layer_names)
 
         net = getattr(pad, "net", None)
         net_id, net_name = resolve_net(net)
@@ -8021,7 +9313,7 @@ def _build_pad_from_kipy(pad, reference: str, fp_x: float, fp_y: float,
         # #962: a custom pad's ANCHOR size in the pad frame, kept before the
         # primitive-extent override below (parity with the text parser's base
         # `(size ...)`): KiCad sizes the paste ratio term from the anchor.
-        anchor_size = (size_x, size_y) if shape == "custom" else None
+        anchor_size = _base_size if shape == "custom" else None
         if shape == "custom" and primary_layer is not None:
             ext_x = ext_y = 0.0
             try:
@@ -8086,6 +9378,8 @@ def _build_pad_from_kipy(pad, reference: str, fp_x: float, fp_y: float,
         if local_clearance == 0.0:
             local_clearance = fp_clearance
         _pad_paste = kipy_pad_paste_overrides(padstack)
+        # #1248: pad-to-die length/delay, parity with the text parser.
+        _pad_die = kipy_pad_to_die(pad)
 
         return Pad(
             component_ref=reference,
@@ -8113,6 +9407,9 @@ def _build_pad_from_kipy(pad, reference: str, fp_x: float, fp_y: float,
             anchor_size=anchor_size,
             # #1063: which layers KiCad flashes this pad on.
             unconnected_layer_mode=kipy_unconnected_layer_mode(padstack),
+            pad_type=pad_type,
+            die_length=_pad_die[0],
+            die_delay=_pad_die[1],
         )
     except Exception as e:
         print(f"Warning: failed to read pad {getattr(pad, 'number', '?')}: {e}")
@@ -8195,24 +9492,150 @@ def _pad_layer_names(pad, padstack, get_layer_name, copper_layers,
     return layers
 
 
-def _compute_edge_cuts_bbox_kipy(drawings, edge_cuts_bl) -> Optional[Tuple[float, float, float, float]]:
-    """Compute bounding box of Edge.Cuts drawings from a list of kipy shapes."""
-    if not drawings or edge_cuts_bl is None:
+def _kipy_on_layer(item, bl) -> bool:
+    """Is a kipy item on `bl`? kipy hands a proto enum field back as a bare
+    int, and `layer_maps()` holds the enum value, so compare by int too."""
+    if bl is None:
+        return False
+    layer = getattr(item, "layer", None)
+    if layer is None:
+        return False
+    if layer == bl:
+        return True
+    try:
+        return int(layer) == int(getattr(bl, "value", bl))
+    except (TypeError, ValueError):
+        return False
+
+
+def _kipy_shape_kind(shape) -> str:
+    """'segment' / 'arc' / 'circle' / 'rectangle' / 'polygon' / 'bezier' for a
+    kipy graphic shape, '' when it is none of them.
+
+    Read off the proto's `geometry` oneof -- a kipy BoardShape has no
+    `shape_type` attribute at all, which is why the reader this replaces
+    matched no segment, rectangle or arc on Edge.Cuts and an outline drawn
+    with lines reached the IPC model as NO outline. Duck-typed fallback for an
+    object without the proto (the tests' stand-ins)."""
+    try:
+        kind = shape.proto.shape.WhichOneof("geometry")
+        if kind:
+            return kind
+    except Exception:
+        pass
+    for kind, attrs in (("polygon", ("polygons",)),
+                        ("bezier", ("control1", "control2")),
+                        ("circle", ("radius_point",)),
+                        ("rectangle", ("top_left", "bottom_right")),
+                        ("arc", ("start", "mid", "end")),
+                        ("segment", ("start", "end"))):
+        try:
+            if all(getattr(shape, a, None) is not None for a in attrs):
+                return kind
+        except Exception:
+            continue
+    return ""
+
+
+def _kipy_edge_shape_segments(shape) -> List[Tuple[Tuple[float, float], Tuple[float, float]]]:
+    """The Edge.Cuts segments of one kipy graphic shape, shape by shape as
+    main's pcbnew contour scan reads a PCB_SHAPE (`_shape_segments` in
+    `_extract_board_contours_from_pcbnew`): a line under 1 um on both axes is
+    skipped (zynq_ad9364's point-lines), a rectangle is its four edges, an arc
+    and a bezier are linearized by the text parser's helpers, a circle is a
+    ring, and a polygon is every outline ring, its points as pcbnew holds them
+    (`kipy_outline_points`, arcs included) with its zero-length edges skipped
+    (`_closed_ring_segments`, 6febcfad)."""
+    kind = _kipy_shape_kind(shape)
+    segs = []
+    if kind == "segment":
+        a, b = _vec_to_xy_mm(shape.start), _vec_to_xy_mm(shape.end)
+        if abs(b[0] - a[0]) >= 0.001 or abs(b[1] - a[1]) >= 0.001:
+            segs.append((a, b))
+    elif kind == "rectangle":
+        (x1, y1), (x2, y2) = (_vec_to_xy_mm(shape.top_left),
+                              _vec_to_xy_mm(shape.bottom_right))
+        segs.extend((((x1, y1), (x2, y1)), ((x2, y1), (x2, y2)),
+                     ((x2, y2), (x1, y2)), ((x1, y2), (x1, y1))))
+    elif kind == "arc":
+        segs.extend(_arc_to_segments(_vec_to_xy_mm(shape.start),
+                                     _vec_to_xy_mm(shape.mid),
+                                     _vec_to_xy_mm(shape.end)))
+    elif kind == "circle":
+        c, e = _vec_to_xy_mm(shape.center), _vec_to_xy_mm(shape.radius_point)
+        r = math.hypot(e[0] - c[0], e[1] - c[1])
+        if r > 1e-6:
+            segs.extend(_circle_to_segments(c[0], c[1], r))
+    elif kind == "bezier":
+        segs.extend(_bezier_to_segments(
+            _vec_to_xy_mm(shape.start), _vec_to_xy_mm(shape.control1),
+            _vec_to_xy_mm(shape.control2), _vec_to_xy_mm(shape.end)))
+    elif kind == "polygon":
+        for pwh in (getattr(shape, "polygons", None) or []):
+            segs.extend(_closed_ring_segments(
+                kipy_outline_points(getattr(pwh, "outline", None), closed=True)))
+    return segs
+
+
+def _kipy_edge_bound_points(shape) -> List[Tuple[float, float]]:
+    """The points one Edge.Cuts shape contributes to the board bounds, by the
+    text parser's `extract_board_bounds` rules: a line's ends (zero-length
+    included), a rectangle's corners, an arc's and a bezier's linearized
+    points, a polygon's pcbnew points, a circle's exact extremes."""
+    kind = _kipy_shape_kind(shape)
+    if kind == "segment":
+        return [_vec_to_xy_mm(shape.start), _vec_to_xy_mm(shape.end)]
+    if kind == "rectangle":
+        return [_vec_to_xy_mm(shape.top_left), _vec_to_xy_mm(shape.bottom_right)]
+    if kind in ("arc", "bezier"):
+        return [p for seg in _kipy_edge_shape_segments(shape) for p in seg]
+    if kind == "circle":
+        c, e = _vec_to_xy_mm(shape.center), _vec_to_xy_mm(shape.radius_point)
+        r = math.hypot(e[0] - c[0], e[1] - c[1])
+        if r <= 1e-6:
+            return []
+        return [(c[0] - r, c[1] - r), (c[0] + r, c[1] + r)]
+    if kind == "polygon":
+        return [p for pwh in (getattr(shape, "polygons", None) or [])
+                for p in kipy_outline_points(getattr(pwh, "outline", None),
+                                             closed=True)]
+    return []
+
+
+def _kipy_fp_shapes(fp) -> list:
+    """A kipy footprint's own graphic shapes, in BOARD coordinates (KiCad keeps
+    a footprint's children at absolute positions, and the API serializes them
+    so). `board.get_shapes()` asks for top-level shapes only and never returns
+    these -- which is how a footprint's Edge.Cuts and copper art went missing
+    from the IPC model."""
+    try:
+        return list(fp.definition.shapes)
+    except Exception:
+        return []
+
+
+def _compute_edge_cuts_bbox_kipy(drawings, edge_cuts_bl,
+                                 footprints=()) -> Optional[Tuple[float, float, float, float]]:
+    """Bounding box of the Edge.Cuts geometry: board drawings and, as on both
+    of main's parse paths, the Edge.Cuts a footprint draws (a board whose
+    whole outline lives in a footprint). `footprints` is (key, kipy footprint)
+    pairs. The old reader probed attribute names a kipy shape does not have
+    (a rectangle's corners, a circle's radius) and missed both."""
+    if edge_cuts_bl is None:
         return None
+    shapes = [d for d in (drawings or ()) if _kipy_on_layer(d, edge_cuts_bl)]
+    for _key, fp in (footprints or ()):
+        shapes.extend(g for g in _kipy_fp_shapes(fp)
+                      if _kipy_on_layer(g, edge_cuts_bl))
     bmin_x = bmin_y = float("inf")
     bmax_x = bmax_y = float("-inf")
     found = False
-    for d in drawings:
-        layer = getattr(d, "layer", None)
-        # Compare both as enum and as int value — kipy may return either
-        # depending on whether `.layer` is the proto field or a wrapper.
-        if not (layer == edge_cuts_bl
-                or (hasattr(layer, "value") and hasattr(edge_cuts_bl, "value")
-                    and layer.value == edge_cuts_bl.value)
-                or (isinstance(layer, int) and hasattr(edge_cuts_bl, "value")
-                    and layer == edge_cuts_bl.value)):
+    for d in shapes:
+        try:
+            pts = _kipy_edge_bound_points(d)
+        except Exception:
             continue
-        for x, y in _shape_extreme_points_kipy(d):
+        for x, y in pts:
             bmin_x = min(bmin_x, x); bmax_x = max(bmax_x, x)
             bmin_y = min(bmin_y, y); bmax_y = max(bmax_y, y)
             found = True
@@ -8221,46 +9644,24 @@ def _compute_edge_cuts_bbox_kipy(drawings, edge_cuts_bl) -> Optional[Tuple[float
     return (bmin_x, bmin_y, bmax_x, bmax_y)
 
 
-def _shape_extreme_points_kipy(shape) -> List[Tuple[float, float]]:
-    """Yield (x_mm, y_mm) for every vertex on a kipy graphic shape.
-
-    Handles BoardShape segment/arc/rect/circle (start/end/center/mid)
-    plus BoardPolygon (.polygons[*].outline as a PolyLine of nodes).
-    """
-    pts: List[Tuple[float, float]] = []
-    for attr in ("start", "end", "center", "mid", "midpoint"):
-        v = getattr(shape, attr, None)
-        if v is not None and (hasattr(v, "x_mm") or hasattr(v, "x")):
-            try:
-                pts.append(_vec_to_xy_mm(v))
-            except Exception:
-                continue
-    # BoardPolygon: kipy stores closed polygons as a sequence of
-    # PolygonWithHoles, each with a PolyLine outline of PolyLineNodes.
-    polys = getattr(shape, "polygons", None)
-    if polys is not None:
-        try:
-            for pwh in polys:
-                pts.extend(_polyline_points_mm(getattr(pwh, "outline", None)))
-        except Exception as e:
-            print(f"_shape_extreme_points: BoardPolygon walk failed: {e}")
-    return pts
-
-
 def _polyline_points_mm(polyline) -> List[Tuple[float, float]]:
     """Extract (x_mm, y_mm) from every node of a kipy PolyLine.
 
     PolyLineNode wraps a Vector2 — either exposed as .point or directly as
-    .x/.y (nm) or .x_mm/.y_mm. Probe defensively across kipy versions.
+    .x/.y (nm) or .x_mm/.y_mm. Probe defensively across kipy versions. An ARC
+    node is replaced by its pcbnew polyline (`kicad_arc_polyline`): read as a
+    point it is the empty Vector2, i.e. a phantom (0, 0) vertex.
     """
     out: List[Tuple[float, float]] = []
     if polyline is None:
         return out
-    try:
-        nodes = list(polyline)
-    except TypeError:
-        nodes = list(getattr(polyline, "nodes", None) or [])
-    for node in nodes:
+    for node in _kipy_nodes(polyline):
+        arc = _kipy_node_arc(node)
+        if arc is not None:
+            for x, y in kicad_arc_polyline(*arc):
+                if not out or out[-1] != (x / 1e6, y / 1e6):
+                    out.append((x / 1e6, y / 1e6))
+            continue
         candidate = getattr(node, "point", node)
         if hasattr(candidate, "x_mm") and hasattr(candidate, "y_mm"):
             try:
@@ -8276,73 +9677,147 @@ def _polyline_points_mm(polyline) -> List[Tuple[float, float]]:
     return out
 
 
-def _extract_board_contours_kipy(drawings, edge_cuts_bl):
-    """Chain Edge.Cuts shapes into (outline, [cutouts]) polygons.
-
-    Handles both `BoardShape` (segment/rect/arc/circle, fed through the
-    segment chainer) and `BoardPolygon` (already a closed loop of points;
-    used as a contour directly).
-    """
-    if not drawings or edge_cuts_bl is None:
-        return [], []
-
-    segments = []
-    closed_contours: List[List[Tuple[float, float]]] = []
-    for d in drawings:
-        if getattr(d, "layer", None) != edge_cuts_bl:
-            continue
-        # BoardPolygon — the outline is already a closed loop.
-        polys = getattr(d, "polygons", None)
-        if polys is not None:
-            try:
-                for pwh in polys:
-                    pts = _polyline_points_mm(getattr(pwh, "outline", None))
-                    if len(pts) >= 3:
-                        closed_contours.append(pts)
-            except Exception:
-                pass
-            continue
-
+def _kipy_nodes(polyline) -> list:
+    """The nodes of a kipy PolyLine (or of anything iterable of nodes)."""
+    if polyline is None:
+        return []
+    nodes = getattr(polyline, "nodes", None)
+    if nodes is None:
         try:
-            start = getattr(d, "start", None)
-            end = getattr(d, "end", None)
-            shape_type = getattr(d, "shape_type", None)
-            type_name = getattr(shape_type, "name", "") if shape_type is not None else ""
-            type_name = str(type_name).lower()
-            if "segment" in type_name and start is not None and end is not None:
-                segments.append((_vec_to_xy_mm(start), _vec_to_xy_mm(end)))
-            elif "rect" in type_name and start is not None and end is not None:
-                x1, y1 = _vec_to_xy_mm(start)
-                x2, y2 = _vec_to_xy_mm(end)
-                segments.append(((x1, y1), (x2, y1)))
-                segments.append(((x2, y1), (x2, y2)))
-                segments.append(((x2, y2), (x1, y2)))
-                segments.append(((x1, y2), (x1, y1)))
-            elif "arc" in type_name and start is not None and end is not None:
-                mid = getattr(d, "mid", None) or getattr(d, "midpoint", None)
-                if mid is not None:
-                    segments.extend(_arc_to_segments(
-                        _vec_to_xy_mm(start),
-                        _vec_to_xy_mm(mid),
-                        _vec_to_xy_mm(end),
-                    ))
+            nodes = list(polyline)
+        except TypeError:
+            nodes = []
+    return list(nodes)
+
+
+def _kipy_vec_nm(v) -> Tuple[int, int]:
+    """A kipy Vector2 as integer nanometres (kipy 0.7 exposes .x/.y in nm;
+    a stand-in may expose .x_mm/.y_mm only)."""
+    try:
+        return (int(v.x), int(v.y))
+    except Exception:
+        return (int(round(float(v.x_mm) * 1e6)), int(round(float(v.y_mm) * 1e6)))
+
+
+def _kipy_node_arc(node):
+    """(start, mid, end) in integer nm for an ARC node of a kipy PolyLine,
+    None for a point node."""
+    try:
+        if not getattr(node, "has_arc", False):
+            return None
+        a = node.arc
+        return (_kipy_vec_nm(a.start), _kipy_vec_nm(a.mid), _kipy_vec_nm(a.end))
+    except Exception:
+        return None
+
+
+def kipy_outline_points(polyline, closed: bool) -> List[Tuple[float, float]]:
+    """A kipy PolyLine's vertices as pcbnew holds them (mm), through the text
+    parser's own `_KicadOutlineChain`:
+
+    - closed=False: a ZONE or rule-area outline (`zone_outline_points`) -- the
+      chain is closed after its points arrive, so a last point repeating the
+      first is merged (37fb1b93);
+    - closed=True: a gr_poly / fp_poly (`kicad_poly_shape_points`) -- closed
+      before, so a repeated closing point is kept (6febcfad).
+
+    An arc node is `kicad_arc_polyline` from its own start/mid/end, which is
+    what the text parser computes from the file's `(arc ...)` entry (fe367f3f):
+    the reader this replaces took an arc node's empty `point`, putting a
+    (0, 0) vertex into the outline. NOT probed against a live KiCad: that the
+    API packs an arc segment of the loaded chain as one arc node carrying the
+    SHAPE_ARC's start/mid/end is read from its PolyLine contract, and the
+    tests feed the nodes as the file spells them."""
+    chain = _KicadOutlineChain(closed=closed)
+    for node in _kipy_nodes(polyline):
+        arc = _kipy_node_arc(node)
+        if arc is not None:
+            chain.append_arc(*arc)
+            continue
+        if getattr(node, "has_point", True) is False:
+            continue
+        try:
+            p = _kipy_vec_nm(getattr(node, "point", node))
         except Exception:
             continue
+        chain.append_xy(p, (p[0] / 1e6, p[1] / 1e6))
+    if not closed:
+        chain.close()
+    return chain.mm
 
-    # Fold any BoardShape segments through the chainer (matches the SWIG-
-    # era path where each drawing was a separate segment item).
-    if len(segments) >= 3:
-        chained = _chain_segments_into_contours(segments)
-        if chained:
-            closed_contours.extend(chained)
 
-    if not closed_contours:
+def kipy_board_contours(drawings, edge_cuts_bl, footprints=(),
+                        include_footprints=True, owners_out=None):
+    """(outers, cutouts) from Edge.Cuts -- the kipy twin of main's
+    `_extract_board_contours_from_pcbnew`, rule for rule: every shape's
+    segments (`_kipy_edge_shape_segments`), the Edge.Cuts a footprint draws
+    (#304: crkbd's per-LED windows), the 4-segment axis-aligned rectangle
+    short-circuit, the chainer, and `_classify_contours` (multi-outline
+    boards, true cut-outs). `footprints` is (key, kipy footprint) pairs;
+    `owners_out`, when a dict, gets each footprint's own segments by key
+    (#829); `include_footprints=False` asks what the outline would be with no
+    footprint contributing."""
+    if edge_cuts_bl is None:
         return [], []
-    closed_contours.sort(
-        key=lambda c: (max(p[0] for p in c) - min(p[0] for p in c)) *
-                      (max(p[1] for p in c) - min(p[1] for p in c)),
-        reverse=True)
-    return closed_contours[0], closed_contours[1:]
+    segments = []
+    for d in (drawings or ()):
+        if not _kipy_on_layer(d, edge_cuts_bl):
+            continue
+        try:
+            segments.extend(_kipy_edge_shape_segments(d))
+        except Exception:
+            continue
+    for key, fp in (footprints if include_footprints else ()):
+        for g in _kipy_fp_shapes(fp):
+            if not _kipy_on_layer(g, edge_cuts_bl):
+                continue
+            try:
+                segs = _kipy_edge_shape_segments(g)
+            except Exception:
+                continue
+            segments.extend(segs)
+            if owners_out is not None and segs:
+                owners_out.setdefault(key, []).extend(segs)
+
+    if len(segments) < 3:
+        return [], []
+    if len(segments) == 4:
+        vertices = set()
+        for seg in segments:
+            vertices.add((round(seg[0][0], 3), round(seg[0][1], 3)))
+            vertices.add((round(seg[1][0], 3), round(seg[1][1], 3)))
+        if len(vertices) == 4 and all(
+                abs(s[0][0] - s[1][0]) < 0.001 or abs(s[0][1] - s[1][1]) < 0.001
+                for s in segments):
+            return [], []
+    contours = _chain_segments_into_contours(segments)
+    if not contours:
+        return [], []
+    return _classify_contours(contours)
+
+
+def _extract_board_contours_kipy(drawings, edge_cuts_bl):
+    """(outline, other rings) -- the shape this reader had before it took
+    main's classification (`kipy_board_contours`); kept for its callers that
+    want one ring. The builder reads `kipy_board_contours` directly."""
+    outers, cutouts = kipy_board_contours(drawings, edge_cuts_bl)
+    return (outers[0] if outers else []), list(outers[1:]) + list(cutouts)
+
+
+def kipy_footprint_outline_owners(drawings, edge_cuts_bl, footprints) -> Dict[str, bool]:
+    """`{key: owns_board_outline}` for every footprint that draws Edge.Cuts --
+    the kipy twin of `footprint_outline_owners_from_pcbnew` (#829), through the
+    same decision function (`classify_outline_owners`) on the same three
+    inputs: each footprint's own segments, the bounds of the board-level
+    Edge.Cuts alone, and the outline the board draws with no footprint."""
+    owners: Dict[str, list] = {}
+    kipy_board_contours(drawings, edge_cuts_bl, footprints, owners_out=owners)
+    if not owners:
+        return {}
+    board_only_bounds = _compute_edge_cuts_bbox_kipy(drawings, edge_cuts_bl)
+    outers, _c = kipy_board_contours(drawings, edge_cuts_bl,
+                                     include_footprints=False)
+    return classify_outline_owners(owners, board_only_bounds, outers)
 
 
 def _extract_stackup_kipy(board) -> List[StackupLayer]:
@@ -8436,65 +9911,672 @@ def _extract_stackup_kipy(board) -> List[StackupLayer]:
     return stackup
 
 
-def _extract_zones_kipy(board, get_layer_name, resolve_net) -> List[Zone]:
-    """Read filled zones via kipy.
-
-    `resolve_net` is the name→synthetic-id resolver from
-    build_pcb_data_from_board. Required — without it zones would
-    mismatch the rest of PCBData's net ids and "is connected?" would
-    silently break for zoned nets.
-    """
-    zones: List[Zone] = []
+def _kipy_enum_name(enum_cls, value) -> str:
+    """A proto enum value's NAME ('PSS_CIRCLE'), '' when it has none. kipy
+    returns enum fields as bare ints, so `getattr(value, 'name')` -- which
+    this builder used to ask -- answers nothing for every one of them."""
     try:
-        zone_iter = board.get_zones()
-    except AttributeError:
-        return zones
+        return str(enum_cls.Name(int(value)))
     except Exception:
-        return zones
+        return ""
 
-    for z in zone_iter:
+
+def _kipy_layer_token(bl) -> str:
+    """A BoardLayer's canonical name ('F.Fab', 'In3.Cu', 'User.12'), '' when
+    unknown. Not `layer_maps()`: that table names copper, mask, paste, silk,
+    Edge.Cuts and User.1-9 only and maps anything else to 'F.Cu', which would
+    put an F.Fab pad layer or a courtyard zone on copper."""
+    try:
+        from kipy.util.board_layer import canonical_name
+        name = canonical_name(bl)
+        return "" if name == "Unknown" else str(name)
+    except Exception:
+        return ""
+
+
+def _kipy_uuid(item) -> str:
+    """A kipy item's KIID as the file spells it (its `(uuid ...)`), '' when it
+    cannot be read. Tracks, vias and zones carry it on both of main's parse
+    paths: a `sense:` group's members resolve against it (#1279), and a zone's
+    ties its per-layer entries back together."""
+    for get in (lambda: item.id.value, lambda: item.proto.id.value):
         try:
-            net = getattr(z, "net", None)
-            net_id, net_name = resolve_net(net)
-            # kipy zones can span multiple layers; emit one Zone entry per
-            # layer so callers that filter by single layer match cleanly.
-            layers = getattr(z, "layers", None)
-            if layers is None:
-                layers = [getattr(z, "layer", None)]
-            polygon = _extract_zone_polygon_mm(z)
-            if not polygon:
-                continue
-            for bl in layers:
-                zones.append(Zone(
-                    net_id=net_id,
-                    net_name=net_name,
-                    layer=get_layer_name(bl),
-                    polygon=polygon,
-                ))
+            v = get()
         except Exception:
             continue
+        if v:
+            return str(v)
+    return ""
 
-    return zones
+
+_KIPY_VIA_TYPE_NAMES = {'VT_THROUGH': 'through', 'VT_MICRO': 'micro',
+                        'VT_BURIED': 'buried', 'VT_BLIND': 'blind',
+                        'VT_BLIND_BURIED': 'blind'}
 
 
-def _extract_zone_polygon_mm(zone) -> List[Tuple[float, float]]:
-    """Pull a zone's outer outline into a list of (x_mm, y_mm) points.
-
-    kipy zone.outline is a PolygonWithHoles whose .outline is a PolyLine.
-    Older releases may expose direct iteration; probe both.
-    """
-    outline = getattr(zone, "outline", None)
-    if outline is None:
-        return []
-    # PolygonWithHoles.outline → PolyLine
-    pwh_outline = getattr(outline, "outline", None)
-    if pwh_outline is not None:
-        return _polyline_points_mm(pwh_outline)
-    # Older / different shape: outline IS a polyline / iterable
+def kipy_via_type(via) -> str:
+    """A kipy Via's type in Via.via_type's spelling -- 'through', 'blind',
+    'buried' or 'micro' -- the twin of main's `pcbnew_via_type` and of the text
+    parser's `_via_type_from_block` (#1268). KiCad 9 has one BLIND_BURIED type
+    (read as 'blind', as its file writes it); KiCad 10 splits it. A via whose
+    type kipy cannot name falls back to its drill span, as main's does to the
+    layer pair: F.Cu/B.Cu (or a span kipy left unknown) is 'through', anything
+    else 'blind'. Never raises."""
     try:
-        return _polyline_points_mm(outline)
+        from kipy.proto.board.board_types_pb2 import ViaType
+        name = _KIPY_VIA_TYPE_NAMES.get(_kipy_enum_name(ViaType, via.type))
+        if name:
+            return name
+    except Exception:
+        pass
+    try:
+        from kipy.proto.board.board_types_pb2 import BoardLayer
+        d = via.padstack.drill
+        span = {int(d.start_layer), int(d.end_layer)}
+        if span & {int(BoardLayer.BL_UNKNOWN), int(BoardLayer.BL_UNDEFINED)}:
+            return 'through'
+        if span == {int(BoardLayer.BL_F_Cu), int(BoardLayer.BL_B_Cu)}:
+            return 'through'
+        return 'blind'
+    except Exception:
+        return 'through'
+
+
+def _copper_rank(name: str) -> int:
+    """Stack position of a copper layer name: F.Cu, In1..In30, B.Cu."""
+    if name == 'F.Cu':
+        return 0
+    if name == 'B.Cu':
+        return 99
+    m = re.match(r'In(\d+)\.Cu$', name or '')
+    return int(m.group(1)) if m else 50
+
+
+def kipy_via_layers(via, via_type: str) -> List[str]:
+    """A kipy via's layer pair, top layer first, as both of main's parse paths
+    read it (6552e70f: pcbnew's TopLayer()/BottomLayer()). A THROUGH via spans
+    F.Cu/B.Cu whatever its drill says, as KiCad loads an untyped via
+    (db60fe77); a span kipy cannot name reads F.Cu/B.Cu too."""
+    if via_type == 'through':
+        return ['F.Cu', 'B.Cu']
+    try:
+        d = via.padstack.drill
+        names = [_kipy_layer_token(d.start_layer), _kipy_layer_token(d.end_layer)]
+    except Exception:
+        return ['F.Cu', 'B.Cu']
+    if not all(n.endswith('.Cu') for n in names):
+        return ['F.Cu', 'B.Cu']
+    return sorted(names, key=_copper_rank)
+
+
+def kipy_sense_groups(board) -> List[Tuple[str, str, List[str]]]:
+    """`sense_branch.sense_groups_from_text` for a live kipy board (#1279):
+    [(group name, group uuid, [member uuid, ...])] for every `sense:` group.
+
+    The twin of main's `sense_groups_from_board`, which reads pcbnew's
+    board.Groups(); here it is `board.get_groups()` (kipy 0.7 / KiCad 10).
+    The members are the group's own item ids as KiCad holds them -- KiCad
+    drops a member that matches no item when it loads the board, so a live
+    group has no dangling member, which is what the text reader reports apart.
+    A board whose groups cannot be read says so, as main's does, rather than
+    protecting nothing in silence."""
+    from sense_branch import GROUP_PREFIX
+    out = []
+    try:
+        groups = list(board.get_groups())
+    except Exception as e:  # noqa: BLE001
+        print(f"  WARNING: could not read the board's groups over IPC "
+              f"({type(e).__name__}: {e}); sense branches (#1279) are not "
+              f"protected")
+        return out
+    for g in groups:
+        name = str(getattr(g, "name", "") or "")
+        if not name.startswith(GROUP_PREFIX):
+            continue
+        try:
+            members = [str(k.value) for k in g.proto.items]
+        except Exception:
+            members = [_kipy_uuid(it) for it in (getattr(g, "items", None) or [])]
+        out.append((name, _kipy_uuid(g), members))
+    return out
+
+
+def kipy_resolve_sense_branches(pcb_data, board) -> None:
+    """Re-resolve `pcb_data.sense_branches` from a live kipy board's `sense:`
+    groups (#1279) -- the twin of main's `resolve_live_sense_branches`, for a
+    dialog that keeps ONE PCBData across steps.
+
+    Resolve against the dialog's OWN PCBData, never adopt a fresh build's
+    branches: the resolver tags each sense pad (`pad.sense`, read by the plane
+    taps, the rescue and the oracle off `pads_by_net`), and a fresh build's
+    branches tag the fresh build's Pad objects, leaving the dialog's pads with
+    the tags of the last resolution. So the old tags are cleared first, as on
+    main, and the protection memo is dropped because holds decide it. Call it
+    once the dialog's copper, pads and zones are current."""
+    from sense_branch import resolve_sense_branches
+    for pads in (getattr(pcb_data, 'pads_by_net', None) or {}).values():
+        for pad in pads:
+            if getattr(pad, 'sense', ''):
+                pad.sense = ''
+    pcb_data.sense_branches = resolve_sense_branches(pcb_data,
+                                                     kipy_sense_groups(board))
+    vars(pcb_data).pop('_protection_map_memo', None)
+
+
+_KIPY_PAD_TYPES = {'PT_PTH': 'thru_hole', 'PT_SMD': 'smd',
+                   'PT_EDGE_CONNECTOR': 'connect', 'PT_NPTH': 'np_thru_hole'}
+
+
+def kipy_pad_type(pad) -> str:
+    """A kipy pad's kind in Pad.pad_type's spelling ('smd', 'thru_hole',
+    'np_thru_hole', 'connect' -- the file's own words), '' when unknown.
+    `pad_is_plated_through` and the NPTH-has-no-copper rule read it."""
+    try:
+        from kipy.proto.board.board_types_pb2 import PadType
+        return _KIPY_PAD_TYPES.get(_kipy_enum_name(PadType, pad.pad_type), '')
+    except Exception:
+        return ''
+
+
+def kipy_pad_layer_names(padstack, board_copper: Sequence[str],
+                         pad_type: str) -> List[str]:
+    """A kipy pad's layer SET as `canonical_pad_layers` spells it -- the set
+    pcbnew loads, the spelling both of main's parse paths agree on (`*.Cu`,
+    `*.Mask`, an F.Fab or User layer by its name; 4f3e4e6e and main's pcbnew
+    builder). Read off `padstack.layers`, the pad's own layer set; [] when
+    kipy gives none, and the caller falls back to `_pad_layer_names`. Copper
+    is listed first, in stack order: a consumer reading `layers[0]` takes it
+    for the pad's copper layer."""
+    try:
+        names = [_kipy_layer_token(bl) for bl in (padstack.layers or ())]
     except Exception:
         return []
+    names = [n for n in names if n]
+    if not names:
+        return []
+    cu = sorted((n for n in names if n.endswith('.Cu')), key=_copper_rank)
+    names = cu + [n for n in names if not n.endswith('.Cu')]
+    return canonical_pad_layers(names, board_copper,
+                                plated_through=(pad_type == 'thru_hole'))
+
+
+def _kipy_padstack_on_size(padstack, copper_layers, base: Tuple[float, float],
+                           pad_layers: Sequence[str],
+                           board_copper: Sequence[str]) -> Tuple[float, float]:
+    """`_padstack_copper_size` for a kipy padstack (#967, 62aace71): the
+    per-axis MAX of the pad's size over the copper layers it is ON, within the
+    board's copper. `base` is the first copper entry, the F.Cu geometry, as the
+    file's base `(size ...)` is; a front/inner/back stack adds its inner and
+    B.Cu entries, a custom one an entry per layer, and a layer with no entry
+    keeps the base. A padstack entry for a layer the pad is not on describes
+    no copper."""
+    try:
+        from kipy.proto.board.board_types_pb2 import PadStackType
+        mode = int(getattr(padstack, "type", PadStackType.PST_NORMAL))
+        fib = int(PadStackType.PST_FRONT_INNER_BACK)
+        custom = int(PadStackType.PST_CUSTOM)
+    except Exception:
+        return base
+    if mode not in (fib, custom):
+        return base
+    per = {}
+    for cl in (copper_layers or []):
+        n = _kipy_layer_token(getattr(cl, "layer", None))
+        size = getattr(cl, "size", None)
+        if n and size is not None:
+            per.setdefault(n, _vec_to_xy_mm(size))
+    on = [ln for ln in board_copper if '*.Cu' in pad_layers or ln in pad_layers]
+    if not on:
+        return base
+    inner = next((sz for n, sz in per.items() if n.startswith('In')), base)
+
+    def size_on(ln):
+        if ln == 'F.Cu':
+            return per.get('F.Cu', base)
+        if mode == fib:
+            return per.get('B.Cu', base) if ln == 'B.Cu' else inner
+        return per.get(ln, base)
+    got = [size_on(ln) for ln in on]
+    return max(s[0] for s in got), max(s[1] for s in got)
+
+
+def _kipy_custom_copper_is_anchor(primary_layer, anchor: Tuple[float, float],
+                                  eps: float = 1e-4) -> bool:
+    """`_custom_copper_is_anchor` for a kipy custom pad: is its copper exactly
+    the anchor -- no primitive, or every primitive (with half its stroke)
+    inside the anchor rect or circle? The primitives are the padstack layer's
+    `custom_shapes`, in the pad frame about the anchor. A primitive this
+    cannot measure (a bezier) is never assumed inside, the text rule. Such a
+    pad takes an ordinary pad's size and residual tilt; any other custom pad
+    is sized by the board-frame box of its copper (#967)."""
+    try:
+        shapes = list(getattr(primary_layer, "custom_shapes", None) or [])
+    except Exception:
+        return False
+    if not shapes:
+        return True
+    try:
+        from kipy.proto.board.board_types_pb2 import PadStackShape
+        circle = (int(getattr(primary_layer, "custom_anchor_shape", 0))
+                  == int(PadStackShape.PSS_CIRCLE))
+    except Exception:
+        circle = False
+    hx, hy = anchor[0] / 2.0, anchor[1] / 2.0
+    r = min(hx, hy)
+
+    def inside(x, y, grow):
+        if circle:
+            return math.hypot(x, y) + grow <= r + eps
+        return abs(x) + grow <= hx + eps and abs(y) + grow <= hy + eps
+
+    for sh in shapes:
+        kind = _kipy_shape_kind(sh)
+        try:
+            hw = _nm_to_mm(sh.attributes.stroke.width) / 2.0
+        except Exception:
+            hw = 0.0
+        if kind == "segment":
+            pts = [_vec_to_xy_mm(sh.start), _vec_to_xy_mm(sh.end)]
+        elif kind == "arc":
+            pts = [p for seg in _arc_to_segments(_vec_to_xy_mm(sh.start),
+                                                 _vec_to_xy_mm(sh.mid),
+                                                 _vec_to_xy_mm(sh.end))
+                   for p in seg]
+        elif kind == "rectangle":
+            (x1, y1), (x2, y2) = (_vec_to_xy_mm(sh.top_left),
+                                  _vec_to_xy_mm(sh.bottom_right))
+            pts = [(x1, y1), (x2, y1), (x2, y2), (x1, y2)]
+        elif kind == "circle":
+            c, e = _vec_to_xy_mm(sh.center), _vec_to_xy_mm(sh.radius_point)
+            rad = math.hypot(e[0] - c[0], e[1] - c[1])
+            if circle:
+                if math.hypot(*c) + rad + hw > r + eps:
+                    return False
+                continue
+            pts = [(c[0] - rad, c[1] - rad), (c[0] + rad, c[1] + rad)]
+        elif kind == "polygon":
+            pts = [p for pwh in (getattr(sh, "polygons", None) or [])
+                   for p in _kipy_graphic_poly_points(getattr(pwh, "outline", None))]
+        else:
+            return False
+        if not pts:
+            return False
+        if not all(inside(x, y, hw) for x, y in pts):
+            return False
+    return True
+
+
+def kipy_pad_to_die(pad) -> Tuple[float, float]:
+    """`pad_to_die_from_text` for a kipy pad (#1248): (die_length mm,
+    die_delay ps), (0.0, 0.0) when unset. The delay is a kipy `Time` in
+    attoseconds, which is KiCad's time IU (IU_PER_PS = 1e6, the text
+    parser's docstring), so ps = value_as / 1e6. A KiCad older than 10 has no
+    delay field and reads 0.0, as its file would."""
+    length = delay = 0.0
+    try:
+        length = _nm_to_mm(pad.pad_to_die_length)
+    except Exception:
+        length = 0.0
+    try:
+        p = pad.proto
+        if p.HasField("pad_to_die_delay"):
+            delay = float(p.pad_to_die_delay.value_as) / 1e6
+    except Exception:
+        delay = 0.0
+    return length, delay
+
+
+def kipy_footprint_sheet_fields(fp) -> Tuple[str, str]:
+    """`(sheet_name, sheet_file)` of a kipy footprint (#1211), the text
+    parser's `_footprint_sheet_fields`: FootprintInstance's
+    `symbol_sheet_name` / `symbol_sheet_filename` (KiCad 9.0.7+), which KiCad
+    fills from the same FOOTPRINT fields main's pcbnew builder reads
+    (GetSheetname / GetSheetfile). '' when this KiCad does not send them."""
+    try:
+        p = fp.proto
+        return (str(p.symbol_sheet_name or ""), str(p.symbol_sheet_filename or ""))
+    except Exception:
+        return ("", "")
+
+
+def kipy_ref_label(fp, fp_x: float, fp_y: float,
+                   fp_rotation: float) -> Optional['RefLabel']:
+    """The Reference field's geometry (#481) off a kipy footprint, in the
+    text parser's RefLabel form: the offset from the footprint origin in its
+    unrotated frame (pcbnew's GetFPRelativePosition, the inverse of the
+    footprint transform), the field's stored -- absolute -- angle, its size
+    (file order HEIGHT WIDTH), stroke, layer, justification and visibility.
+    None when kipy cannot say. The read this replaces called pcbnew's
+    accessors on a kipy footprint and an undefined `to_mm`, so every IPC
+    footprint came back with no label. Not probed against a live KiCad."""
+    try:
+        from kipy.proto.common.types.enums_pb2 import (HorizontalAlignment,
+                                                        VerticalAlignment)
+        rf = fp.reference_field
+        txt = rf.text
+        gx, gy = _vec_to_xy_mm(txt.position)
+        lx, ly = _global_to_local(fp_x, fp_y, fp_rotation, gx, gy)
+        attrs = txt.attributes
+        size = attrs.size
+        just = []
+        ha = _kipy_enum_name(HorizontalAlignment, attrs.horizontal_alignment)
+        va = _kipy_enum_name(VerticalAlignment, attrs.vertical_alignment)
+        if ha == 'HA_LEFT':
+            just.append('left')
+        elif ha == 'HA_RIGHT':
+            just.append('right')
+        if va == 'VA_TOP':
+            just.append('top')
+        elif va == 'VA_BOTTOM':
+            just.append('bottom')
+        if attrs.mirrored:
+            just.append('mirror')
+        return RefLabel(
+            at_x=round(lx * 1e6) / 1e6,
+            at_y=round(ly * 1e6) / 1e6,
+            rotation=float(attrs.angle) % 360,
+            size_h=_nm_to_mm(size.y),
+            size_w=_nm_to_mm(size.x),
+            thickness=_nm_to_mm(attrs.stroke_width),
+            layer=_kipy_layer_token(rf.layer) or "F.SilkS",
+            justify=' '.join(just),
+            hidden=not bool(rf.visible),
+            is_property_node=True)
+    except Exception:
+        return None
+
+
+def kipy_net_tie_groups(fp) -> List[List[str]]:
+    """A kipy footprint's net-tie pad groups, the text parser's
+    `(net_tie_pad_groups "1, 2")` read off its definition's `net_ties`. Each
+    entry's pad numbers are split on commas and whitespace too, so a group
+    KiCad hands over as one "1, 2" string reads the same as one it splits.
+    The read this replaces called pcbnew's IsNetTie() on a kipy footprint and
+    found no group on any board."""
+    out = []
+    try:
+        ties = list(fp.definition.proto.net_ties)
+    except Exception:
+        return out
+    for t in ties:
+        nums = []
+        for tok in getattr(t, "pad_number", None) or ():
+            for part in re.split(r'[,\s]+', str(tok)):
+                if part and part not in nums:
+                    nums.append(part)
+        if len(nums) >= 2:
+            out.append(nums)
+    return out
+
+
+def _kipy_graphic_poly_points(polyline) -> List[Tuple[float, float]]:
+    """`poly_points_with_arcs` for a kipy PolyLine: points as held, each arc
+    node linearized by `_arc_to_segments` from its own start/mid/end, and --
+    only when an arc was present -- consecutive repeats and a closing repeat
+    dropped (`_ring_without_repeats`), exactly the text rule."""
+    pts, arcs = [], False
+    for node in _kipy_nodes(polyline):
+        arc = _kipy_node_arc(node)
+        if arc is not None:
+            arcs = True
+            s, m, e = [(x / 1e6, y / 1e6) for x, y in arc]
+            segs = _arc_to_segments(s, m, e)
+            pts.append(segs[0][0])
+            pts.extend(p1 for _p0, p1 in segs)
+            continue
+        if getattr(node, "has_point", True) is False:
+            continue
+        try:
+            x, y = _kipy_vec_nm(getattr(node, "point", node))
+        except Exception:
+            continue
+        pts.append((x / 1e6, y / 1e6))
+    return _ring_without_repeats(pts) if arcs else pts
+
+
+def kipy_graphic_copper(drawings, footprints, resolve_net) -> List[Segment]:
+    """[Segment(graphic=True)] for a kipy board's copper GRAPHICS: board-level
+    shapes on a copper layer (#337) and the copper a footprint's land pattern
+    draws (#908) -- the twin of main's `pcbnew_graphic_copper` and of the text
+    parser's gr_* / fp_* pass, emitted the text parser's way:
+
+    - every copper shape of a pad-bearing footprint (NPTH pads do not count,
+      `footprint_copper_is_functional`); a pad-less logo footprint's copper is
+      the writer's to relocate to silk and is not modelled;
+    - a line or an arc at its stroke, a polygon / rectangle / circle as its
+      outline (a 0-stroke filled shape at the fab track width), its filled
+      interior as `graphic_ring` (#1181), a zero-length edge skipped;
+    - an UNFILLED zero-width shape at UNSTROKED_SHAPE_WIDTH, pcbnew's loader
+      rule (6925b417) -- kipy hands over the loaded width, so this is a guard;
+    - a polygon's arc vertices linearized by `_arc_to_segments` from their own
+      control points (`_kipy_graphic_poly_points`, 6925b417);
+    - a bezier is not modelled, as on the text side (graphic_copper_unmeasured).
+
+    `footprints` is (key, kipy footprint) pairs; `board.get_shapes()` returns
+    no footprint child, so the footprint half reads each part's own shapes,
+    which KiCad holds in board coordinates. `owner_ref` is the footprint key.
+    Not probed against a live KiCad."""
+    segments: List[Segment] = []
+
+    def feeders():
+        for d in (drawings or ()):
+            yield d, ""
+        for key, fp in (footprints or ()):
+            try:
+                npads = sum(1 for p in _fp_pads(fp)
+                            if kipy_pad_type(p) != 'np_thru_hole')
+            except Exception:
+                npads = 0
+            if not footprint_copper_is_functional(npads):
+                continue
+            for g in _kipy_fp_shapes(fp):
+                yield g, key
+
+    for d, owner in feeders():
+        try:
+            layer = _kipy_layer_token(getattr(d, "layer", None))
+        except Exception:
+            continue
+        if not layer.endswith('.Cu'):
+            continue
+        kind = _kipy_shape_kind(d)
+        try:
+            w = _nm_to_mm(d.attributes.stroke.width)
+        except Exception:
+            w = 0.0
+        try:
+            filled = bool(d.attributes.fill.filled)
+        except Exception:
+            filled = False
+        if kind in ("segment", "arc"):
+            filled = False
+        if w <= 0 and not filled:
+            w = UNSTROKED_SHAPE_WIDTH
+        try:
+            nid, _nn = resolve_net(getattr(d, "net", None))
+        except Exception:
+            nid = 0
+        uuid = _kipy_uuid(d)
+
+        def emit_outline(pts, kind_='poly', circle=None):
+            if len(pts) < 2:
+                return
+            ew = w if w > 0 else defaults.TRACK_WIDTH
+            seq = list(pts) + [pts[0]]
+            ring = tuple((float(x), float(y)) for x, y in pts) if filled else None
+            for a, b in zip(seq, seq[1:]):
+                if a == b:
+                    continue
+                segments.append(Segment(
+                    start_x=a[0], start_y=a[1], end_x=b[0], end_y=b[1],
+                    width=ew, layer=layer, net_id=nid, uuid=uuid, graphic=True,
+                    owner_ref=owner, drawn_width=max(0.0, w), graphic_kind=kind_,
+                    graphic_circle=circle, graphic_filled=filled,
+                    graphic_ring=ring))
+
+        try:
+            if kind == "segment":
+                a, b = _vec_to_xy_mm(d.start), _vec_to_xy_mm(d.end)
+                segments.append(Segment(
+                    start_x=a[0], start_y=a[1], end_x=b[0], end_y=b[1],
+                    width=w, layer=layer, net_id=nid, uuid=uuid, graphic=True,
+                    owner_ref=owner, drawn_width=w, graphic_kind='line'))
+            elif kind == "arc":
+                for p0, p1 in _arc_to_segments(_vec_to_xy_mm(d.start),
+                                               _vec_to_xy_mm(d.mid),
+                                               _vec_to_xy_mm(d.end)):
+                    segments.append(Segment(
+                        start_x=p0[0], start_y=p0[1], end_x=p1[0], end_y=p1[1],
+                        width=w, layer=layer, net_id=nid, uuid=uuid,
+                        graphic=True, owner_ref=owner, drawn_width=w,
+                        graphic_kind='arc'))
+            elif kind == "polygon":
+                for pwh in (getattr(d, "polygons", None) or []):
+                    emit_outline(_kipy_graphic_poly_points(
+                        getattr(pwh, "outline", None)))
+            elif kind == "rectangle":
+                (x1, y1), (x2, y2) = (_vec_to_xy_mm(d.top_left),
+                                      _vec_to_xy_mm(d.bottom_right))
+                emit_outline([(x1, y1), (x2, y1), (x2, y2), (x1, y2)],
+                             kind_='rect')
+            elif kind == "circle":
+                c, e = _vec_to_xy_mm(d.center), _vec_to_xy_mm(d.radius_point)
+                r = math.hypot(e[0] - c[0], e[1] - c[1])
+                emit_outline([(c[0] + r * math.cos(k * math.pi / 8),
+                               c[1] + r * math.sin(k * math.pi / 8))
+                              for k in range(16)],
+                             kind_='circle', circle=(c[0], c[1], r))
+        except Exception:
+            continue
+    return segments
+
+
+_KIPY_ISLAND_MODES = {'IRM_ALWAYS': 0, 'IRM_NEVER': 1, 'IRM_AREA': 2}
+
+
+def _kipy_zone_entries(z, resolve_net, in_footprint: bool = False) -> List[Zone]:
+    """One Zone per COPPER layer of a kipy zone, as `extract_zones` and main's
+    `_extract_zones_from_pcbnew` emit them, or [] when it is not copper.
+
+    - A rule area is a keep-out, not copper: skipped (rule areas reach
+      board_info.keepouts from the file, `extract_keepouts`). kipy's
+      get_zones() returns them with every pour, and the reader this replaces
+      modelled each as a net-0 pour on its layers.
+    - A zone on no copper layer (a mask or paste opening drawn as a zone) is
+      not copper either (da63ad5c).
+    - The outline is pcbnew's (`kipy_outline_points`: arc vertices to the
+      nanometre, fe367f3f; a closing repeat merged, 37fb1b93); every further
+      ring is a hole (#1279) -- KiCad loads every `(polygon ...)` after the
+      first as a hole of the first.
+    - `teardrop` is KiCad's generated teardrop area (#1164): copper, never a
+      pour. Priority, island removal, clearance, min thickness, uuid and
+      `in_footprint` as the text parser reads them.
+    """
+    try:
+        if z.is_rule_area():
+            return []
+    except Exception:
+        pass
+    names = []
+    for bl in (getattr(z, "layers", None) or ()):
+        n = _kipy_layer_token(bl)
+        if n.endswith('.Cu') and n not in names:
+            names.append(n)
+    if not names:
+        return []
+    pwhs = []
+    try:
+        from kipy.geometry import PolygonWithHoles
+        pwhs = [PolygonWithHoles(proto_ref=p) for p in z.proto.outline.polygons]
+    except Exception:
+        try:
+            pwhs = [z.outline]
+        except Exception:
+            pwhs = []
+    if not pwhs:
+        return []
+    polygon = kipy_outline_points(getattr(pwhs[0], "outline", None), closed=False)
+    if not polygon:
+        return []
+    rings = list(getattr(pwhs[0], "holes", None) or [])
+    for extra in pwhs[1:]:
+        rings.append(getattr(extra, "outline", None))
+        rings.extend(getattr(extra, "holes", None) or [])
+    holes = [h for h in (kipy_outline_points(r, closed=False) for r in rings)
+             if len(h) >= 3]
+    net_id, net_name = resolve_net(getattr(z, "net", None))
+    try:
+        priority = int(getattr(z, "priority", 0) or 0)
+    except Exception:
+        priority = 0
+    island_mode = 0
+    island_area = 0.0
+    clearance = min_thickness = None
+    teardrop = False
+    try:
+        from kipy.proto.board.board_types_pb2 import (IslandRemovalMode,
+                                                       TeardropType)
+        island_mode = _KIPY_ISLAND_MODES.get(
+            _kipy_enum_name(IslandRemovalMode, z.island_mode), 0)
+        island_area = float(z.min_island_area or 0) / 1e12   # nm^2 -> mm^2
+        if z.clearance is not None:
+            clearance = _nm_to_mm(z.clearance)
+        if z.min_thickness is not None:
+            min_thickness = _nm_to_mm(z.min_thickness)
+        td = z.teardrop
+        teardrop = td is not None and _kipy_enum_name(TeardropType, td.type) in (
+            'TDT_VIA_PAD', 'TDT_TRACK_END')
+    except Exception:
+        pass
+    uuid = _kipy_uuid(z)
+    return [Zone(net_id=net_id, net_name=net_name, layer=n, polygon=polygon,
+                 uuid=uuid, priority=priority, island_removal_mode=island_mode,
+                 island_area_min=island_area, clearance=clearance,
+                 min_thickness=min_thickness, in_footprint=in_footprint,
+                 teardrop=teardrop, holes=holes)
+            for n in names]
+
+
+def _extract_zones_kipy(board, get_layer_name, resolve_net,
+                        footprints=()) -> List[Zone]:
+    """Every copper zone of a kipy board (`_kipy_zone_entries`): the board's
+    own and, as the text parser reads them (#478, `in_footprint`), the zones a
+    footprint carries -- which `board.get_zones()` does not return. A
+    footprint zone whose uuid the board listing already gave is not read
+    twice. `resolve_net` is the builder's name->synthetic-id resolver; without
+    it zones would mismatch the rest of PCBData's net ids. `get_layer_name` is
+    kept for the call shape; layers are named by `_kipy_layer_token`."""
+    zones: List[Zone] = []
+    seen = set()
+    try:
+        zone_iter = list(board.get_zones())
+    except Exception:
+        zone_iter = []
+    for z in zone_iter:
+        try:
+            got = _kipy_zone_entries(z, resolve_net)
+        except Exception:
+            continue
+        zones.extend(got)
+        u = _kipy_uuid(z)
+        if u:
+            seen.add(u)
+    for _key, fp in (footprints or ()):
+        try:
+            items = list(fp.definition.items)
+        except Exception:
+            continue
+        for it in items:
+            if type(it).__name__ != "Zone":
+                continue
+            u = _kipy_uuid(it)
+            if u and u in seen:
+                continue
+            try:
+                zones.extend(_kipy_zone_entries(it, resolve_net, in_footprint=True))
+            except Exception:
+                continue
+    return zones
 
 
 def _global_to_local(fp_x, fp_y, fp_rotation_deg, global_x, global_y):
@@ -8520,6 +10602,75 @@ def _global_to_local(fp_x, fp_y, fp_rotation_deg, global_x, global_y):
     local_y = dx * sin_r + dy * cos_r
 
     return local_x, local_y
+
+
+def _polygon_union_excess(polys_a, polys_b):
+    """How far the copper `polys_a` describes reaches OUTSIDE the copper
+    `polys_b` describes: (distance mm, (x, y)) at the worst sample.
+
+    Each argument is a pad's `polygons`, read the way every consumer reads it
+    -- the UNION of its rings, each ring even-odd. The two parse paths spell
+    one pad differently (pcbnew merges a custom pad into one outline, the text
+    parser keeps one ring per primitive plus the anchor), so the rings cannot
+    be compared one to one; their unions can. Samples are every vertex of
+    `polys_a` and the midpoint of every edge, which sees a protruding cap or
+    corner and a missing primitive (its vertices are outside); a notch cut
+    into the middle of a long edge between two samples is the one shape this
+    can miss."""
+    from check_drc import _point_in_poly as _pip
+    from geometry_utils import point_to_segment_distance as _psd
+    rings_b = [r for r in polys_b if len(r) >= 3]
+    boxes_b = [(min(p[0] for p in r), min(p[1] for p in r),
+                max(p[0] for p in r), max(p[1] for p in r)) for r in rings_b]
+    worst, where = 0.0, None
+    for ring in polys_a:
+        n = len(ring)
+        if n < 2:
+            continue
+        samples = list(ring) + [((ring[i][0] + ring[(i + 1) % n][0]) / 2.0,
+                                 (ring[i][1] + ring[(i + 1) % n][1]) / 2.0)
+                                for i in range(n)]
+        for x, y in samples:
+            if any(bx0 <= x <= bx1 and by0 <= y <= by1 and _pip(x, y, r)
+                   for r, (bx0, by0, bx1, by1) in zip(rings_b, boxes_b)):
+                continue
+            d = min((_psd(x, y, r[i][0], r[i][1], r[(i + 1) % len(r)][0],
+                          r[(i + 1) % len(r)][1])
+                     for r in rings_b for i in range(len(r))), default=float('inf'))
+            if d > worst:
+                worst, where = d, (x, y)
+    return worst, where
+
+
+def _pair_nearest_bounds(items_a, items_b):
+    """Pair two equal-length lists of objects carrying `.bounds` by GEOMETRY:
+    an exact match on the bounds rounded to 0.1 um first (the common case,
+    and linear), then each leftover with its nearest remaining partner by the
+    largest per-coordinate difference. Returns the list of (a, b) pairs.
+
+    A comparator that sorts both lists and zips them pairs by RANK, and two
+    float spellings of one coordinate (119.950866 vs 119.9508655) are enough
+    to re-rank a row of identical-size openings."""
+    def key(o):
+        return tuple(round(v, 4) for v in o.bounds)
+    pool = {}
+    for b in items_b:
+        pool.setdefault(key(b), []).append(b)
+    pairs, left_a = [], []
+    for a in items_a:
+        hit = pool.get(key(a))
+        if hit:
+            pairs.append((a, hit.pop()))
+        else:
+            left_a.append(a)
+    left_b = [b for bs in pool.values() for b in bs]
+    for a in left_a:
+        if not left_b:
+            break
+        j = min(range(len(left_b)), key=lambda k: max(
+            abs(x - y) for x, y in zip(a.bounds, left_b[k].bounds)))
+        pairs.append((a, left_b.pop(j)))
+    return pairs
 
 
 def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: float = 0.01) -> List[str]:
@@ -8556,6 +10707,23 @@ def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: flo
 
     if len(bi_b.stackup) != len(bi_f.stackup):
         diffs.append(f"Stackup layer count: board={len(bi_b.stackup)} file={len(bi_f.stackup)}")
+    # Layer by layer (#1222): the impedance width solver and the via barrel
+    # length read thickness, epsilon_r and loss_tangent, so a front that
+    # combines a multi-sheet dielectric or reads a locked thickness differently
+    # sizes different tracks. Thickness to 1 nm (pcbnew holds it in integer
+    # nm); the two dielectric constants to 1e-6, well above float noise and
+    # far below any declared value's precision.
+    for i, (sb, sf) in enumerate(zip(bi_b.stackup, bi_f.stackup)):
+        if (sb.name, sb.layer_type) != (sf.name, sf.layer_type):
+            diffs.append(f"Stackup layer {i}: board={sb.name!r} ({sb.layer_type}) "
+                         f"file={sf.name!r} ({sf.layer_type})")
+            continue
+        for _attr, _tol in (('thickness', 1e-6), ('epsilon_r', 1e-6),
+                            ('loss_tangent', 1e-6)):
+            vb, vf = getattr(sb, _attr), getattr(sf, _attr)
+            if abs(vb - vf) > _tol:
+                diffs.append(f"Stackup layer {i} {sb.name!r} {_attr}: "
+                             f"board={vb!r} file={vf!r}")
 
     # --- Compare nets (net 0 = unconnected pseudo-net; one path may list it) ---
     board_net_ids = set(from_board.nets.keys()) - {0}
@@ -8624,11 +10792,23 @@ def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: flo
             diffs.append(f"Footprint {ref} position: board=({bf.x:.3f},{bf.y:.3f}) file=({ff.x:.3f},{ff.y:.3f})")
         if not close(bf.rotation % 360, ff.rotation % 360):
             diffs.append(f"Footprint {ref} rotation: board={bf.rotation:.1f} file={ff.rotation:.1f}")
+        # #1054: the GUI's placement Apply sets each live lock from the TEXT
+        # parse of the result board, and every placement step decides what it
+        # may move from this field -- so the two paths must agree on it.
+        if bool(getattr(bf, 'locked', False)) != bool(getattr(ff, 'locked', False)):
+            diffs.append(f"Footprint {ref} locked: board={bf.locked} file={ff.locked}")
         # Footprint-level clearance override (#326): a divergence here shifts
         # EVERY inheriting pad's resolved local_clearance between the two paths.
         bfc = getattr(bf, 'clearance', 0.0); ffc = getattr(ff, 'clearance', 0.0)
         if not close(bfc, ffc):
             diffs.append(f"Footprint {ref} clearance: board={bfc:.3f} file={ffc:.3f}")
+        # #1211: the schematic sheet, which `place_pose replicate` resolves a
+        # channel by (name) and maps its parts by (path). A pcbnew accessor
+        # that moved would hand the GUI a board with no sheets.
+        for _sheet in ('sheet_path', 'sheet_name', 'sheet_file'):
+            bs = getattr(bf, _sheet, ''); fs = getattr(ff, _sheet, '')
+            if bs != fs:
+                diffs.append(f"Footprint {ref} {_sheet}: board={bs!r} file={fs!r}")
         # Net-tie pad groups (#328): the pcbnew path wraps GetNetTiePadGroups() in a
         # broad try/except -> [], so a KiCad build that drops them would silently give
         # the GUI zero net-ties (phantom shorts / refused tie escapes) while the text
@@ -8698,6 +10878,25 @@ def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: flo
                 br = getattr(bp, 'rect_rotation', 0.0); fr = getattr(fp, 'rect_rotation', 0.0)
                 if not close(br, fr):
                     diffs.append(f"Pad {ref}:{bp.pad_number} rect_rotation: board={br:.2f} file={fr:.2f}")
+                # A custom pad's real copper (#188): the obstacle map and
+                # check_drc read `polygons` before the size rect, and nothing
+                # compared them. Compared as the UNION each path describes,
+                # both ways (`_polygon_union_excess`), since pcbnew merges the
+                # primitives into one ring and the text parser keeps one per
+                # primitive.
+                bpp = getattr(bp, 'polygons', None) or []
+                fpp = getattr(fp, 'polygons', None) or []
+                if bool(bpp) != bool(fpp):
+                    diffs.append(f"Pad {ref}:{bp.pad_number} polygons: board={len(bpp)} "
+                                 f"ring(s) file={len(fpp)} ring(s)")
+                elif bpp:
+                    for _who, _a, _b in (('board', bpp, fpp), ('file', fpp, bpp)):
+                        _d, _at = _polygon_union_excess(_a, _b)
+                        if _d >= tolerance:
+                            diffs.append(
+                                f"Pad {ref}:{bp.pad_number} polygons: {_who} copper reaches "
+                                f"{_d:.3f} mm past the other path's at "
+                                f"({_at[0]:.3f},{_at[1]:.3f})")
                 # Per-pad local clearance override (fiducial keep-clear rings etc.).
                 # A pcbnew accessor that silently returns 0 would drop a keep-out the
                 # file parse honors - this surfaces that divergence.
@@ -8713,6 +10912,12 @@ def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: flo
                         diffs.append(f"Pad {ref}:{bp.pad_number} roundrect_rratio: board={brr:.3f} file={frr:.3f}")
                 if not close(bp.drill, fp.drill):
                     diffs.append(f"Pad {ref}:{bp.pad_number} drill: board={bp.drill:.3f} file={fp.drill:.3f}")
+                # #1248: pad-to-die length (mm) / delay (ps). A getter that read
+                # 0 would silently drop the term every length matcher adds.
+                for _die in ('die_length', 'die_delay'):
+                    bd = getattr(bp, _die, 0.0); fd = getattr(fp, _die, 0.0)
+                    if abs(bd - fd) > 1e-6:
+                        diffs.append(f"Pad {ref}:{bp.pad_number} {_die}: board={bd:.6f} file={fd:.6f}")
                 # Compare layers (as sets since order may differ)
                 if set(bp.layers) != set(fp.layers):
                     diffs.append(f"Pad {ref}:{bp.pad_number} layers: board={bp.layers} file={fp.layers}")
@@ -8730,6 +10935,11 @@ def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: flo
         # GRAPHICS (#337, no pads/tracks anchor them), pcbnew's renumbered
         # code and the file's net-table id legitimately differ (openstint
         # /A-: board 3 vs file 14) while naming the same net.
+        # Net 0 is "no net" on both, whether or not a path lists it (a KiCad
+        # 9 file without the net-0 entry: apple1_aci_card's 2,363 unnetted
+        # tracks read '' on one side and 0 on the other).
+        if not nid:
+            return ''
         n = pcb.nets.get(nid)
         return n.name if n is not None else nid
 
@@ -8798,39 +11008,78 @@ def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: flo
                         lambda s: f"ends={s[0]} w={s[1]} layer={s[2]} net={s[3]}")
 
     # --- Compare vias (geometry, not just count) ---
+    # The pair IN ORDER and the type: a consumer keys on both (placement
+    # Apply's via key is the ordered pair), so a sorted pair hid the paths
+    # disagreeing on a via written bottom first.
     def _via_sig(v):
-        return (_q(v.x), _q(v.y), _q(v.size), _q(v.drill), v.net_id, tuple(sorted(v.layers)))
+        return (_q(v.x), _q(v.y), _q(v.size), _q(v.drill), v.net_id, tuple(v.layers),
+                getattr(v, 'via_type', 'through'))
 
     _multiset_diff(from_board.vias, from_file.vias, _via_sig, "Via",
-                   lambda v: f"({v[0]},{v[1]}) size={v[2]} drill={v[3]} net={v[4]} layers={list(v[5])}")
+                   lambda v: f"({v[0]},{v[1]}) size={v[2]} drill={v[3]} net={v[4]} "
+                             f"layers={list(v[5])} type={v[6]}")
 
-    # --- Compare zones (net/layer/vertex count) ---
+    # --- Compare zones, as a multiset per (net, layer) ---
+    # Pairing the two lists by sort order on (net_id, layer) was ambiguous
+    # wherever two zones share a net and a layer -- a pour and the teardrops on
+    # its tracks (#1164), or two pours -- so a disagreement could land on the
+    # wrong partner, or two could cancel. Each (net, layer) group is compared as
+    # a multiset of what a consumer reads: the teardrop flag (#1164: it decides
+    # `pour_zones` membership -- rip-eligibility, the --force-reroute skip, the
+    # plane-finalize hand-off, the GUI's plane suggestions), the vertex count,
+    # and the fill semantics (#350: the priority-exact fill-point rejection and
+    # the island-patch gating diverge CLI vs GUI without them).
+    # island_area_min is only meaningful in mode 2: pcbnew's GetMinIslandArea()
+    # reports the C++ default (10mm^2) even when the file carries no token
+    # (mode 0/1 zones), so comparing it unconditionally manufactured phantom
+    # parity diffs (free_dap).
     if len(from_board.zones) != len(from_file.zones):
         diffs.append(f"Zone count: board={len(from_board.zones)} file={len(from_file.zones)}")
-    else:
-        # Compare zones by net_id and layer
-        b_zones = sorted(from_board.zones, key=lambda z: (z.net_id, z.layer))
-        f_zones = sorted(from_file.zones, key=lambda z: (z.net_id, z.layer))
-        for bz, fz in zip(b_zones, f_zones):
-            if bz.net_id != fz.net_id:
-                diffs.append(f"Zone net_id mismatch: board={bz.net_id} file={fz.net_id}")
-            if bz.layer != fz.layer:
-                diffs.append(f"Zone layer mismatch: board={bz.layer} file={fz.layer}")
-            if len(bz.polygon) != len(fz.polygon):
-                diffs.append(f"Zone net={bz.net_id} layer={bz.layer} vertex count: board={len(bz.polygon)} file={len(fz.polygon)}")
-            # Fill semantics (#350): both fronts must agree or the priority-
-            # exact fill-point rejection / island-patch gating diverge CLI vs GUI.
-            if getattr(bz, 'priority', 0) != getattr(fz, 'priority', 0):
-                diffs.append(f"Zone net={bz.net_id} layer={bz.layer} priority: board={bz.priority} file={fz.priority}")
-            if getattr(bz, 'island_removal_mode', 0) != getattr(fz, 'island_removal_mode', 0):
-                diffs.append(f"Zone net={bz.net_id} layer={bz.layer} island_removal_mode: board={bz.island_removal_mode} file={fz.island_removal_mode}")
-            # island_area_min is only meaningful in mode 2: pcbnew's
-            # GetMinIslandArea() reports the C++ default (10mm^2) even when
-            # the file carries no token (mode 0/1 zones), so comparing it
-            # unconditionally manufactured phantom parity diffs (free_dap).
-            if (getattr(bz, 'island_removal_mode', 0) == 2
-                    and abs(getattr(bz, 'island_area_min', 0.0) - getattr(fz, 'island_area_min', 0.0)) > 0.01):
-                diffs.append(f"Zone net={bz.net_id} layer={bz.layer} island_area_min: board={bz.island_area_min} file={fz.island_area_min}")
+
+    # The outline itself, on pcbnew's nm grid: both fronts hold the vertices
+    # pcbnew loads (an `(arc ...)` vertex is KiCad's own polyline on both,
+    # `zone_outline_points`), so they agree to the nanometre or not at all.
+    def _zone_sig(z):
+        mode = getattr(z, 'island_removal_mode', 0)
+        return (bool(getattr(z, 'teardrop', False)), len(z.polygon),
+                getattr(z, 'priority', 0), mode,
+                round(getattr(z, 'island_area_min', 0.0), 3) if mode == 2 else None,
+                tuple((_kiround(x * 1e6), _kiround(y * 1e6)) for x, y in z.polygon),
+                # #1279: the cut-outs, the same way.
+                tuple(tuple((_kiround(x * 1e6), _kiround(y * 1e6)) for x, y in h)
+                      for h in (getattr(z, 'holes', None) or ())))
+
+    def _zone_fmt(s):
+        import zlib
+        return (f"[{'teardrop' if s[0] else 'pour'} vertices={s[1]} priority={s[2]} "
+                f"island_mode={s[3]}" + (f" island_area_min={s[4]}" if s[3] == 2 else '')
+                + f" outline=#{zlib.crc32(repr(s[5]).encode()):08x}"
+                + (f" holes={len(s[6])}#{zlib.crc32(repr(s[6]).encode()):08x}" if s[6] else '')
+                + "]")
+
+    from collections import Counter as _Counter
+    _zb, _zf = {}, {}
+    for _z in from_board.zones:
+        _zb.setdefault((_z.net_id, _z.layer), _Counter())[_zone_sig(_z)] += 1
+    for _z in from_file.zones:
+        _zf.setdefault((_z.net_id, _z.layer), _Counter())[_zone_sig(_z)] += 1
+    for _key in sorted(set(_zb) | set(_zf), key=lambda k: (k[0], str(k[1]))):
+        cb, cf = _zb.get(_key, _Counter()), _zf.get(_key, _Counter())
+        if cb == cf:
+            continue
+        net_id, layer = _key
+        td_b = sum(n for s, n in cb.items() if s[0])
+        td_f = sum(n for s, n in cf.items() if s[0])
+        if td_b != td_f:
+            diffs.append(f"Zone net={net_id} layer={layer} teardrop count: "
+                         f"board={td_b} file={td_f}")
+        only_b = sorted((cb - cf).elements())
+        only_f = sorted((cf - cb).elements())
+        diffs.append(
+            f"Zone net={net_id} layer={layer}: {len(only_b)} only in board "
+            f"{' '.join(map(_zone_fmt, only_b[:3]))}{' ...' if len(only_b) > 3 else ''}; "
+            f"{len(only_f)} only in file "
+            f"{' '.join(map(_zone_fmt, only_f[:3]))}{' ...' if len(only_f) > 3 else ''}")
 
     # --- Compare board outline / cutouts (used for edge & cutout obstacles) ---
     bo_b = bi_b.board_outline or []
@@ -8882,27 +11131,68 @@ def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: flo
     if bi_b.via_protection_setup != bi_f.via_protection_setup:
         diffs.append(f"Via protection setup: board={bi_b.via_protection_setup} "
                      f"file={bi_f.via_protection_setup}")
+    # The copper-to-hole floor each front prices NPTH holes at (#1038's via
+    # keep-out turns on above 0). The board side reads pcbnew's in-memory
+    # rule, the file side the project; on a board pcbnew just loaded from
+    # that file they must declare the same floor, including pcbnew's factory
+    # stand-in on a project-less board (obstacle_map.declared_hole_clearance).
+    # Compared exactly (a rule value, not a geometry), and never skipped in
+    # silence: a comparison that could not run is reported as one.
+    try:
+        from obstacle_map import declared_hole_clearance
+        _hc_b = declared_hole_clearance(from_board)
+        _hc_f = declared_hole_clearance(from_file)
+        if abs(_hc_b[0] - _hc_f[0]) > 1e-9:
+            diffs.append(f"Copper-to-hole floor: board={_hc_b[0]} ({_hc_b[1] or 'none'}) "
+                         f"file={_hc_f[0]} ({_hc_f[1] or 'none'})")
+    except ImportError as _e:
+        diffs.append(f"Copper-to-hole floor: not compared ({type(_e).__name__}: {_e})")
+    # The kicad_routing_tools records each front reads: the live board's
+    # (its project's copy and the copy on the board) against the file's (the
+    # project's copy and the board file's). Freshly loaded, they are the same.
+    _rb_p = getattr(from_board, 'live_records_provider', None)
+    _src = getattr(from_file, 'source_path', '') or ''
+    if callable(_rb_p) and _src:
+        try:
+            import tool_records
+            _rb, _rf = _rb_p() or {}, tool_records.effective_namespace(_src)
+            if _rb != _rf:
+                diffs.append(f"Tool records: board={sorted(_rb)} rev "
+                             f"{tool_records.revision(_rb)} file={sorted(_rf)} "
+                             f"rev {tool_records.revision(_rf)}")
+        except ImportError as _e:
+            diffs.append(f"Tool records: not compared ({type(_e).__name__}: {_e})")
 
     def _ap_sig(pcb, ap):
         nm = pcb.nets.get(ap.net_id)
         return (ap.owner_ref, ap.layer, ap.source, ap.pad_number,
                 nm.name if nm else '')
     from collections import Counter as _Counter
-    _ab = sorted(from_board.paste_apertures or [],
-                 key=lambda a: (_ap_sig(from_board, a), a.bounds))
-    _af = sorted(from_file.paste_apertures or [],
-                 key=lambda a: (_ap_sig(from_file, a), a.bounds))
-    _cb = _Counter(_ap_sig(from_board, a) for a in _ab)
-    _cf = _Counter(_ap_sig(from_file, a) for a in _af)
+    _cb = _Counter(_ap_sig(from_board, a) for a in from_board.paste_apertures or [])
+    _cf = _Counter(_ap_sig(from_file, a) for a in from_file.paste_apertures or [])
     if _cb != _cf:
         diffs.append(f"Paste apertures: only board={sorted((_cb - _cf).elements())[:6]} "
                      f"only file={sorted((_cf - _cb).elements())[:6]}")
     else:
-        for a, b in zip(_ab, _af):
-            if (not all(close(x, y) for x, y in zip(a.bounds, b.bounds))
-                    or not all(close(x, y) for x, y in zip(a.margin, b.margin))):
-                diffs.append(f"Paste aperture {a.label()}: bounds/margin "
-                             f"board={a.bounds}/{a.margin} file={b.bounds}/{b.margin}")
+        # Pair the openings WITHIN one signature by geometry, never by a sort
+        # of the raw bounds: the openings of one QFN windowpane or one
+        # connector's paste graphics share every signature field, and their
+        # bounds agree between the paths only to float noise (119.950866 vs
+        # 119.9508655), which re-orders a sort and paired the board's opening
+        # #1 against the file's #4 -- 506 phantom diffs over 31 boards whose
+        # two sets were the same rectangles.
+        def _by_sig(pcb):
+            out = {}
+            for a in pcb.paste_apertures or []:
+                out.setdefault(_ap_sig(pcb, a), []).append(a)
+            return out
+        _gb, _gf = _by_sig(from_board), _by_sig(from_file)
+        for _sig in sorted(_gb, key=repr):
+            for a, b in _pair_nearest_bounds(_gb[_sig], _gf[_sig]):
+                if (not all(close(x, y) for x, y in zip(a.bounds, b.bounds))
+                        or not all(close(x, y) for x, y in zip(a.margin, b.margin))):
+                    diffs.append(f"Paste aperture {a.label()}: bounds/margin "
+                                 f"board={a.bounds}/{a.margin} file={b.bounds}/{b.margin}")
 
     # #962: what the off-outline grade discloses it could NOT measure. A front
     # that misses an entry reports a narrower blind spot than the other.
@@ -8913,6 +11203,14 @@ def compare_pcb_data(from_board: 'PCBData', from_file: 'PCBData', tolerance: flo
     if _ub != _uf:
         diffs.append(f"Unmeasured graphic copper: only board={sorted((_ub - _uf).elements())[:6]} "
                      f"only file={sorted((_uf - _ub).elements())[:6]}")
+
+    # #1279: the protected sense branches -- what each front would keep new
+    # copper off, and why a branch it declines is declined.
+    from sense_branch import branch_signature
+    _sb = sorted(branch_signature(b) for b in (from_board.sense_branches or []))
+    _sf = sorted(branch_signature(b) for b in (from_file.sense_branches or []))
+    if _sb != _sf:
+        diffs.append(f"Sense branches: board={_sb} file={_sf}")
 
     return diffs
 

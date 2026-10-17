@@ -72,6 +72,9 @@ def _get_net_classes_from_board(pcb_data):
 #: #1067: how `_optimize_decoupling_caps` says it refused to run, which
 #: `run_cap_optimization` reads to skip the post-pass a run would owe.
 CAP_NOT_RUN = "Cap optimization NOT run"
+#: How it says the pass raised -- where place_fanout_clearance.py would exit
+#: non-zero and write no board. Neither summary is a produced result.
+CAP_FAILED = "Cap optimization skipped (error"
 
 
 def cap_optimization_summary(result):
@@ -1259,23 +1262,31 @@ class BGAOptionsPanel(wx.ScrolledWindow):
 class QFNOptionsPanel(wx.ScrolledWindow):
     """QFN fanout options panel (parameters not in Basic tab)."""
 
-    def __init__(self, parent):
+    #: Item 0 of the escape-layer choice: qfn_fanout.py with no --layer.
+    MOUNTED_LAYER = "Mounted layer (default)"
+
+    def __init__(self, parent, copper_layers=None):
         """
         Create QFN options panel.
 
         Args:
             parent: Parent window
+            copper_layers: The board's copper layer names, offered as escape
+                layers after the mounted-layer default (F.Cu/B.Cu if None).
         """
         super().__init__(parent, style=wx.VSCROLL)
         self.SetScrollRate(0, 10)
+        self._copper_layers = list(copper_layers or ['F.Cu', 'B.Cu'])
         self._create_ui()
 
     def _create_ui(self):
         """Create the panel UI."""
         main_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # Info text - QFN uses component's layer automatically
-        info_text = wx.StaticText(self, label="QFN fanout routes on the component's layer.")
+        # Info text - QFN uses the component's layer unless told otherwise
+        info_text = wx.StaticText(
+            self, label="QFN fanout routes on the component's mounted layer "
+                        "unless another escape layer is chosen.")
         info_text.Wrap(350)
         main_sizer.Add(info_text, 0, wx.ALL, 10)
 
@@ -1285,6 +1296,21 @@ class QFNOptionsPanel(wx.ScrolledWindow):
 
         grid = wx.FlexGridSizer(cols=2, hgap=10, vgap=5)
         grid.AddGrowableCol(1)
+
+        # qfn_fanout.py --layer. Item 0 is its default (the part's mounted
+        # layer); a plan step's `qfn_layer: "B.Cu"` selects that item by
+        # label. Any layer but the mounted one floats the stubs off the SMD
+        # pads (#96), which the run warns about, as the CLI does.
+        grid.Add(wx.StaticText(self, label="Escape layer:"), 0,
+                 wx.ALIGN_CENTER_VERTICAL)
+        self.qfn_layer = wx.Choice(
+            self, choices=[self.MOUNTED_LAYER] + self._copper_layers)
+        self.qfn_layer.SetSelection(0)
+        self.qfn_layer.SetToolTip(
+            "Layer for the escape stubs (CLI qfn_fanout --layer). Default: "
+            "the layer the part is mounted on. Another layer leaves the stubs "
+            "off the part's SMD pads unless that is intended.")
+        grid.Add(self.qfn_layer, 0, wx.EXPAND)
 
         # #381 D7: QFN-specific track width & clearance, defaulting to the CLI's
         # QFN-tuned 0.1/0.1 (qfn_fanout.py --width/--clearance) instead of
@@ -1354,6 +1380,9 @@ class QFNOptionsPanel(wx.ScrolledWindow):
             'extension': self.extension.GetValue(),
             'escape_method': 'underpad' if self.underpad_escape.GetValue() else 'stub',
             'allow_via_in_pad': self.allow_via_in_pad.GetValue(),
+            # None = the part's mounted layer, qfn_fanout.py's omitted --layer.
+            'layer': (self.qfn_layer.GetStringSelection()
+                      if self.qfn_layer.GetSelection() > 0 else None),
         }
 
 
@@ -1450,7 +1479,8 @@ class FanoutTab(wx.Panel):
 
         # Options panels (stacked, show/hide based on type)
         self.bga_options = BGAOptionsPanel(self, on_differential_changed=self._on_bga_differential_changed)
-        self.qfn_options = QFNOptionsPanel(self)
+        self.qfn_options = QFNOptionsPanel(
+            self, copper_layers=self.pcb_data.board_info.copper_layers)
 
         right_sizer.Add(self.bga_options, 1, wx.EXPAND | wx.BOTTOM, 5)
         right_sizer.Add(self.qfn_options, 1, wx.EXPAND | wx.BOTTOM, 5)
@@ -1564,6 +1594,10 @@ class FanoutTab(wx.Panel):
                         footprint, self.pcb_data, **kwargs)
                     vias_to_remove = None
                     skipped = list(qfn_fanout.LAST_CANCEL_SKIPPED)
+                # #857: the Design rules line bga_fanout.py / qfn_fanout.py
+                # print (the exit code is the CLI's alone).
+                from fab_tiers import finish_design_rules
+                finish_design_rules(None, 0)
                 self._operation_result = {
                     'tracks': tracks, 'vias': vias, 'failed': failed,
                     'vias_to_remove': vias_to_remove, 'skipped': skipped}
@@ -1608,6 +1642,10 @@ class FanoutTab(wx.Panel):
                     failed_nets=res.get('failed'),
                     vias_to_remove=res.get('vias_to_remove'),
                     **apply_kw)
+            # The plan executor's "this step produced its result" (gui_utils);
+            # the error and cancel returns above produce none.
+            from .gui_utils import mark_plan_step_produced
+            mark_plan_step_produced(self)
         finally:
             self._end_run()
 
@@ -1882,6 +1920,8 @@ class FanoutTab(wx.Panel):
                 # #693: shared "Fix DRC settings after routing" checkbox --
                 # the apply path gates its live-floor writeback on this.
                 'fix_drc_settings': shared.get('fix_drc_settings', True),
+                # #581: recorded at the step boundary, as bga_fanout records it.
+                'same_net_pad_clearance': shared.get('same_net_pad_clearance', -1.0),
             },
             optimize_caps=config.get('optimize_caps', False),
         )
@@ -1921,13 +1961,22 @@ class FanoutTab(wx.Panel):
         via_size = shared.get('via_size', defaults.BGA_VIA_SIZE)
         via_drill = shared.get('via_drill', defaults.BGA_VIA_DRILL)
 
-        # Use the component's layer (F.Cu for top, B.Cu for bottom)
-        component_layer = footprint.layer if hasattr(footprint, 'layer') else 'F.Cu'
+        # The panel's escape layer: None = the part's mounted layer (F.Cu for
+        # top, B.Cu for bottom), as qfn_fanout.py resolves an omitted --layer,
+        # through the same function, which also phrases the #96 warning when
+        # the chosen layer is not the mounted one.
+        from qfn_fanout import resolve_escape_layer
+        escape_layer, layer_note, layer_warns = resolve_escape_layer(
+            footprint, config.get('layer'))
+        if layer_warns:
+            print(layer_note)
+            if self.append_log:
+                self.append_log(layer_note.strip())
 
         engine_kw = dict(
             cancel_check=self._make_cancel_check(),
             net_filter=net_patterns,
-            layer=component_layer,
+            layer=escape_layer,
             track_width=track_width,
             extension=extension,
             clearance=clearance,
@@ -1950,11 +1999,20 @@ class FanoutTab(wx.Panel):
             fanout_config={
                 'track_width': track_width,
                 'extension': extension,
+                # The floors qfn_fanout's main writes back are this run's
+                # clearance and (when it drew a via) its via size and drill
+                # (fix_kicad_drc_settings.fanout_fix_kwargs). Without them here
+                # the tab wrote no clearance at all where the CLI writes it.
+                'clearance': clearance,
+                'via_size': via_size,
+                'via_drill': via_drill,
                 # Shared "Add teardrops" checkbox (#489 section 9).
                 'add_teardrops': shared.get('add_teardrops', False),
                 # #693: shared "Fix DRC settings after routing" checkbox --
                 # the apply path gates its live-floor writeback on this.
                 'fix_drc_settings': shared.get('fix_drc_settings', True),
+                # #581: recorded at the step boundary, as qfn_fanout records it.
+                'same_net_pad_clearance': shared.get('same_net_pad_clearance', -1.0),
             },
             fanout_kind='qfn',
         )
@@ -2063,6 +2121,8 @@ class FanoutTab(wx.Panel):
                         # #962: the engine's Type VII stamp on a via it put
                         # in a pad or paste opening.
                         tenting_attrs=vd.get('tenting_attrs'),
+                        # #1268: a re-placed blind/micro via keeps its type.
+                        via_type=vd.get('via_type'),
                     ))
                     vias_added += 1
         except Exception as e:
@@ -2116,27 +2176,28 @@ class FanoutTab(wx.Panel):
         # 0.125 / 0.5-0.25 after step 9. Later steps resolve their geometry from
         # that class, so the fronts diverge from there.
         #
-        # Through apply_drc_settings_fix, not the SWIG front's
-        # update_live_drc_floors: kipy cannot write live design settings, so the
-        # floors go to the sibling .kicad_pro like every other IPC tab's. That
-        # shared helper already carries BOTH gates this block would otherwise
-        # spell out -- #693's "Fix DRC settings after routing" checkbox, and
-        # #782's non-Default class clamp gated on the Min-Clearance override --
-        # and `fanout_config` carries `fix_drc_settings`, `clamp_netclasses` and
-        # `clearance_ceiling`, so both arrive set.
-        # #1195: the floors of copper this step drew, as qfn_fanout's main
-        # writes them -- a QFN run with no copper writes none, one with no via
-        # leaves the via and hole floors alone (None is 'leave it' to the
-        # writer). bga_fanout writes them on every run.
-        from fix_kicad_drc_settings import fanout_written_floors
-        _floors, _via_floors = fanout_written_floors(fanout_kind, tracks, vias)
-        if _floors:
+        # The floors bga_fanout's / qfn_fanout's main writes, from the ONE
+        # decision both fronts read (fix_kicad_drc_settings.fanout_fix_kwargs):
+        # #1195 -- a QFN run with no copper writes none, one with no via leaves
+        # the via and hole floors alone -- and the routed clearance (which also
+        # sets the copper-to-hole floor), every class clamped to it, no
+        # hole-to-hole and no edge setting beyond the fab pin. Into the sibling
+        # .kicad_pro through apply_drc_settings_fix, not the SWIG front's live
+        # apply_fix_to_board: kipy cannot write live design settings. That
+        # helper carries #693's "Fix DRC settings after routing" gate and
+        # records #581's same-net pad clearance, as bga_fanout's main does.
+        _fcfg = fanout_config or {}
+        import clearance_ledger as _cl
+        from fix_kicad_drc_settings import fanout_fix_kwargs
+        _fclr = _fcfg.get('clearance')
+        _fix_kw = fanout_fix_kwargs(
+            fanout_kind, tracks, vias,
+            clearance=_cl.effective(_fclr) if _fclr is not None else None,
+            track_width=_fcfg.get('track_width'),
+            via_size=_fcfg.get('via_size'), via_drill=_fcfg.get('via_drill'))
+        if _fix_kw is not None:
             from .gui_utils import apply_drc_settings_fix
-            _wcfg = dict(fanout_config or {})
-            if not _via_floors:
-                _wcfg['via_size'] = None
-                _wcfg['via_drill'] = None
-            apply_drc_settings_fix(_wcfg)
+            apply_drc_settings_fix(_fcfg, fix_kwargs=_fix_kw)
 
         # #678: the balls this fanout promised to serve by FILL CONTACT rather
         # than a drop via. A later route step's in-run plane finalize audits
@@ -2390,7 +2451,7 @@ class FanoutTab(wx.Panel):
         except Exception as e:
             import traceback
             traceback.print_exc()
-            return f"Cap optimization skipped (error: {e})"
+            return f"{CAP_FAILED}: {e})"
 
     def run_cap_optimization(self, log=None):
         """Standalone decoupling-cap optimization on the live board (#130, IPC).
@@ -2458,6 +2519,13 @@ class FanoutTab(wx.Panel):
             #
             # No refill_all_zones / pcbnew.Refresh here either: KiCad refills
             # and repaints server-side on each IPC commit.
+            # The plan executor's "this step produced its result" (gui_utils):
+            # a refusal (#1067's intent that does not load) or a raised pass is
+            # the CLI's exit without a board.
+            if (summary and not summary.startswith(CAP_NOT_RUN)
+                    and not summary.startswith(CAP_FAILED)):
+                from .gui_utils import mark_plan_step_produced
+                mark_plan_step_produced(self)
         if summary:
             self.status_text.SetLabel(summary)
             if log:

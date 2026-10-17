@@ -61,7 +61,8 @@ for _p in (_REPO, os.path.join(_REPO, 'py_placer')):
         sys.path.insert(0, _p)
 
 from kicad_parser import (parse_kicad_pcb, KICAD_10_MIN_VERSION,  # noqa: E402
-                          kipy_via_protection_live)
+                          kipy_via_protection_live, kipy_via_type,
+                          kipy_via_layers)
 
 
 # id(kipy Zone) -> the arguments make_zone was called with. Module level so a
@@ -112,21 +113,31 @@ class _FakeFootprint:
 
 
 class _FakeZone:
-    """Zone stand-in shaped for existing_zone_keys().
+    """Zone stand-in shaped for the adapter's zone reads (_live_pours).
 
-    That helper reads `.net.name` and `.layers` -- PLURAL, a list of BoardLayer
-    enums it puts through layer_name_for(). Exposing a single `.layer` string
-    made every re-run miss the dedupe and stack a second pour on the same
-    net+layer.
+    It reads `.net.name`, `.layers` -- PLURAL, a list of BoardLayer enums it
+    puts through layer_name_for() -- `.type` and `.name`. ONE stand-in per
+    physical zone with its whole layer set, as kipy reports it: the text
+    parser hands a multi-layer pour back as one Zone per layer, and one
+    single-layer stand-in each would make a multi-layer pour look replaceable
+    (route_planes never deletes one to replace a layer). `.type` is
+    ZT_TEARDROP for a teardrop (#1164), so it is no pour. `uuid` is how a
+    removal reaches the file.
     """
 
-    def __init__(self, net_name, layer_name):
+    def __init__(self, net_name, layer_names, uuid='', teardrop=False,
+                 name=''):
         from kicad_ipc_adapter import layer_maps
+        from kipy.proto.board.board_types_pb2 import ZoneType
+        if isinstance(layer_names, str):
+            layer_names = [layer_names]
         self.net = _NamedNet(net_name)
-        self.layer = layer_name
+        self.layer = layer_names[0] if layer_names else ''
         name_to_bl, _ = layer_maps()
-        bl = name_to_bl.get(layer_name)
-        self.layers = [bl] if bl is not None else []
+        self.layers = [name_to_bl[n] for n in layer_names if n in name_to_bl]
+        self.type = ZoneType.ZT_TEARDROP if teardrop else ZoneType.ZT_COPPER
+        self.name = name
+        self.uuid = uuid
 
 
 class _NamedNet:
@@ -197,9 +208,22 @@ class FakeIpcBoard:
             _FakeFootprint(ref, fp.x, fp.y, fp.rotation)
             for ref, fp in self.pcb_data.footprints.items()
         ]
+        # One stand-in per physical zone (see _FakeZone): the parser's
+        # per-layer Zones regrouped by uuid. A footprint's own zones are not
+        # board zones (kipy's get_zones does not list them either).
+        by_zone = {}
+        for z in self.pcb_data.zones:
+            if getattr(z, 'in_footprint', False):
+                continue
+            key = getattr(z, 'uuid', '') or ('#', id(z))
+            ent = by_zone.setdefault(key, [z, []])
+            if z.layer not in ent[1]:
+                ent[1].append(z.layer)
         self._zones = [
-            _FakeZone(self._name_of.get(z.net_id, ''), z.layer)
-            for z in self.pcb_data.zones
+            _FakeZone(self._name_of.get(z.net_id, ''), layers,
+                      uuid=getattr(z, 'uuid', ''),
+                      teardrop=bool(getattr(z, 'teardrop', False)))
+            for z, layers in by_zone.values()
         ]
 
         # Pending, flushed on push_commit.
@@ -337,10 +361,14 @@ class FakeIpcBoard:
                              'net_id': _nid(_name(it))})
             elif hasattr(it, 'position'):
                 x, y = _vec_xy_mm(it.position)
+                # The type and span the plugin wrote (#1268): a blind or micro
+                # via the plugin re-created used to land in the file THROUGH.
+                vtype = kipy_via_type(it)
                 vias.append({'x': x, 'y': y,
                              'size': getattr(it, 'diameter', 0) / 1e6,
                              'drill': getattr(it, 'drill_diameter', 0) / 1e6,
-                             'layers': ['F.Cu', 'B.Cu'],
+                             'layers': list(kipy_via_layers(it, vtype)),
+                             'via_type': vtype,
                              'net_id': _nid(_name(it)),
                              # What the plugin wrote onto the padstack, in
                              # the form KiCad saves it (probed on 10.0.0).
@@ -360,9 +388,16 @@ class FakeIpcBoard:
         # the plugin actually asked for. Dropping these was worth 257 phantom
         # "gui-only" segments: with no pour on the board, the next step's plane
         # REPAIR reconnected the regions with tracks instead.
+        _k10 = self.pcb_data.kicad_version >= KICAD_10_MIN_VERSION
         for it in self._added:
             zd = _ZONE_SRC.get(id(it))
             if zd is None:
+                continue
+            if zd.get('keepout'):
+                from kicad_writer import generate_keepout_zone_sexpr
+                self._zone_sexprs.append(generate_keepout_zone_sexpr(
+                    zd['layers'], zd['polygon_mm'], zd['name'],
+                    use_net_name=_k10))
                 continue
             self._zone_sexprs.append(generate_zone_sexpr(
                 net_id=_nid(zd['net_name']),
@@ -371,9 +406,13 @@ class FakeIpcBoard:
                 polygon_points=zd['polygon_mm'],
                 clearance=zd['clearance_mm'],
                 min_thickness=zd['min_thickness_mm'],
-                direct_connect=True,
-                use_net_name=self.pcb_data.kicad_version >= KICAD_10_MIN_VERSION,
+                direct_connect=not zd.get('thermal_relief', False),
+                priority=int(zd.get('priority', 0) or 0),
+                use_net_name=_k10,
             ))
+        # Zones the plugin REMOVED (a replaced pour, a78cc7d2), by uuid.
+        rm_zone_uuids = {getattr(it, 'uuid', '') for it in self._removed
+                         if isinstance(it, _FakeZone)} - {''}
 
         zone_sexpr = '\n'.join(self._zone_sexprs) if self._zone_sexprs else None
         ok = write_plane_output(
@@ -385,6 +424,8 @@ class FakeIpcBoard:
 
         if rm_vias:
             self._strip_vias(rm_vias)
+        if rm_zone_uuids:
+            self._strip_zones(rm_zone_uuids)
         if self._updated:
             self._flush_footprint_moves()
 
@@ -426,6 +467,42 @@ class FakeIpcBoard:
                   f"stripped")
         with open(self.path, 'w', encoding='utf-8') as f:
             f.write(content)
+
+    def _strip_zones(self, uuids):
+        """Delete the file's top-level `(zone ...)` blocks with these uuids.
+        Unmatched uuids are REPORTED, as _strip_vias reports its misses."""
+        import re
+        with open(self.path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        out, i, found = [], 0, set()
+        for m in re.finditer(r'\(zone[\s\n]', content):
+            if m.start() < i:
+                continue
+            depth, j = 0, m.start()
+            while j < len(content):
+                c = content[j]
+                if c == '(':
+                    depth += 1
+                elif c == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            block = content[m.start():j + 1]
+            u = re.search(r'\(uuid\s+"?([0-9a-fA-F-]+)"?\)', block)
+            if u and u.group(1) in uuids:
+                found.add(u.group(1))
+                out.append(content[i:m.start()].rstrip(' \t'))
+                i = j + 1
+                if content[i:i + 1] == '\n':
+                    i += 1
+        out.append(content[i:])
+        missing = set(uuids) - found
+        if missing:
+            print(f"  FakeIpcBoard: {len(missing)} removed zone(s) could not be "
+                  f"matched in the file and were NOT stripped")
+        with open(self.path, 'w', encoding='utf-8') as f:
+            f.write(''.join(out))
 
     # -- misc --------------------------------------------------------------
 
@@ -487,10 +564,22 @@ def install(board_path):
             'polygon_mm': list(polygon_mm), 'layer': layer_name,
             'net_name': net_name or '', 'clearance_mm': clearance_mm,
             'min_thickness_mm': min_thickness_mm,
+            'priority': kw.get('priority', 0),
+            'thermal_relief': kw.get('thermal_relief', False),
         }
         return z
 
     adapter.make_zone = _make_zone
+
+    _real_make_keepout = adapter.make_keepout_zone
+
+    def _make_keepout_zone(polygon_mm, layer_names, name=''):
+        z = _real_make_keepout(polygon_mm, layer_names, name=name)
+        _ZONE_SRC[id(z)] = {'keepout': True, 'polygon_mm': list(polygon_mm),
+                            'layers': list(layer_names), 'name': name}
+        return z
+
+    adapter.make_keepout_zone = _make_keepout_zone
 
     adapter.get_board = lambda *a, **k: board
     adapter.connect = lambda *a, **k: None

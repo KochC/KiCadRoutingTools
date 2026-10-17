@@ -10,7 +10,7 @@ import os
 import math
 import re
 import sys
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from kicad_parser import (find_matching_paren, flip_layer_token,
                           iter_footprint_blocks, footprint_at_match,
@@ -266,6 +266,10 @@ def _rotate_pad_angles(fp_text: str, delta_rot: float) -> str:
         fix_pad, fp_text)
 
 
+#: A text node's own `(at x y [angle])`.
+_TEXT_AT = re.compile(r'\(at\s+([^\s()]+)\s+([^\s()]+)(?:\s+([^\s()]+))?\)')
+
+
 def _rotate_text_angles(fp_text: str, delta_rot: float, ref: str) -> str:
     """Add delta_rot to the FIRST `(at x y [a])` of every top-level text node
     (`property`, `fp_text`) in a footprint block.
@@ -284,30 +288,66 @@ def _rotate_text_angles(fp_text: str, delta_rot: float, ref: str) -> str:
     labelled. The flip path has always composed its texts (#714) and is
     untouched here -- one code path per mode, as `write_placed_output` says.
     """
+    def rotated(x, y, a):
+        na = round(((float(a) if a is not None else 0.0) + delta_rot) % 360, 6)
+        if a is not None or na != 0:
+            return f"(at {x} {y} {na:.6g})"
+        return f"(at {x} {y})"
+    return _rewrite_text_ats(fp_text, ref, rotated, 'this rotation')
+
+
+def _set_text_angles(fp_text: str, angle: float, ref: str) -> str:
+    """Set EVERY top-level text node's absolute angle to `angle` (#1163).
+
+    A pile must carry nothing about the poses it was made from. Composing a
+    text with the rotation change (`_rotate_text_angles`) is right for a real
+    rotation, but a pile sets every part to one rotation, so each text keeps
+    its text-to-part angle `T - R`; humans keep labels upright, and that
+    hands back the human rotation `R`. Writing one angle for every text
+    removes it, and the token is always written (KiCad 10's own spelling for
+    a text), so its presence carries nothing either.
+    """
+    def fixed(x, y, _a):
+        return f"(at {x} {y} {round(angle % 360, 6):.6g})"
+    return _rewrite_text_ats(fp_text, ref, fixed, 'this text-angle reset')
+
+
+def text_node_angles(fp_text: str) -> List[Optional[float]]:
+    """The angle token of each top-level text node's `(at ...)`, in order.
+
+    None where the token is absent (KiCad reads that as 0). For a check that
+    has to prove what a writer did to a block's texts (make_unplaced, #1163).
+    """
+    out = []
+    for head, s, e in _iter_sexpr_children(fp_text, 0):
+        if head in _FLIP_TEXTS:
+            m = _TEXT_AT.search(fp_text[s:e])
+            if m:
+                out.append(float(m.group(3)) if m.group(3) is not None else None)
+    return out
+
+
+def _rewrite_text_ats(fp_text: str, ref: str, new_at, what: str) -> str:
+    """Replace the FIRST `(at x y [a])` of every top-level text node
+    (`property`, `fp_text`) with `new_at(x, y, a)`; `a` is None when absent."""
     pieces = []
     for head, s, e in _iter_sexpr_children(fp_text, 0):
         if head not in _FLIP_TEXTS:
             continue
         node = fp_text[s:e]
-        m = re.search(r'\(at\s+([^\s()]+)\s+([^\s()]+)(?:\s+([^\s()]+))?\)',
-                      node)
+        m = _TEXT_AT.search(node)
         if not m:
             if re.search(r'\(at\b', node):
                 # Same doctrine as `_flip_at_angle`: an `(at ...)` that is
                 # there and does not parse must not be skipped silently, or
                 # the block ships with its pads turned and its texts not.
                 raise SideFlipUnsupported(
-                    f"{ref}: a text node has an `(at ...)` this rotation "
+                    f"{ref}: a text node has an `(at ...)` {what} "
                     f"cannot parse -- expected two or three plain numbers. "
                     f"Refusing rather than rotating the pads and leaving the "
                     f"text where it was: {node[:120]!r}")
             continue
-        x, y, a = m.group(1), m.group(2), m.group(3)
-        na = round(((float(a) if a is not None else 0.0) + delta_rot) % 360, 6)
-        if a is not None or na != 0:
-            rep = f"(at {x} {y} {na:.6g})"
-        else:
-            rep = f"(at {x} {y})"
+        rep = new_at(m.group(1), m.group(2), m.group(3))
         if rep != node[m.start():m.end()]:
             pieces.append((s + m.start(), s + m.end(), rep))
     if not pieces:
@@ -511,6 +551,12 @@ _PAD_HANDLED = frozenset({
     'clearance', 'thermal_bridge_angle', 'solder_paste_margin_ratio',
     'thermal_bridge_width', 'thermal_gap', 'thermal_width', 'die_length',
     'zone_layer_connections', 'tstamp', 'locked', 'chamfer_ratio',
+    # #1248: KiCad 10's pad-to-die DELAY (ps) is a per-pad scalar like
+    # `die_length` and mirror-invariant the same way: pcbnew's FOOTPRINT::Flip
+    # leaves both values unchanged (probed on 10.0.0). No tracked board
+    # carries either token, so the parity gate and the round trip pin it on
+    # an injected tigard J7; without it a part carrying one refused to flip.
+    'die_delay',
 })
 
 _SIDED_LAYER = re.compile(r'^[FB]\.')
@@ -951,6 +997,12 @@ def write_placed_output(input_file: str, output_file: str,
               `new_rotation` still means the FINAL orientation; pcbnew's
               `Flip` negates it and this does not, so the same call cannot
               mean different things depending on the input side.
+            - new_text_angle: float, OPTIONAL (#1163). Absent or None, every
+              text composes with the rotation change as pcbnew does (the
+              write is unchanged). Present, every top-level text node
+              (`property`, `fp_text`) is written at this ABSOLUTE angle
+              instead -- the pile builder's way to keep a text-to-part
+              angle from handing back the rotation it replaced.
 
     Returns:
         True if output was written successfully
@@ -1120,6 +1172,17 @@ def write_placed_output(input_file: str, output_file: str,
                 delta_rot, new_x - float(at_match.group(1)),
                 new_y - float(at_match.group(2)))
 
+        # #1163: an absolute text angle, after either path has composed its
+        # texts, so it holds whatever the rotation or the side did.
+        new_text_angle = placement.get('new_text_angle')
+        if new_text_angle is not None:
+            if isinstance(new_text_angle, bool) or \
+                    not isinstance(new_text_angle, (int, float)):
+                raise ValueError(f"{key}: new_text_angle must be a number of "
+                                 f"degrees, not {new_text_angle!r}")
+            new_fp_text = _set_text_angles(new_fp_text, float(new_text_angle),
+                                           key)
+
         content = content[:start] + new_fp_text + content[end:]
         modified_count += 1
 
@@ -1129,7 +1192,24 @@ def write_placed_output(input_file: str, output_file: str,
     if via_moves or new_segments:
         from plane_io import _remove_vias_at_positions
         from kicad_writer import generate_via_sexpr, generate_segment_sexpr
+        from kicad_parser import is_immutable_copper
         n2n = getattr(pcb_data, 'net_id_to_name', None) if pcb_data is not None else None
+        # A KiCad-locked via (#521) or one a `sense:` group holds (#1279) is
+        # never re-emitted: deleting it and appending it again gives it a new
+        # uuid, which takes it out of its group, and moves pinned copper. The
+        # nudge never proposes one, so a move naming one is a caller's bug --
+        # refused rather than written. The nudge moves its Via in place, so
+        # the via is looked for at the move's old AND new position.
+        for m in (via_moves or ()) if pcb_data is not None else ():
+            nid = m[2]['net_id']
+            for v in getattr(pcb_data, 'vias', ()) or ():
+                if v.net_id == nid and is_immutable_copper(v) and any(
+                        abs(v.x - x) < 1e-6 and abs(v.y - y) < 1e-6
+                        for x, y in ((m[0], m[1]), (m[2]['x'], m[2]['y']))):
+                    raise ValueError(
+                        f"via move ({m[0]}, {m[1]}) -> ({m[2]['x']}, "
+                        f"{m[2]['y']}) names a KiCad-locked or sense-held via; "
+                        f"such a via is never re-emitted (#1279)")
 
         def _net_name(net_id):
             """This board's name for a net id, or None if it has none.
@@ -1224,7 +1304,9 @@ def write_placed_output(input_file: str, output_file: str,
                     # cannot do this job -- the repo's own idiom for carrying a
                     # spec is `dict(...)`, which would turn any dict-shaped
                     # sentinel back into a plain {}.
-                    inherit_when_unspecified=True))
+                    inherit_when_unspecified=True,
+                    # A nudged blind/micro via keeps its type word.
+                    via_type=v.get('via_type')))
         for nsd in (new_segments or []):
             nm = n2n.get(nsd['net_id']) if n2n else None
             elements.append(generate_segment_sexpr(

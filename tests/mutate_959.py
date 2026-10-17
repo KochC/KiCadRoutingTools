@@ -122,8 +122,8 @@ ROWS = [
      "    if False:",
      (T_PLAN,), 'KILLED'),
     ('compare-seeds-retries-a-refused-plan', 'cs',
-     "        if r.returncode == 5:",
-     "        if False:",
+     "    if r.returncode == 5:",
+     "    if False:",
      (T_PLAN,), 'KILLED'),
     ('zone-check-absolute-not-relative', 'po',
      "                and row['outside_mm_after'] > row['outside_mm_before'] + 1e-9):",
@@ -178,7 +178,7 @@ ROWS = [
 
     # ---- #1002: decaps ------------------------------------------------------
     ('auto-derives-on-a-partial-pile', 'fp',
-     "        if _st.unplaced or _st.partially_unplaced:",
+     "        if _st.pile:",
      "        if _st.unplaced:",
      (T_DECAPS,), 'KILLED'),
     ('auto-withholds-into-budget-withheld', 'fp',

@@ -113,10 +113,17 @@ REGISTRY = {
     'apply_stamps_in_memory': ['via_protection_stamps'],
     'print_via_protection_record': ['via_protection_stamps'],
     'via_snapshot': ['via_protection_stamps'],
-    # #1195: which floors a fanout step may lower (none for a QFN run with no
-    # copper, no via floors without a via). qfn_fanout's main and the fanout
-    # tab's apply both decide with it before their writeback.
-    'fanout_written_floors': ['_apply_fanout_results'],
+    # #1195: the fanout writeback -- which floors a step may lower (none for a
+    # QFN run with no copper, no via floors without a via) and the keywords
+    # they are written with. bga_fanout's and qfn_fanout's mains and the fanout
+    # tab's apply all decide with it before their writeback.
+    'fanout_fix_kwargs': ['_apply_fanout_results'],
+    # #857: the end-of-run `Design rules [...]` line (and, CLI-only, the
+    # --strict-sizes exit 3). route.py's line comes from inside batch_route on
+    # both fronts; route_diff / route_planes / the fanouts print it from their
+    # mains, and their GUI tabs call the same helper after the engine
+    # (differential_gui, planes_gui, fanout_gui), so the log says the same.
+    'finish_design_rules': ['finish_design_rules'],
 }
 # NOTE (deliberately NOT registered): move_copper_graphics_to_silkscreen runs
 # inside the shared plane WRITER (plane_io), not a main() -- so this gate, which
@@ -147,6 +154,18 @@ REGISTRY = {
 #
 # fix_kicad_drc_settings is a MODULE; the main() call is
 # fix_project_for_output (above).
+#
+# NOTE (not registered, and out of this lint's sight): a FILE-mode pass inside
+# batch_route is CLI-only exactly as a main() post-pass is, but this gate scans
+# main() scopes only. #666's scoped cap move is one (route.py
+# _cap_moves_to_file666: write_placed_output + the pcb_data mirror + an
+# oracle_reconnect re-weld, after the write and after the plane finalize). Its
+# GUI twin is in the engine too (_cap_moves_in_run666: the mirror and the
+# re-weld on a staged board, at the same points) plus the applier
+# (results_data['pending_cap_moves'] -> gui_utils.apply_cap_moves_to_live_board,
+# and run_kicad_oracle_on_live_board only when there was no staged board), and
+# tests/gui_parity/test_666_cap_move_gui.py is the gate that measures the two
+# fronts against each other.
 
 # Modules whose public functions are ALL post-route finalization passes: a
 # never-before-seen symbol from these, called in a CLI main, must be reviewed.
@@ -202,6 +221,33 @@ KNOWN_CLI_ONLY = {
     'write_filled_board': 'route.py --write-fill: fills the WRITTEN board for '
                           'delivery; the GUI mutates a live board KiCad fills '
                           'itself, so there is no file to fill',
+    # Report-only grade of the plane nets on repair_planes' WRITTEN board,
+    # after its oracle reconnect -> JSON_SUMMARY status/failed_multipoint/
+    # unconnected_pads. No GUI front runs repair_planes' main (the planes tab
+    # lost repair in #562); the GUI's repair is the route step's in-run
+    # finalize, whose #1069 re-grade reports the same on both fronts.
+    'grade_plane_completion': 'repair_planes.py: grades the plane nets on the '
+                              'written board for JSON_SUMMARY (report-only, '
+                              'no board mutation)',
+    # Found reviewing #1282: repair_planes' main replaces its per-attempt
+    # --power-nets `plane tap` ledger rows with the copper it ships. No GUI
+    # front runs repair_planes' main; the route tab's in-run finalize is
+    # graded by route.py's engine-side pass, on both fronts.
+    'replace_track_rows': 'repair_planes.py: --power-nets ledger rows from '
+                          'the copper it ships (report-only, no board '
+                          'mutation)',
+    # #1279, found by the 2026-10-16 parity audit (neither module is in
+    # POSTPASS_MODULES, so discovery cannot see them; listed by hand as
+    # replace_track_rows was). Both only fill JSON_SUMMARY.sense_branches.
+    # The WARNINGs a GUI user needs -- a pour over a branch, a run tapping
+    # one -- are printed by the engines on both fronts.
+    'consume_sense_branches': 'route_planes.py: takes create_plane\'s '
+                              'sense-branch entries (with poured_over) for '
+                              'JSON_SUMMARY (report-only, no board mutation)',
+    'sense_branches_shipped': 'repair_planes.py: judges the declared sense '
+                              'branches on the board it wrote, for '
+                              'JSON_SUMMARY (report-only, no board mutation; '
+                              'no GUI front runs repair_planes\' main)',
 }
 
 
@@ -288,7 +334,7 @@ SAME_SYMBOL_TWINS = {
     'persist_protected_nets',
     'persist_impedance_specs',
     'persist_pour_served_pads',
-    'fanout_written_floors',
+    'fanout_fix_kwargs',
 }
 
 

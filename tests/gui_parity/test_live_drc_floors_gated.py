@@ -43,8 +43,13 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PLUGIN = os.path.join(ROOT, "kicad_routing_plugin")
 
-# Writers that must never be called without a gate around the CALL.
-GATED_AT_CALL = ("update_live_drc_floors", "fix_project_for_output")
+# Writers that must never be called without a gate around the CALL. The
+# adapter's `write_drc_settings_to_project` is the one apply_drc_settings_fix
+# delegates to, so a direct call is the choke point bypassed; the call INSIDE
+# the choke point is exempt (its gate is the early return there, which
+# check_choke_point verifies).
+GATED_AT_CALL = ("update_live_drc_floors", "fix_project_for_output",
+                 "write_drc_settings_to_project")
 # The shared helper that carries the gate INSIDE it.
 CHOKE_POINT = "apply_drc_settings_fix"
 # A gate is any enclosing `if` whose test mentions the toggle. ai_plan reads the
@@ -69,12 +74,16 @@ def check_call_sites():
         if not any(f in src for f in GATED_AT_CALL):
             continue
         tree = ast.parse(src)
+        choke = [(n.lineno, n.end_lineno or n.lineno) for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == CHOKE_POINT]
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Call)
                     and _call_name(node) in GATED_AT_CALL):
                 continue
-            checked += 1
             line = node.lineno
+            if any(a <= line <= b for a, b in choke):
+                continue
+            checked += 1
             tests = [ast.get_source_segment(src, n.test) or ""
                      for n in ast.walk(tree)
                      if isinstance(n, ast.If)

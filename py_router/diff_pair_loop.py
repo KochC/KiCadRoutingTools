@@ -19,6 +19,7 @@ from dataclasses import replace
 from diff_pair_routing import (route_diff_pair_with_obstacles, get_diff_pair_endpoints,
                                _route_direct_coupled_middle, _seg_to_seglist_min_edge)
 from blocking_analysis import analyze_frontier_blocking, print_blocking_analysis, filter_rippable_blockers, invalidate_obstacle_cache
+from protected_nets import rip_refusal
 from rip_up_reroute import rip_up_net, restore_net
 from obstacle_cache import refresh_net_obstacles  # #806
 from polarity_swap import apply_polarity_swap, get_canonical_net_id
@@ -281,6 +282,14 @@ def route_diff_pairs(
                 state.config = config
                 state.diff_pair_extra_clearance = diff_pair_extra_clearance
                 state.diff_pair_base_obstacles = diff_pair_base_obstacles
+            # The deferred branch below reads this reason back, so one left by
+            # an earlier attempt must not outlive it. A guard: no caller routes
+            # a deferred pair twice on one state today (the bare-pad retry
+            # pass skips a pair already left to single-ended, and the #246
+            # re-queue only takes a pair whose copper was ripped).
+            _diag = state.pair_diagnostics.get(pair_name, {})
+            if _diag.get('reason') == 'coupled-route-failed':
+                del _diag['reason']
             try:
                 leg_results, merged, peeled = route_multipoint_diff_pair(state, pair, pair_name, terminals)
             finally:
@@ -332,13 +341,17 @@ def route_diff_pairs(
                 refresh_net_obstacles(state.working_obstacles, state.net_obstacles_cache,
                                       pcb_data, config, (pair.p_net_id, pair.n_net_id))
             else:
-                # No leg was coupled - every leg was electrically short and
-                # deferred (peeled set above). Not a failure: the single-ended
-                # follow-up pass connects the whole pair.
-                print(f"  All {len(terminals) - 1} legs electrically short - "
-                      f"whole pair left for single-ended")
-                record_pair_diag(state, pair_name, outcome='deferred',
-                                 reason='electrically-short', stage='multipoint')
+                # No leg was coupled - every leg was electrically short, or no
+                # coupled chain routed (#165, reason recorded by the router) -
+                # and the whole pair was deferred (peeled set above). The
+                # single-ended follow-up pass connects it.
+                if state.pair_diagnostics.get(pair_name, {}).get('reason') == 'coupled-route-failed':
+                    print(f"  Coupled legs failed - whole pair left for single-ended")
+                else:
+                    print(f"  All {len(terminals) - 1} legs electrically short - "
+                          f"whole pair left for single-ended")
+                    record_pair_diag(state, pair_name, outcome='deferred',
+                                     reason='electrically-short', stage='multipoint')
             continue
 
         # Build complete obstacle map for diff pair routing
@@ -384,7 +397,9 @@ def route_diff_pairs(
             self_canon = pair.p_net_id  # this pair's canonical id (p_net_id)
             if (gnet not in routed_results
                     or canonical in diff_pair_rip_exclude(state, pair.p_net_id, pair.n_net_id)
-                    or canonical in _graze_ancestry.get(self_canon, ())):
+                    or canonical in _graze_ancestry.get(self_canon, ())
+                    or rip_refusal(pcb_data, gnet, "diff-pair graze rip",
+                                   diff_pair_by_net_id)):
                 break  # not ours to rip, the global guard forbids it, or it would
                        # ping-pong (the grazed net already graze-ripped this pair)
             print(f"  Route would graze net {gnet}; ripping it to route {pair_name} "
@@ -466,7 +481,9 @@ def route_diff_pairs(
             seen_canonical_ids = set()
             for b in blockers:
                 canonical = get_canonical_net_id(b.net_id, diff_pair_by_net_id)
-                if canonical not in seen_canonical_ids and b.net_id in routed_results:
+                if (canonical not in seen_canonical_ids and b.net_id in routed_results
+                        and not rip_refusal(pcb_data, b.net_id, "diff-pair probe rip",
+                                            diff_pair_by_net_id)):
                     seen_canonical_ids.add(canonical)
                     rippable_blockers.append(b)
 
@@ -771,7 +788,8 @@ def route_diff_pairs(
                             print_blocking_analysis(fresh_blockers, prefix="    ")
                             next_blocker = None
                             for b in fresh_blockers:
-                                if b.net_id in routed_results:
+                                if b.net_id in routed_results and not rip_refusal(
+                                        pcb_data, b.net_id, "diff-pair rip ladder", diff_pair_by_net_id):
                                     canonical = get_canonical_net_id(b.net_id, diff_pair_by_net_id)
                                     if canonical not in ripped_canonical_ids:
                                         next_blocker = b

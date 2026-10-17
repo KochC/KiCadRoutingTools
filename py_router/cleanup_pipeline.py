@@ -739,7 +739,8 @@ def unreported_input_strips(orig_seg_by_net, orig_via_by_net, scope_net_ids,
     NEITHER GRAPHIC NOR LOCKED COPPER IS EVER A CANDIDATE. Graphic is the
     asymmetry that motivated this function (below). LOCKED copper is the same
     class for the same reason: KiCad's `(locked yes)` is user-pinned, every
-    prune site refuses it (`pcb_modification` 1645/2056/2072/2080/5156) and
+    prune, trim, re-bend and shift site refuses it (`pcb_modification._locked`,
+    #1261) and
     #521 makes its net never-rippable with no override -- so a locked original
     missing from the model is not something this pass may finish by deleting
     the user's copper from the output.
@@ -759,6 +760,7 @@ def unreported_input_strips(orig_seg_by_net, orig_via_by_net, scope_net_ids,
     re-emit clause lets a result reproduce an original's span, so that span is
     still on the board even when the original object is not in `board_*`.
     """
+    from kicad_parser import is_immutable_copper  # #1279
     present_s = {_seg_ledger_sig(x) for x in board_segments
                  if not getattr(x, 'graphic', False)}
     present_v = {_via_ledger_sig(x) for x in board_vias}
@@ -770,12 +772,12 @@ def unreported_input_strips(orig_seg_by_net, orig_via_by_net, scope_net_ids,
             for x in orig_seg_by_net.get(nid, ())
             if id(x) not in known_seg_ids
             and not getattr(x, 'graphic', False)
-            and not getattr(x, 'locked', False)
+            and not is_immutable_copper(x)
             and _seg_ledger_sig(x) not in present_s]
     vias = [x for nid in (scope_net_ids or ())
             for x in orig_via_by_net.get(nid, ())
             if id(x) not in known_via_ids
-            and not getattr(x, 'locked', False)
+            and not is_immutable_copper(x)
             and _via_ledger_sig(x) not in present_v]
     return segs, vias
 

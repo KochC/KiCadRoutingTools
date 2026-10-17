@@ -60,6 +60,20 @@ Build the same `PCBData` structure directly from a live `pcbnew.BOARD`
 object (inside KiCad's Python console or an action plugin). Much faster than
 saving and re-parsing, and reflects unsaved edits.
 
+**On the ipc-migration branch** `board` is a kipy (kicad-python) `Board`
+reached over KiCad 10's IPC socket, and the `pcbnew_*` / `resync_live_*` /
+`resolve_live_sense_branches` helpers described below do not exist. The kipy
+reader fills the same fields through `kipy_*` helpers -- `kipy_via_type` /
+`kipy_via_layers` (#1268), `kipy_locked`, `kipy_via_protection_attrs`,
+`kipy_sense_groups` (#1279), `kipy_pad_paste_overrides` and its siblings
+(#962) -- and the dialog, which keeps one `PCBData` across steps, re-syncs
+from a FRESH build: copper, zones and paste openings taken from it, footprint
+and pad poses patched in place (`routing_dialog._sync_footprint_poses`, #362),
+then `kipy_resolve_sense_branches(pcb, board)` against the dialog's own pads.
+kipy exposes no design-settings read and no board-level property, so
+`live_rules_provider` and `live_records_provider` stay `None` there and those
+readers fall back to the sibling `.kicad_pro`.
+
 Layer names are the file's canonical tokens (`In1.Cu`, `User.1`), as
 `parse_kicad_pcb` reads them, even when Board Setup gives a layer a display
 name (In1.Cu shown as "GND"). Map a live board's layers the same way:
@@ -73,6 +87,22 @@ import pcbnew
 from kicad_parser import build_pcb_data_from_board
 pcb = build_pcb_data_from_board(pcbnew.GetBoard())
 ```
+
+The live board's tracks, arc pieces and vias are read by ONE extractor,
+`pcbnew_track_copper(board)` -> `([Segment], [Via])` (uuid, KiCad lock, via
+type and protection spec included), and its copper GRAPHICS (#337 board
+drawings, #908 footprint copper) by ONE emitter,
+`pcbnew_graphic_copper(board, live_fps, live_keys, get_layer_name, to_mm)`,
+with the footprints and their keys from `pcbnew_live_footprints(board)`. A
+caller that keeps one `PCBData` across edits of the live board (the GUI dialog
+does, step to step) refreshes it with `resync_live_copper(pcb, board)` -- the
+board's tracks, vias and copper graphics through those two, so a footprint
+moved in the session carries its copper art, every memo derived from the old
+copper dropped -- and then, once pads and zones are current,
+`resolve_live_sense_branches(pcb, board)`, which re-reads the board's
+`sense:<REF>.<PAD>` groups (#1279). Building copper objects by hand loses
+what the extractor carries: the GUI's re-sync once did, and every step after
+the first ran with no KiCad lock, no uuid and no arc copper.
 
 ## PCBData
 
@@ -95,9 +125,11 @@ The top-level container returned by both entry points.
 | `groups` | `List` | KiCad groups (#459) — kept so writers can preserve group membership |
 | `source_path` | `str` | Absolute path this data came from (`""` = in-memory). Lets engines with no `input_file` discover sibling project files, e.g. the `.kicad_dru` per-layer clearance rules (#498) |
 | `exact_fill_provider` | `Optional[Callable]` | Zero-arg callable returning `{(net_name, layer): [island_polygon, ...]}` — KiCad-truth fill for exact-fill consumers (#424). `None` (file-parsed boards) = refill `source_path`; `build_pcb_data_from_board` sets it to a staged-save refill of the live board (live copper AND live clearances) |
-| `live_rules_provider` | `Optional[Callable]` | Zero-arg callable returning the LIVE board's design-settings rules `{'min_track_width': mm, 'min_connection': mm}` (#1187), read when called. `None` (file-parsed boards) = the sibling `.kicad_pro`; `build_pcb_data_from_board` sets it, because mid-plan the file beside the live board is the original project while the floors the plan lowered live in pcbnew's memory. Read by `fix_kicad_drc_settings.connection_width_floor` |
-| `paste_apertures` | `List[PasteAperture]` | Every solder-paste OPENING (#962), from `paste_apertures.build_paste_apertures`. Sources: `pad` (a pad on a paste layer, grown by its resolved paste margin -- pad, then footprint, then board setup, per axis, ratio and margin independently, clamped at -size/2 except for a custom pad, which KiCad does not clamp), `paste_only_pad` (a pad on a paste layer with no copper, e.g. windowpanes) and `graphic` (a paste-layer shape, e.g. esp_prog U2's F.Paste tab). Which nets an opening concerns is `paste_apertures.aperture_nets` (the per-net lists `apertures_by_net` / `apertures_for_net` are memoised): a pad opening its pad's net, a graphic or paste-only one the nets of the owner's copper it overlaps. Both parse paths feed the one builder |
+| `live_rules_provider` | `Optional[Callable]` | Zero-arg callable returning the LIVE board's design-settings rules `{'min_track_width': mm, 'min_connection': mm, 'min_hole_clearance': mm}` (#1187, #1038), read when called. `None` (file-parsed boards) = the sibling `.kicad_pro`; `build_pcb_data_from_board` sets it, because mid-plan the file beside the live board is the original project while the floors the plan lowered live in pcbnew's memory -- and a Board Setup edit lives there before it is saved, or on a board with no file at all (#1238). Read by `fix_kicad_drc_settings.connection_width_floor` and `obstacle_map.declared_hole_clearance`. It answers only the rules the live board DECLARES (`fix_kicad_drc_settings.live_declared_rules`): pcbnew holds every project-less board at its factory values (`pcbnew.DEFAULT_*`: hole clearance 0.25, track 0.2, ...), which the file does not declare, so a live value counts when the project declares the key, a GUI writer of this session targeted it, or it differs from the factory value. `None` when it declares none of them, which sends both readers to the file |
+| `live_records_provider` | `Optional[Callable]` | Zero-arg callable returning the LIVE board's `kicad_routing_tools` records (fab-floor origin, protected nets, impedance specs, pour promises, ...): the newer of its project's copy and the copy on the board itself (`tool_records.live_namespace`), read when called. The GUI keeps the records on the board because KiCad's own project save drops what was written into the `.kicad_pro` after load. `None` (file-parsed boards) = the files: the newer of the project's copy and the `.kicad_pcb`'s (`tool_records.effective_namespace`). Read by the `protected_nets` readers and the hole floor's origin |
+| `paste_apertures` | `List[PasteAperture]` | Every solder-paste OPENING (#962), from `paste_apertures.build_paste_apertures`. Sources: `pad` (a pad on a paste layer, grown by its resolved paste margin -- pad, then footprint, then board setup, per axis, ratio and margin independently, clamped at -size/2 except for a custom pad, which KiCad does not clamp), `paste_only_pad` (a pad on a paste layer with no copper, e.g. windowpanes) and `graphic` (a paste-layer shape, e.g. esp_prog U2's F.Paste tab). Which nets an opening concerns is `paste_apertures.aperture_nets` (the per-net lists `apertures_by_net` / `apertures_for_net` are memoised): a pad opening its pad's net, a graphic or paste-only one the nets of the owner's copper it overlaps. Both parse paths feed the one builder, and the GUI's pre-step re-sync rebuilds it from the live board (`resync_live_paste_apertures`) once the parts are current, so a part moved in the session moves its openings |
 | `graphic_copper_unmeasured` | `List[dict]` | Footprint copper the parser does NOT model, per owner (`{owner_ref, kind, reason}`, kind `logo` / `curve` / `text`), so the off-outline grade can say what it did not measure (#962) |
+| `sense_branches` | `List[SenseBranch]` | One entry per KiCad group named `sense:<REF>.<PAD>` (#1279, `sense_branch.py`): a protected Kelvin sense branch whose join pad is `REF.PAD`, its member copper resolved by uuid, its sense pads, and the `reason` it is refused when it cannot be protected. Both parse paths resolve it the same way (`board.Groups()` on the live board) and `compare_pcb_data` diffs it. Separate from `groups` |
 
 ### `PCBData.get_via_barrel_length`
 
@@ -116,16 +148,16 @@ section. Used for accurate length/time matching.
 | Field | Type | Meaning |
 |-------|------|---------|
 | `component_ref` | str | Parent footprint reference (`'U9'`) |
-| `pad_number` | str | Pad identifier (`'1'`, `'H2'`; may be empty) |
+| `pad_number` | str | Pad identifier (`'1'`, `'H2'`; may be empty). `''` for a pad that cannot carry a number -- an NPTH hole, or an SMD/connector pad with no copper layer (an aperture) -- whatever the file wrote, as pcbnew's reader blanks it (`PAD::CanHaveNumber`) |
 | `global_x`, `global_y` | float | Absolute board position (footprint rotation applied) |
 | `local_x`, `local_y` | float | Position relative to footprint origin (before rotation) |
-| `size_x`, `size_y` | float | Pad dimensions in board space |
+| `size_x`, `size_y` | float | Pad dimensions in board space. A KiCad 9 `(padstack ...)` pad is the per-axis MAX over the copper layers it is ON (within the board's copper): an entry for a layer the pad has no copper on does not count (both parse paths) |
 | `shape` | str | `'circle'`, `'rect'`, `'roundrect'`, `'oval'`, `'trapezoid'`, `'custom'` |
-| `layers` | List[str] | Layers the pad is on (`['*.Cu']` = all copper, for through-hole) |
+| `layers` | List[str] | Layers the pad is on, as the SET pcbnew loads (`canonical_pad_layers`): `'*.Cu'` = every copper layer; `F&B.Cu` reads as `'F.Cu', 'B.Cu'` and `*.Adhes` / `*.Fab` / `*.CrtYd` / `*In.Cu` as their members; `*.Mask` / `*.Paste` / `*.SilkS` stay wildcards (two explicit members collapse to one); a **plated** through-hole pad is on every copper layer of the board whatever the file lists. File order is kept otherwise. Both parse paths give the same set |
 | `net_id` | int | Net ID (0 = unconnected) |
 | `net_name` | str | Net name (`''` if unconnected) |
 | `rotation` | float | Total rotation in degrees (pad + footprint), normalized to [0, 360) |
-| `drill` | float | Drill diameter (0 for SMD, > 0 for through-hole). Oval/slot drills (`(drill oval w h)`) report `max(w, h)` so they keep `> 0` / through-hole semantics. |
+| `drill` | float | Drill diameter (0 for SMD, > 0 for through-hole). Oval/slot drills (`(drill oval w h)`) report `max(w, h)` so they keep `> 0` / through-hole semantics. Read in exponent form too: `(drill 1e-06)` is 1 nm, not 1 mm. |
 | `pinfunction` | str | Pin function from the schematic (`'TX'`, `'~RESET'`) |
 | `pintype` | str | Pin electrical type (`'passive'`, `'input'`, `'power_in'`) |
 | `pad_type` | str | Pad kind: `'smd'`, `'thru_hole'`, `'np_thru_hole'`, `'connect'`. NPTH pads carry **no copper** (their size is just the mask opening, even when `layers` lists `*.Cu`), so copper-clearance checks skip them; only their drill hole matters. |
@@ -135,6 +167,9 @@ section. Used for accurate length/time matching.
 | `local_clearance` | float | The pad's **resolved** clearance override in mm (issue #326): its own `(clearance …)` token, else the footprint-level override, else `0` (= use the global/netclass clearance). KiCad enforces `max(the two items' clearances)` per pair; the router's obstacle stamps and `check_drc` honor this the same way. Negative (shrinking) overrides clamp to `0`. |
 | `castellated` | bool | KiCad's `(property pad_prop_castellated)`: a deliberate half-hole pad **on** the board outline. Set by both parse paths. The routing mains run a castellated-landing retract post-pass that pulls track ends landing inside such a pad's edge-clearance zone back to the pad's inner reach (`pcb_modification.retract_castellated_landings`). |
 | `unconnected_layer_mode` | str | KiCad's unconnected-layer mode, from `(remove_unused_layers …)` + `(keep_end_layers …)`: `'keep_all'`, `'remove_all'` or `'remove_except_start_end'`. On a layer the mode removes, KiCad flashes a through-hole pad only when copper reaches its **hole**, so a track ending in the annulus short of the drill is not connected there. Set by both parse paths; `connectivity.pad_unflashed_layers(pad, layers)` names those layers. |
+| `die_length` | float | KiCad's **pad-to-die** length in mm, `(die_length …)` / `PAD.GetPadToDieLength()`: the bond wire or package trace inside the part. KiCad adds it to the net's length in its tuners (start and end pads) and its length/skew DRC (every pad). `0.0` = none declared. Set by both parse paths (#1248); `net_queries.net_match_length` and every length-matching pass add it. |
+| `die_delay` | float | The time twin in **ps**, `(die_delay …)` / `PAD.GetPadToDieDelay()` (KiCad 10; `0.0` on KiCad 9). Time matching adds it; a `die_length` is never converted into a delay, as in KiCad 10. Set by both parse paths (#1248). |
+| `sense` | str | The `sense:<REF>.<PAD>` group this pad is a SENSE pad of (#1279): a pad of the branch's net that its member copper touches, the join pad excepted. Set only on a protected branch; the router never attaches new copper to it. `''` otherwise |
 
 Pad dimensions are resolved into board space using the pad's **absolute** angle
 (the KiCad `(at … angle)` already includes the footprint rotation; applying the
@@ -145,6 +180,16 @@ keeps its given dimensions and carries the tilt in `rect_rotation`; the obstacle
 map and DRC rotate the pad rectangle by that angle. `check_pads.py` flags pads
 whose resolved copper overlaps a different-net neighbour (a modelling error).
 
+A **custom** pad carries its real copper in `polygons` (GLOBAL mm; their union
+is the copper), and its `size_x`/`size_y`/`rect_rotation` follow one rule on
+both parse paths: a pad whose copper IS its anchor -- no primitive, or every
+primitive inside the anchor shape -- is the anchor rect with its residual
+tilt, like an ordinary pad; otherwise it is the board-axis box of the copper
+(anchor shape plus primitives) about the copper centre, `rect_rotation` 0. The
+box never includes the drill (an NPTH custom pad is its anchor, not its hole)
+and is centred on the copper, not the hole, when the pad has a copper offset.
+`anchor_size` is the anchor in the pad frame.
+
 ### `Segment`
 
 | Field | Type | Meaning |
@@ -154,16 +199,18 @@ whose resolved copper overlaps a different-net neighbour (a modelling error).
 | `width` | float | Track width |
 | `layer` | str | Layer name |
 | `net_id` | int | Net ID |
-| `uuid` | str | UUID from the file (`''` for newly created segments and for uuid-less file items — KiCad treats the token as optional, PR #534) |
+| `uuid` | str | UUID from the file, or the live item's `m_Uuid` on the pcbnew path (#1279) (`''` for newly created segments and for uuid-less file items — KiCad treats the token as optional, PR #534) |
 | `start_x_str`, … | str | Original coordinate strings, kept for exact file matching |
 | `graphic` | bool | This copper came from a **graphic**, not a track (issue #337, extended to footprint shapes by #908). It is real copper for obstacles and DRC, and it is immutable: cleanup passes must never prune it and writers cannot strip it, because there is no `(segment …)` block to match. It never conducts — connectivity gives a graphic no credit, so KiCad will keep calling such a net unconnected (#513 item 6). |
-| `locked` | bool | KiCad `(locked yes)`: the user pinned this copper. Its net is never rip-eligible (#521, no override); locked copper was already an obstacle (#150). Both parse paths set it. The text parser reads the token anywhere in the block, as KiCad does -- `(locked yes)`, `(locked)` or the bare `(segment locked ...` word (#1158) -- and reads every track block by its own tokens, so a hand-written block in any field order is modelled, and one it still cannot model is reported on stderr rather than dropped. |
+| `locked` | bool | KiCad `(locked yes)`: the user pinned this copper. Its net is never rip-eligible (#521, no override) -- before the run and in every in-run rip ladder, rescue and blame (`protected_nets.rip_refusal`, #1261); locked copper was already an obstacle (#150). No layer switch moves it (`stub_layer_switching.get_stub_info` answers None for a stub whose switch would), no cleanup pass removes, trims or re-bends it, and a net whose copper is all locked and whose pads grade connected is not routed (#1261). Both parse paths set it. The text parser reads the token anywhere in the block, as KiCad does -- `(locked yes)`, `(locked)` or the bare `(segment locked ...` word (#1158) -- and reads every track block by its own tokens, so a hand-written block in any field order is modelled, and one it still cannot model is reported on stderr rather than dropped. |
 | `owner_ref` | str | For copper drawn **inside a footprint**, the disambiguated footprint key that owns it (`'U2'`, `'TP4~2'`); `''` for board-level graphics and every routed track (#908). It is what lets a DRC report name the object the way KiCad does — `net_0 [Polygon(U2)]` beside KiCad's *"Polygon [\<no net\>] of U2 on F.Cu"* — and what scopes the own-pad obstacle lift to the owning part. |
-| `drawn_width` | Optional[float] | Graphic copper only: the stroke AS DRAWN (#962). `width` models a filled shape drawn at stroke 0 at the fab track width, which is right for an obstacle and wrong for a measurement; the off-outline grade reads this. `None` for tracks |
+| `drawn_width` | Optional[float] | Graphic copper only: the stroke AS DRAWN (#962). `width` models a filled shape drawn at stroke 0 at the fab track width, which is right for an obstacle and wrong for a measurement; the off-outline grade reads this. An UNFILLED shape whose file stroke is 0 is stroked at `UNSTROKED_SHAPE_WIDTH` (0.1 mm), as pcbnew's reader strokes it (paste graphics too). A polygon's `(arc ...)` point entries are linearized in order (`poly_points_with_arcs`; the pcbnew builder linearizes the live chain's arcs with the same function, so both paths emit the same segments). `None` for tracks |
 | `graphic_kind` | str | Graphic copper only: the primitive (`'line'`, `'arc'`, `'poly'`, `'rect'`, `'circle'`; a footprint rect at a non-cardinal angle reads `'poly'`, as pcbnew loads it). `''` for tracks |
 | `graphic_circle` | Optional[Tuple] | For a circle, its TRUE `(cx, cy, r)`: the outline is a 16-gon whose chord midpoints sit 1.9% of r inside the curve, so a reach measured on the chords under-reads |
 | `graphic_filled` | bool | A closed graphic (poly/rect/circle) whose interior is copper, by KiCad's loader rules (a `(fill ...)` token; without one a poly is filled and a rect or circle only at stroke 0). The segments model only the outline; the off-outline grade reads this to look inside |
 | `graphic_ring` | Optional[Tuple] | For a FILLED closed graphic, its outline vertices as one tuple shared by every segment of the shape; `None` otherwise (#1181). The obstacle map stamps the interior it encloses and check_drc grades copper inside it (`check_drc.filled_graphic_shapes`). Both parse paths set it |
+| `sense` | str | The protected `sense:<REF>.<PAD>` group this track is a member of (#1279), `''` otherwise. Drives the routing rule: for its own net the copper is foreign except on the join pad, and never a place to attach |
+| `held_by` | str | The `sense:` group holding this track immutable (#1279), `''` otherwise: set whenever the group's members resolve on the join pad's net, protected or refused. `kicad_parser.is_immutable_copper(item)` (`locked or held_by`) is what the move/rewrite/remove guards read. Not a KiCad lock: never written, and the net's routes of the run stay rippable; only a whole-net strip of the net's pre-existing copper is refused (`protected_nets.protection_map` reason `sense:<REF>.<PAD>`) |
 
 ### `Via`
 
@@ -172,9 +219,11 @@ whose resolved copper overlaps a different-net neighbour (a modelling error).
 | `x`, `y` | float | Position |
 | `size` | float | Outer (pad) diameter |
 | `drill` | float | Hole diameter |
-| `layers` | List[str] | Layer span, e.g. `['F.Cu', 'B.Cu']` |
-| `net_id` | int | Net ID |
-| `uuid` | str | UUID from the file |
+| `layers` | List[str] | The two end layers, e.g. `['F.Cu', 'B.Cu']`. A through via reads `['F.Cu', 'B.Cu']` on both paths whatever its `(layers ...)` says: KiCad loads a via with no type word as THROUGH and snaps its pair, pcbnew's `TopLayer()`/`BottomLayer()` report that, and the text parser does the same (a through via written `(layers "B.Cu" "F.Cu")` included). A typed via keeps its file pair, top layer first as pcbnew reads it back, so both paths hold one ordered pair. Whether the via covers only part of the stack is `via_type`, never this pair |
+| `via_type` | str | `'through'`, `'blind'`, `'buried'` or `'micro'`: the block's type word (text) or `GetViaType()` (pcbnew). KiCad loads a via with no type word as THROUGH whatever its `(layers ...)` says, and this repo's writer emits no type word, so only a typed via has copper on part of the stack, the layers between its end layers (`geometry_utils.via_on_layer` / `via_span_layer_indices`, which the obstacle maps and check_drc read, #1268). A `Via` constructed without one is `'through'` |
+| `net_id` | int | Net ID, as pcbnew's connectivity pass leaves it on load: a non-free via with no same-net track or pad on it that sits in the zone FILL of exactly one net (on a layer it spans), with no track or pad of another net on it, takes that net whatever the file wrote (`propagate_via_cluster_nets`; antmicro lpddr4_test_board's stitching vias). A via joined to netted copper only by a track is not re-netted here |
+| `uuid` | str | UUID from the file, or the live item's `m_Uuid` on the pcbnew path (#1279) |
+| `sense`, `held_by` | str | As on `Segment` (#1279) |
 | `free` | bool | `(free yes)` flag — KiCad won't reassign the net from overlapping copper |
 | `tenting_attrs` | Dict[str, str] | Protection spec as `{token: raw inner s-expr}` for `tenting`/`covering`/`plugging`/`capping`/`filling`, e.g. `{'covering': '(front no) (back no)', 'capping': 'no'}`. `{}` = the board specified nothing (KiCad inherits its board default). Read by **both** parse paths (text and `build_pcb_data_from_board`) in the same normalized form. What a via is actually FABRICATED with is resolved token by token against `BoardInfo.via_protection_setup` by `fab_notes.effective_via_protection` (#962) |
 
@@ -204,7 +253,11 @@ declares Type VII (#962, see the writer docs).
 | `layer` | str | `'F.Cu'` or `'B.Cu'` |
 | `pads` | List[Pad] | The footprint's pads |
 | `value` | str | Component value (`'100nF'`, `'MCF5213'`) |
+| `locked` | bool | KiCad `(locked yes)` on the footprint (also `(locked)` and KiCad 6's bare `locked` word): placement never moves it. Both parse paths set it (pcbnew: `FOOTPRINT.IsLocked()`) and `compare_pcb_data` diffs it, because the GUI's placement Apply sets every live lock from the text parse of the result board (#1054) |
 | `clearance` | float | Footprint-level `(clearance …)` override in mm (0 = none). Already **resolved into** each pad's `local_clearance` at parse time — read that field for clearance decisions; this records the raw footprint value (issue #326). |
+| `uuid` | str | The footprint's own `(uuid …)` (KiCad 6: `(tstamp …)`); KiCad's `(group …)` blocks list members by it (#459) |
+| `sheet_path` | str | The schematic `(path "/<sheet uuid>/…/<symbol uuid>")`. The LAST uuid is the symbol, the rest the sheet instance; two instances of one hierarchical sheet carry the SAME symbol uuid under different prefixes, which `place_pose replicate` maps parts by (#1211). A single-uuid path is top level |
+| `sheet_name`, `sheet_file` | str | The schematic sheet's NAME and FILE as the file spells them (#1211): KiCad 8+ header tokens `(sheetname "/CH1/")` / `(sheetfile "strip.kicad_sch")`, or KiCad 6/7's `Sheetname` / `Sheetfile` properties (KiCad 6 dev files spell them `Sheet name` / `Sheet file`; either property counts only up to file version `SHEET_PROPERTIES_MAX_VERSION` (20230619), where pcbnew stops reading it -- in a later file it is an ordinary user field) (the value is a path `"/CH1/"` on some boards, a bare name `"IO_Buffer_B"` on others; not normalised). Read from the block header only, escapes undone. `build_pcb_data_from_board` reads `FOOTPRINT.GetSheetname()` / `GetSheetfile()`, which return the same spelling for both forms (KiCad 10.0.0); `compare_pcb_data` diffs all three sheet fields, and `tests/gui_parity/test_1211_sheet_name_parity.py` pins the parity. `''` = the file names none |
 | `net_tie_groups` | List[List[str]] | Pad-number groups the footprint deliberately shorts (`(net_tie_pad_groups "1, 2")` — Kelvin shunts, net-ties). KiCad's clearance exemption between the grouped pads is **local**: a tied net's copper may contact the partner pad only where the contact lies on its own pad. Query per-net via `pcb.net_tie_exempt_pad_ids(net_id)`. |
 | `owns_edge_cuts` | bool | The footprint draws Edge.Cuts geometry of its own (`fp_line`/`fp_rect`/`fp_arc`/`fp_circle`/`fp_poly`/`fp_curve` on that layer, issue #829). Its `(at x y rot)` therefore transforms part of the board outline. |
 | `owns_board_outline` | bool | ...and that geometry is **the board's own boundary** rather than a relief the part carries, so moving the footprint would resize the board (issue #829). A footprint is *carried* (this stays `False`, and it remains movable) only when its Edge.Cuts segments **close on themselves** — a window, slot or milled relief — **and** that shape lies inside the outline the board draws without it. An open path cannot be a cut-out, so it is always the boundary. crkbd draws 184 per-LED windows as carried geometry, and #628 measured that freezing such a part costs it every legal pose it has. **Movers gate on this field, never on `owns_edge_cuts`.** Computed by `kicad_parser.footprint_outline_owners` (text) and `footprint_outline_owners_from_pcbnew` (live board), which share the one decision function `classify_outline_owners`. |
@@ -225,7 +278,10 @@ modelled). The segments are the **perimeter**; a filled shape's interior is
 its `graphic_ring` (#1181), which the obstacle map stamps for every foreign net
 and check_drc grades containment in -- the same for board-level graphics. The
 off-outline grade (`check_drc.footprint_graphic_outline_census`, #962) reads
-`Segment.graphic_filled` to look inside a filled shape.
+`Segment.graphic_filled` to look inside a filled shape, and another part's
+PADS on the copper (`check_drc.footprint_graphic_pad_census`, #1266) are
+measured the same way -- strokes, then the interior -- for check_drc, the
+placement gate and check_assembly.
 
 ### `Zone`
 
@@ -233,12 +289,28 @@ off-outline grade (`check_drc.footprint_graphic_outline_census`, #962) reads
 |-------|------|---------|
 | `net_id`, `net_name` | int, str | Zone's net |
 | `layer` | str | Layer name |
-| `polygon` | List[Tuple[float, float]] | Outline vertices |
+| `polygon` | List[Tuple[float, float]] | Outline vertices, as pcbnew loads them: an `(arc (start) (mid) (end))` vertex becomes KiCad's own polyline (`kicad_arc_polyline`, below), a vertex equal on the nm grid to the one before it is dropped, and so is a last vertex repeating the first (pcbnew closes the outline as it parses it, in every file format; a KiCad 5-converted board writes one on every zone) |
 | `uuid` | str | UUID from the file |
 | `priority` | int | `(priority N)`; higher-priority zones win where outlines overlap (0 when absent) |
 | `island_removal_mode` | int | 0 = always remove isolated islands (KiCad default), 1 = never, 2 = below `island_area_min` |
 | `island_area_min` | float | mm² floor for mode 2 (0.0 when absent) |
 | `in_footprint` | bool | Zone is owned by a footprint (nested in its `(footprint ...)` block); points are still board coordinates. Plane creation neither replaces nor aborts on these |
+| `teardrop` | bool | KiCad's `(attr (teardrop ...))` (pcbnew `IsTeardropArea()`): a generated teardrop area where a track meets a pad or via. Routing output, so `assess_placement`'s `has_copper` counts it (#1164) |
+| `holes` | List[List[Tuple[float, float]]] | The outline's cut-outs: KiCad's file holds ONE outline per zone and every later `(polygon ...)` block of it is a hole in that outline (pcbnew loads it so, `Outline().HoleCount(0)`). The fill never enters one. Read the same way as `polygon`, by both parse paths; `[]` without cut-outs (#1279) |
+
+A teardrop is still COPPER: the obstacle map, DRC and connectivity read it
+through `pcb.zones` like any zone. It is never a POUR: a consumer deciding
+"is this net a plane / poured net" asks `pour_zones(pcb.zones)`, every zone
+but the teardrops. Counted as a pour, a teardropped signal net read as a
+plane net (never offered to `--rip-existing-nets`, handed to the plane
+finalize), and a GND teardrop on F.Cu read as "GND already pours on F.Cu",
+which route_planes replaced, or kept instead of the plane it was asked for.
+
+A zone on no copper layer -- a solder-mask or paste opening drawn as a zone
+(`(layers "*.Mask")`, `(layers "F.Mask" "F.Paste")`), a silkscreen fill -- is
+not copper, and neither front puts it in `pcb.zones` (pcbnew strips its net on
+load). A zone listing copper among other layers is modelled on its copper
+layers only.
 
 ### `BoardInfo`
 
@@ -250,7 +322,7 @@ off-outline grade (`check_drc.footprint_graphic_outline_census`, #962) reads
 | `board_outline` | List[Tuple[float, float]] | Outline polygon for non-rectangular boards (empty if rectangular) |
 | `board_cutouts` | List[List[Tuple]] | Interior cutout polygons |
 | `stackup` | List[StackupLayer] | Physical stackup, top to bottom (empty if the board has none) |
-| `keepouts` | List[dict] | KiCad keepout rule areas (board-level AND footprint-owned): `{'polygon': [...], 'holes': [...], 'layers': set, 'tracks_allowed': bool, 'vias_allowed': bool, 'copper_pour_allowed': bool, 'in_footprint': bool}` |
+| `keepouts` | List[dict] | KiCad keepout rule areas (board-level AND footprint-owned): `{'polygon': [...], 'holes': [...], 'layers': set, 'tracks_allowed': bool, 'vias_allowed': bool, 'copper_pour_allowed': bool, 'in_footprint': bool, 'name': str}` (`name` is the area's `(name ...)`, `''` without one: a `.kicad_dru` area predicate names it) |
 | `pad_to_paste_clearance`, `pad_to_paste_clearance_ratio` | float | The board-level paste margin and ratio from `(setup ...)`, the last term of a pad's paste-margin resolution (#962) |
 | `via_protection_setup` | Dict[str, str] | The board's via protection policy, `{token: inner}` for all five tokens (`tenting`, `covering`, `plugging`, `capping`, `filling`), canonicalised from KiCad 10's per-token form and the legacy `(tenting front back)` form; a token the board does not declare takes KiCad's factory value (#962) |
 
@@ -439,6 +511,9 @@ KiCad 6 board parses on the CLI the way it loads in KiCad:
 |---|---|---|
 | `(layers *.Cu *.Mask)` — names unquoted | the same names | every layer list (KiCad 6 writes pad lists bare) |
 | a zone on `(layers F&B.Cu)` / `(layers *.Cu)` | one `Zone` per layer: F.Cu + B.Cu / every copper layer | all versions |
+| a pad on `(layers "F&B.Cu" ...)`, `"*.Adhes"`, ..., or a plated pad declared on one side | `Pad.layers` as the set pcbnew loads (`canonical_pad_layers`) | all versions |
+| an NPTH or copper-less pad with a number | `pad_number` `''` | all versions |
+| `(property "Sheet name" ...)` / `(property "Sheetname" ...)` | `Footprint.sheet_name` (and the file pair) | version ≤ `SHEET_PROPERTIES_MAX_VERSION` (20230619) |
 | `(gr_arc (start CENTER) (end ARC-START) (angle SWEEP))` | the three-point arc pcbnew writes | version ≤ `LEGACY_ARC_FORMATTING` (20210925) |
 | a footprint whose `(tags ...)` start with `"net tie"` | one `net_tie_groups` entry of every pad | version ≤ `LEGACY_NET_TIES` (20220815) |
 | `(tstamp ...)` | the item's `uuid` (an 8-hex-digit stamp expanded as KiCad's KIID does) | footprints, tracks, vias, zones |
@@ -451,6 +526,7 @@ file of that version, which KiCad would then fail to load.
 
 ```python
 layer_list_tokens(body: str) -> List[str]          # names in a (layers ...) body, quoted or bare
+canonical_pad_layers(tokens, board_copper=(), plated_through=False) -> List[str]  # a pad's layers as pcbnew loads them
 map_layer_list_tokens(body: str, fn) -> str        # rewrite each name, keeping its spelling
 upgrade_legacy_arcs(content: str, kicad_version=None) -> str
 kiid_from_tstamp(raw: str) -> str
@@ -526,11 +602,29 @@ Compares two parses (e.g. live-board vs file) and returns human-readable
 difference strings; empty list means they match. Useful to validate
 `build_pcb_data_from_board` against `parse_kicad_pcb` (this is what the GUI's
 **Validate PCB Data** button runs). Coverage spans the fields the router
-actually consumes: board info (layers, bounds, stackup), nets, footprint and
-per-pad geometry (position, size, `rect_rotation`, `roundrect_rratio`,
-`local_clearance`, drill, layers), track and via geometry (matched as a
-multiset, not just counts), zones, board outline/cutouts, keepout zones, and
-guide paths.
+actually consumes: board info (layers, bounds, and the stackup layer by layer:
+name, type, thickness, epsilon_r, loss tangent), nets, footprint locks,
+footprint and per-pad geometry (position, size, `rect_rotation`, `roundrect_rratio`,
+`local_clearance`, drill, layers, and a custom pad's `polygons`, compared as
+the UNION each path describes -- pcbnew merges the primitives into one ring,
+the text parser keeps one per primitive -- by `_polygon_union_excess`, both
+ways), track and via geometry (matched as a multiset, not just counts; net 0
+is the same net on both paths), zones, board outline/cutouts, keepout zones,
+guide paths, and the paste openings (paired within one signature by nearest
+bounds, `_pair_nearest_bounds`, never by a sort of float coordinates).
+Zones are compared per (net, layer) as a multiset of the teardrop
+flag, the outline's and its cut-outs' vertices on the nm grid, the priority
+and the island-removal semantics, so a pour and the teardrops that share its net and
+layer cannot be paired with the wrong partner; a disagreement on the flag is
+named as a `teardrop count` line (#1164, pinned by
+`tests/gui_parity/test_1164_teardrop_parity.py`). Both fronts hold the
+vertices pcbnew loads (arcs as KiCad's polyline, the closing vertex dropped),
+so they agree to the nanometre or not at all.
+On KiCad 10.0.0 the SWIG bindings do not wrap `BOARD_STACKUP`
+(`GetStackupDescriptor()` returns an opaque pointer), so
+`build_pcb_data_from_board` reads the stackup from the board FILE through
+`extract_stackup`, the text parser's own reader, and the stackup comparison
+cannot disagree there; it guards a build whose SWIG branch answers.
 
 ```python
 save_extracted_data(pcb_data: PCBData, output_path: str)
@@ -557,6 +651,9 @@ large file:
 | `extract_vias(content, name_to_id=None)` | `List[Via]` |
 | `extract_zones(content, name_to_id=None)` | `List[Zone]` |
 | `extract_keepouts(content)` | `List[dict]` (keepout rule areas) |
+| `zone_outline_points(pts_text)` | the vertices of one zone / rule-area `(pts ...)` as pcbnew loads it (mm) |
+| `kicad_poly_shape_points(pts_text)` | the vertices of a `gr_poly` / `fp_poly` `(pts ...)` as pcbnew holds them (mm; a polygon shape's chain is closed before its points arrive) |
+| `kicad_arc_polyline(start, mid, end, max_error=ZONE_ARC_MAX_ERROR_NM)` | the polyline pcbnew holds for a three-point arc, integer nm |
 | `extract_board_contours(content)` | `(outline, cutouts)` |
 | `parse_guide_paths(content, layer)` | `List[GuidePath]` from a user layer |
 | `parse_keepout_zones(content, layer)` | `List[GuidePath]` (closed only) |
@@ -587,6 +684,41 @@ large file:
 - **`pad.layers` may contain `'*.Cu'`** (through-hole pads). Expand with
   [`net_queries.expand_pad_layers`](api-net-analysis.md#expand_pad_layers)
   before comparing to routing layers.
+- **A zone or rule-area outline can be drawn with arcs.** KiCad writes a
+  rounded outline as `(arc (start ..) (mid ..) (end ..))` vertices among its
+  `(xy ..)` points, keeps the arc, and hands every consumer its polyline.
+  `extract_zones` and `extract_keepouts` build that same polyline
+  (`kicad_arc_polyline`, a port of `SHAPE_ARC::ConvertToPolyline` as
+  `SHAPE_LINE_CHAIN::Append` calls it in KiCad 10.0.0, max error
+  `ZONE_ARC_MAX_ERROR_NM` = 1000 nm), so the CLI holds the GUI's vertices to
+  the nanometre (`tests/gui_parity/test_zone_arc_outline_parity.py` holds
+  it to pcbnew on random outlines -- radii 1 µm to 500 mm, both sweep
+  directions, chained, mixed with `xy` points, as written and as pcbnew saves
+  them -- and on degenerate arcs; `tests/test_zone_outline_points.py` pins
+  vertices pcbnew produced). Before, only `(xy ..)` was read: an all-arc
+  outline gave no points and its zone was dropped (key_ripper's `F&B.Cu` GND
+  pour), a mixed one lost its arcs.
+- **Outline-arc tessellation is KiCad-VERSION dependent, and the parser
+  follows KiCad 10.** pcbnew polygonises an outline arc at
+  `getArcPolygonizationMaxError()` = 1000 nm in KiCad 10, and at
+  `ARC_HIGH_DEF` = 5000 nm in KiCad 9. The text parser cannot know which
+  KiCad the GUI runs, so it uses `ZONE_ARC_MAX_ERROR_NM` = 1000 nm. On a
+  KiCad 9 GUI, `build_pcb_data_from_board` therefore holds fewer vertices on
+  every arc in a zone, rule-area or Edge.Cuts polygon outline, and
+  `compare_pcb_data` reports a vertex-count difference on each of them: that
+  is this known difference, not a parse bug, and the copper differs by under
+  5 µm. (`gr_arc` / `gr_circle` / `gr_curve` board edges are not affected:
+  both fronts tessellate those with the same function.)
+- **An Edge.Cuts `gr_poly` / `fp_poly` is read with pcbnew's points**
+  (`kicad_poly_shape_points`): its `(arc ..)` vertices as KiCad's polyline,
+  and -- because KiCad closes a polygon shape's chain BEFORE its points
+  arrive -- a last `xy` repeating the first point is kept (only an arc ending
+  on the first point merges it), while a zero-length edge is skipped, as both
+  fronts skip one from a `gr_line`. So a rectangle drawn as a polygon with its
+  closing point repeated takes the plain-rectangle path (no ring; the bounds),
+  as on the GUI and as in KiCad's own board outline (Castor_and_Pollux's
+  faceplate used to chain into a 5-vertex ring on the CLI), and a polygon
+  with an arc vertex is not lost (`tests/gui_parity/test_edge_poly_outline_parity.py`).
 - **`board_info.stackup` is on `board_info`**, not on `PCBData` directly,
   and is an empty list when the board file has no stackup section (impedance
   functions then fall back to FR4 defaults).

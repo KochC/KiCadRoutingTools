@@ -70,6 +70,7 @@ When specifying multiple nets, each net is paired with its corresponding plane l
 | `--via-drill` | 0.3 | Via drill size in mm |
 | `--track-width` | 0.3 | Track width for via-to-pad connections in mm |
 | `--clearance` | 0.25 | Clearance from other copper in mm |
+| `--net-clearances` | - | JSON file mapping net name -> clearance in mm (the file `route.py` / `route_diff.py` take). It REPLACES the per-net map auto-read from the board's net classes for plane taps, the pour's fill model and `--add-gnd-vias` return vias, used as given (not capped by `--clearance-ceiling`); a net it does not name routes at the run's clearance. GUI: the Advanced tab's **Net Clearances File** |
 
 ### Zone Options
 
@@ -87,7 +88,7 @@ When specifying multiple nets, each net is paired with its corresponding plane l
 | `--hole-to-hole-clearance` | 0.2 | Minimum clearance between drill holes in mm (fab floor) |
 | `--same-net-pad-clearance` | project record, else -1 | Edge-to-edge clearance (mm) between placed vias and same-net pads. `> 0` keeps **all** of this step's vias (stitching, taps, region joins) off same-net pads at that clearance, and records the value in the sibling `.kicad_pro` (`kicad_routing_tools.same_net_pad_clearance`) so later chain steps — `route.py`, `route_diff.py`, `bga_fanout`/`qfn_fanout`, `repair_planes` — inherit it (#581). `0` keeps its legacy stitching-only meaning; `-1` explicitly allows via-in-pad. Unset = use the project's recorded value if one exists |
 | `--layers`, `-l` | F.Cu + plane-layers + B.Cu | All copper layers for routing and via span (auto-computed) |
-| `--layer-costs` | 1.0 per layer (4+) or F.Cu=1.0/B.Cu=3.0 (2-layer) | Per-layer routing cost multipliers (1.0-1000) |
+| `--layer-costs` | 1.0 per layer (4+) or F.Cu=1.0/B.Cu=3.0 (2-layer) | Per-layer routing cost multipliers (1.0-1000), one per `--layers` entry; any other count is refused |
 
 ### Multi-net Plane Layer Options
 
@@ -97,6 +98,9 @@ These options control the spines routed on a layer several nets share (see [Mult
 |--------|---------|-------------|
 | `--voronoi-seed-interval` | 2.0 | Longest gap between a spine's Voronoi seeds (mm); nearer another net's point they run closer |
 | `--plane-max-iterations` | 200000 | Maximum A* iterations for routing a spine |
+
+The GUI planes tab exposes these two and `--min-thickness` in its "Zone Width &
+Shared Layers (advanced)" box, each starting at the CLI default above.
 
 A spine's keep-out from another net's via is not a setting: it is derived from the board (the via's radius plus the zone clearance plus half the zone's minimum width), and a spine pays no proximity cost.
 
@@ -251,6 +255,12 @@ An existing pour for the **same** net on the target layer is replaced by default
   those layers together or by deleting it in KiCad.
 
 A pour is therefore removed only when every layer it covers is being replaced.
+A teardrop area on the net is not a pour (#1164) and is never removed with it.
+
+The GUI planes tab does the same. Its **Skip existing zones** checkbox is
+`--skip-existing-zones`, unticked by default as on the CLI: the tab then deletes
+the replaced pour from the live board and adds the new one, and a plan step
+that omits the flag runs unticked again.
 
 #### Choosing `--gnd-via-distance`
 
@@ -642,6 +652,14 @@ at the loosest clearance that routes — there is no hard-coded "fine clearance"
 grades the board at it. Obstacle maps for each retry are built on a small window
 around the pad, so fine grids stay cheap on large boards. Per-pad outcomes are printed, and pads that still fail are listed in
 the summary. Use `--no-repair-pads` to only reconnect zone islands.
+
+The standalone script then grades the plane nets on the board it wrote (after
+the KiCad-oracle reconnect, with the same fill-aware grade as route.py's final
+re-grade), and its `JSON_SUMMARY` says what is left: `status:
+"incomplete-pads"`, route.py's `failed_multipoint` / `multipoint_pads_total` /
+`multipoint_pads_connected`, and `unconnected_pads` (`"REF.PAD (NET)"`). A
+shortfall still exits 0, as on `route.py`; exit 4 means rip casualties ship
+open.
 
 **`route_planes.py` taps nothing** (#562, see the note at the top),
 so it is the ROUTE step's in-run plane finalize that runs this repair —

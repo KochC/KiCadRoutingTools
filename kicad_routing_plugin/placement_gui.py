@@ -965,13 +965,25 @@ class PlacementTab(wx.Panel):
             return
 
         moves = self._pose_moves(board, result_pcb)
+        locks = self._lock_changes(board, result_pcb)
         with_copper = self._mode == "place_route"
+
+        def _refs(refs):
+            return ", ".join(refs[:30]) + (", ..." if len(refs) > 30 else "")
         lines = [f"{len(moves)} footprint(s) will move."]
         if moves:
-            refs = ", ".join(r for r, _fp, _p in moves[:30])
-            if len(moves) > 30:
-                refs += ", ..."
-            lines.append(refs)
+            lines.append(_refs([r for r, _fp, _p in moves]))
+        # #1054: the run's locks are part of its result (the seeder stamps its
+        # seated fixed_poses, `place_pose lock/unlock` stamps and strips), so
+        # Apply mirrors them -- and NAMES them first, an unlock above all.
+        to_lock = [r for r, _fp, want in locks if want]
+        to_unlock = [r for r, _fp, want in locks if not want]
+        if to_lock:
+            lines.append(f"{len(to_lock)} footprint(s) will be LOCKED, as the "
+                         f"result board has them: {_refs(to_lock)}")
+        if to_unlock:
+            lines.append(f"{len(to_unlock)} footprint(s) will be UNLOCKED, as "
+                         f"the result board has them: {_refs(to_unlock)}")
         # #829: say what was NOT applied. A skip the dialog does not mention is
         # a live board that silently disagrees with the result board.
         _skipped = getattr(self, '_outline_skipped', None)
@@ -982,12 +994,13 @@ class PlacementTab(wx.Panel):
                 f"in the result board are left alone here; edit part and "
                 f"outline together in KiCad if one really must move (#829).")
         if with_copper:
-            lines.append("Place + Route additionally REPLACES ALL tracks and "
-                         "vias on the live board with the run's routing. "
-                         "Arc tracks come back as short straight segments "
-                         "(the parser linearizes arcs) and blind/buried vias "
-                         "as through vias - if the input board carried "
-                         "either, open the result board file instead.")
+            lines.append("Place + Route additionally makes the live board's "
+                         "tracks and vias the run's routing: copper the run "
+                         "kept unchanged stays as it is (groups included), "
+                         "the rest is replaced. Replaced arc tracks come "
+                         "back as short straight segments (the parser "
+                         "linearizes arcs) - if the run changed any, open "
+                         "the result board file instead.")
         lines.append("The live board may have changed since the run started - "
                      "this diff is against its state right now. Continue?")
         if wx.MessageBox("\n\n".join(lines), "Apply Placement Result",
@@ -995,7 +1008,7 @@ class PlacementTab(wx.Panel):
             return
 
         tracks_added, vias_added = self._apply_ipc(
-            board, result_pcb, moves, with_copper)
+            board, result_pcb, moves, with_copper, locks)
 
         # BuildConnectivity / refill / Refresh are NOT needed under IPC:
         # KiCad rebuilds and fills server-side on each commit (same doctrine
@@ -1012,8 +1025,12 @@ class PlacementTab(wx.Panel):
                 f"{live_zones} - new zones are NOT imported by Apply; open "
                 "the result board file to get them.\n")
         msg = f"Applied: {len(moves)} footprint pose(s)"
+        if locks:
+            msg += (f", {len(to_lock)} lock(s) set and {len(to_unlock)} "
+                    f"cleared")
         if with_copper:
-            msg += f", {tracks_added} track(s), {vias_added} via(s) (replaced)"
+            msg += (f", {tracks_added} track(s), {vias_added} via(s) added "
+                    f"(unchanged copper kept)")
         msg += ". Use Edit -> Undo in KiCad to revert."
         self.set_status(msg)
         self.append_log("Placement apply: " + msg + "\n")
@@ -1030,6 +1047,35 @@ class PlacementTab(wx.Panel):
             return fp.layer == _ensure_kipy().BoardLayer.BL_B_Cu
         except Exception:
             return False
+
+    @staticmethod
+    def _live_by_key(board):
+        """{PCBData key: live kipy footprint}, in one enumeration.
+
+        One enumeration, not a lookup per part: kipy has no
+        FindFootprintByReference and each get_footprints() is a round trip.
+
+        Keyed the way PCBData keys are (#726): two blocks sharing a reference
+        are `TP4` and `TP4~2`, so a map keyed on the bare reference finds
+        neither -- `live.get('TP4~2')` is None and the part is silently
+        skipped. `disambiguate_references` over the board's own footprint
+        order is the same function both parse paths use, which is the whole
+        contract between them. (The IPC twin of main's
+        `gui_utils.live_footprints_by_key`, which the port deleted along with
+        the rest of the pcbnew live-board helpers.)
+        """
+        from kicad_parser import _fp_reference, disambiguate_references
+        live_fps = list(board.get_footprints())
+        raw = []
+        for fp in live_fps:
+            r = _fp_reference(fp)
+            if not r:
+                try:
+                    r = "#" + str(fp.id.value)
+                except Exception:
+                    r = "?"
+            raw.append(r)
+        return dict(zip(disambiguate_references(raw), live_fps))
 
     def _pose_moves(self, board, result_pcb):
         """[(ref, live_fp, parsed_fp)] for every footprint whose pose differs.
@@ -1053,31 +1099,8 @@ class PlacementTab(wx.Panel):
         builder fills it, rather than being a second, divergent rule. See the
         IPC GAPS note in the merge commit.
         """
-        from kicad_parser import _fp_reference, disambiguate_references
         from kicad_ipc_adapter import _vec_xy_mm
-
-        # One enumeration, not a lookup per part: kipy has no
-        # FindFootprintByReference and each get_footprints() is a round trip.
-        #
-        # Keyed the way PCBData keys are (#726): two blocks sharing a
-        # reference are `TP4` and `TP4~2`, so a map keyed on the bare
-        # reference finds neither -- `live.get('TP4~2')` is None and the part
-        # is silently skipped. `disambiguate_references` over the board's own
-        # footprint order is the same function both parse paths use, which is
-        # the whole contract between them. (This replaces the SWIG-side
-        # `gui_utils.live_footprints_by_key`, which the port deleted along
-        # with the rest of the pcbnew live-board helpers.)
-        _live_fps = list(board.get_footprints())
-        _raw = []
-        for fp in _live_fps:
-            r = _fp_reference(fp)
-            if not r:
-                try:
-                    r = "#" + str(fp.id.value)
-                except Exception:
-                    r = "?"
-            _raw.append(r)
-        live = dict(zip(disambiguate_references(_raw), _live_fps))
+        live = self._live_by_key(board)
 
         moves = []
         unreachable = []
@@ -1119,17 +1142,62 @@ class PlacementTab(wx.Panel):
                   % (len(unreachable), ', '.join(sorted(unreachable)[:12])))
         return moves
 
-    def _apply_ipc(self, board, result_pcb, moves, with_copper):
-        """Apply poses (and optionally ALL copper) in ONE IPC commit.
+    def _lock_changes(self, board, result_pcb):
+        """[(ref, live_fp, want_locked)] for every footprint whose KiCad lock
+        differs from the result board's (#1054).
 
-        Wholesale copper replacement is correct here: the place+route loop's
-        contract is that placement invalidates all prior copper. Poses and
-        copper ride the SAME commit so the board is never left half-applied
-        and the whole apply is one undo step (parity with
+        A SEPARATE pass from `_pose_moves`, because a lock is not a pose: the
+        seeder stamps `(locked yes)` on a fixed_pose it seats, and one already
+        at its seat changes its lock and nothing else, so a pose diff never
+        sees it. The result board is mirrored in BOTH directions. Placement
+        unlocks on purpose -- `place_pose unlock` is the only way to move a
+        KiCad-locked part, and make_unplaced strips each moved part's lock --
+        so keeping the live lock would ship a part locked at a pose nobody
+        locked it at. The caller names every change before applying any.
+
+        An outline owner (#829) is included: `_pose_moves` skips it because
+        moving it would resize the board, and a lock moves nothing. A part
+        missing from the live board was already reported by `_pose_moves`.
+        """
+        from kicad_parser import kipy_locked
+        live = self._live_by_key(board)
+        changes = []
+        for ref, parsed in sorted(result_pcb.footprints.items()):
+            fp = live.get(ref)
+            if fp is None:
+                continue
+            want = bool(getattr(parsed, 'locked', False))
+            if kipy_locked(fp) != want:
+                changes.append((ref, fp, want))
+        return changes
+
+    def _apply_ipc(self, board, result_pcb, moves, with_copper, locks=()):
+        """Apply poses, locks and (optionally) copper in ONE IPC commit.
+
+        Poses, locks and copper ride the SAME commit so the board is never
+        left half-applied and the whole apply is one undo step (parity with
         kicad_ipc_adapter.apply_footprint_moves).
+
+        Copper: the result board is the authority -- the place+route loop's
+        contract is that placement invalidates prior copper, so live copper
+        the result does not carry is removed and copper it adds is created. A
+        live track, arc or via the result carries UNCHANGED -- same geometry,
+        layer, width and net, and for a via the same size, drill, layer pair
+        and type -- is KEPT rather than removed and recreated (#1279).
+        Recreating gave every item a new uuid, which took it out of any KiCad
+        group: a `sense:<REF>.<PAD>` group lost its members, KiCad dropped the
+        emptied group on save, and the Kelvin branch it declared was no longer
+        protected; an unchanged arc also came back as chords. A kept via takes
+        the result's protection spec. A created item takes its KiCad lock from
+        the result's `locked`, the file's own `(locked ...)` token (#521) -- a
+        sense hold is `held_by`, never a lock, so Apply never writes one.
+        Returns (tracks_added, vias_added).
         """
         from kicad_ipc_adapter import (begin_commit, make_track, make_via,
-                                       vec_mm, _ensure_kipy)
+                                       vec_mm, _ensure_kipy, layer_name_for,
+                                       set_item_locked, _vec_xy_mm)
+        from kicad_parser import (mm_to_iu, _arc_to_segments, kipy_via_type,
+                                  kipy_set_via_protection)
         try:
             from kipy.geometry import Angle
         except Exception:
@@ -1141,9 +1209,22 @@ class PlacementTab(wx.Panel):
             net = result_pcb.nets.get(net_id)
             return net.name if net is not None else None
 
+        def live_net_name(item):
+            net = getattr(item, "net", None)
+            return (getattr(net, "name", "") or "") if net is not None else ""
+
+        # Keys compare in integer nanometres, the resolution both boards hold.
+        def seg_key(a, b, width_nm, layer, net_name):
+            return (min(a, b), max(a, b), width_nm, layer, net_name)
+
+        def via_key(x, y, size, drill, layers, vtype, net_name):
+            return (mm_to_iu(x), mm_to_iu(y), mm_to_iu(size), mm_to_iu(drill),
+                    tuple(layers or ()), vtype or 'through', net_name)
+
         tracks_added = vias_added = 0
         with begin_commit(board, "KiCadRoutingTools: apply placement") as commit:
             BoardLayer = _ensure_kipy().BoardLayer
+            updated = {}
             for _ref, fp, parsed in moves:
                 parsed_back = str(parsed.layer or "F.Cu").startswith("B")
                 if self._fp_is_back(fp) != parsed_back:
@@ -1157,45 +1238,113 @@ class PlacementTab(wx.Panel):
                             float(parsed.rotation or 0))
                     except Exception:
                         pass  # leave orientation if the API shape differs
+                updated[id(fp)] = fp
+            # #1054: the result board's KiCad locks, in both directions.
+            for _ref, fp, want in locks:
+                set_item_locked(fp, want)
+                updated[id(fp)] = fp
+            for fp in updated.values():
                 commit.update(fp)
 
             if not with_copper:
                 return 0, 0
 
-            for item in list(board.get_tracks()) + list(board.get_vias()):
-                commit.remove(item)
+            # The result's copper, by key. Copper GRAPHICS parse into segments
+            # too (#337 board gr_*, #908 footprint fp_*): they are drawings,
+            # not tracks. The live board keeps its own (a footprint's travel
+            # with its pose), and as a track each would be a net-0 track over
+            # its own pads.
+            want_segs, want_vias = {}, {}
             for seg in result_pcb.segments:
-                # Copper GRAPHICS parse into segments too (#337 board gr_*, #908
-                # footprint fp_*): they are drawings, not tracks. The live board
-                # keeps its own (a footprint's travel with its pose), and as a
-                # track each would be a net-0 track over its own pads.
                 if getattr(seg, "graphic", False):
                     continue
+                k = seg_key((mm_to_iu(seg.start_x), mm_to_iu(seg.start_y)),
+                            (mm_to_iu(seg.end_x), mm_to_iu(seg.end_y)),
+                            mm_to_iu(seg.width), seg.layer,
+                            name_for(seg.net_id) or "")
+                want_segs.setdefault(k, []).append(seg)
+            for via in result_pcb.vias:
+                k = via_key(via.x, via.y, via.size, via.drill, via.layers,
+                            getattr(via, 'via_type', 'through'),
+                            name_for(via.net_id) or "")
+                want_vias.setdefault(k, []).append(via)
+
+            # The live copper, keyed the way the kipy builder reads it: an
+            # arc's pieces chorded by the same _arc_to_segments the result's
+            # parse chords it with.
+            items = []
+            for t in list(board.get_tracks()):
+                net = live_net_name(t)
+                width = int(getattr(t, "width", 0) or 0)
+                layer = layer_name_for(getattr(t, "layer", None))
+                sx, sy = _vec_xy_mm(t.start)
+                ex, ey = _vec_xy_mm(t.end)
+                mid = getattr(t, "mid", None)
+                if mid is not None:
+                    mx, my = _vec_xy_mm(mid)
+                    keys = [seg_key((mm_to_iu(p0[0]), mm_to_iu(p0[1])),
+                                    (mm_to_iu(p1[0]), mm_to_iu(p1[1])),
+                                    width, layer, net)
+                            for p0, p1 in _arc_to_segments((sx, sy), (mx, my),
+                                                           (ex, ey))]
+                else:
+                    keys = [seg_key((mm_to_iu(sx), mm_to_iu(sy)),
+                                    (mm_to_iu(ex), mm_to_iu(ey)),
+                                    width, layer, net)]
+                items.append((t, 'seg', keys))
+            for v in list(board.get_vias()):
+                vx, vy = _vec_xy_mm(v.position)
+                drill = getattr(getattr(v, "padstack", None), "drill", None)
+                top = layer_name_for(getattr(drill, "start_layer", None)) or "F.Cu"
+                bot = layer_name_for(getattr(drill, "end_layer", None)) or "B.Cu"
+                items.append((v, 'via', [via_key(
+                    vx, vy, (getattr(v, "diameter", 0) or 0) / 1e6,
+                    (getattr(v, "drill_diameter", 0) or 0) / 1e6,
+                    [top, bot], kipy_via_type(v), live_net_name(v))]))
+
+            kept = 0
+            for it, kind, keys in items:
+                pool = want_segs if kind == 'seg' else want_vias
+                need = {}
+                for k in keys:
+                    need[k] = need.get(k, 0) + 1
+                if keys and all(len(pool.get(k, ())) >= n
+                                for k, n in need.items()):
+                    taken = [pool[k].pop() for k in keys]
+                    kept += 1
+                    spec = getattr(taken[0], "tenting_attrs", None)
+                    if kind == 'via' and spec:
+                        # Keep the result's tenting/plugging spec (#489 s8);
+                        # an empty spec leaves the via inheriting, as it was.
+                        kipy_set_via_protection(it, spec)
+                        commit.update(it)
+                else:
+                    commit.remove(it)
+
+            for seg in (s for segs in want_segs.values() for s in segs):
                 t = make_track(commit.net_map, seg.start_x, seg.start_y,
                                seg.end_x, seg.end_y, seg.width, seg.layer,
                                net_name=name_for(seg.net_id))
                 # #521: user-pinned copper must come back pinned - the whole
                 # protection chain (never-rippable, no override) rests on it.
-                try:
-                    t.locked = bool(getattr(seg, "locked", False))
-                except Exception:
-                    pass
+                set_item_locked(t, bool(getattr(seg, "locked", False)))
                 commit.add(t)
                 tracks_added += 1
-            for via in result_pcb.vias:
+            for via in (v for vias in want_vias.values() for v in vias):
                 layers = getattr(via, "layers", None) or ["F.Cu", "B.Cu"]
                 v = make_via(commit.net_map, via.x, via.y, via.size, via.drill,
                              top_layer=layers[0], bottom_layer=layers[-1],
                              net_name=name_for(via.net_id),
                              # #489 s8 / #962: the via's own protection spec,
                              # as the result board declares it.
-                             tenting_attrs=getattr(via, "tenting_attrs", None))
-                try:
-                    v.locked = bool(getattr(via, "locked", False))  # #521
-                except Exception:
-                    pass
+                             tenting_attrs=getattr(via, "tenting_attrs", None),
+                             via_type=getattr(via, "via_type", None))
+                set_item_locked(v, bool(getattr(via, "locked", False)))  # #521
                 commit.add(v)
                 vias_added += 1
+            print(f"Placement apply: {kept} unchanged track(s)/via(s) kept, "
+                  f"{len(items) - kept} removed, {tracks_added} track(s) and "
+                  f"{vias_added} via(s) added")
         from kicad_ipc_adapter import disclose_unwritten_via_protection
         disclose_unwritten_via_protection(
             result_pcb.vias, name_for, result_pcb, "placement apply")

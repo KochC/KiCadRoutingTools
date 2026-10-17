@@ -491,16 +491,61 @@ def make_track(net_map: NetMap, start_x_mm: float, start_y_mm: float,
     return t
 
 
+def set_item_locked(item, locked: bool) -> None:
+    """Set a kipy item's KiCad lock (#521 / #1054): a footprint, track, arc
+    or via -- the write half of kicad_parser.kipy_locked.
+
+    kicad-python 0.7.1 wraps `locked` as a property on all four (probed);
+    kipy_locked's note records an earlier release without it on Track /
+    ArcTrack, where an assignment would set a Python attribute KiCad never
+    sees. So write the property where the class has one, the proto (which
+    carries the field on every item) otherwise."""
+    cls_prop = getattr(type(item), "locked", None)
+    if isinstance(cls_prop, property) and cls_prop.fset is not None:
+        item.locked = bool(locked)
+        return
+    try:
+        from kipy.proto.common.types import LockedState
+        item.proto.locked = (LockedState.LS_LOCKED if locked
+                             else LockedState.LS_UNLOCKED)
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def kipy_via_type_value(via_type):
+    """The kipy ViaType for a Via.via_type, or None for a through via (a new
+    kipy Via is already VT_THROUGH). The IPC twin of main's
+    kicad_parser.pcbnew_viatype_value: KiCad 10 has VT_BLIND and VT_BURIED,
+    an older kicad-python one VT_BLIND_BURIED for both."""
+    try:
+        from kipy.proto.board.board_types_pb2 import ViaType
+    except Exception:                                            # noqa: BLE001
+        return None
+    if via_type == 'micro':
+        return getattr(ViaType, 'VT_MICRO', None)
+    if via_type in ('blind', 'buried'):
+        own = getattr(ViaType, 'VT_BURIED' if via_type == 'buried'
+                      else 'VT_BLIND', None)
+        return own if own is not None else getattr(ViaType, 'VT_BLIND_BURIED', None)
+    return None
+
+
 def make_via(net_map: NetMap, x_mm: float, y_mm: float, size_mm: float,
              drill_mm: float, top_layer: str = "F.Cu",
              bottom_layer: str = "B.Cu", net_name: Optional[str] = None,
-             tenting_attrs: Optional[dict] = None):
+             tenting_attrs: Optional[dict] = None, via_type=None):
     """Build a kipy Via ready to be added to a commit.
 
-    Note: kipy doesn't expose a simple `SetLayerPair`; through-hole vias
-    work out-of-the-box (default padstack spans F.Cu→B.Cu). Blind/buried
-    vias may need padstack customisation — see TODO in plan's open
-    questions.
+    `via_type` is the Via's own Via.via_type ('through' / 'blind' / 'buried'
+    / 'micro', #1268). It DECIDES the span, as KiCad does and as
+    kicad_writer.generate_via_sexpr does for the file: only a blind, buried
+    or micro via spans part of the stack, and None or 'through' (every via
+    the tool adds) is a through via whatever pair it names -- a new kipy Via
+    is VT_THROUGH, whose drill kipy holds at F.Cu/B.Cu. (Unlike pcbnew's
+    PCB_VIA, where main's gui_utils.set_via_layers must set the type before
+    the pair, kipy's setter resets the drill only for a THROUGH type, so the
+    order is immaterial here.) Without it every apply re-created an existing
+    blind or micro via as a through via.
 
     `tenting_attrs` is the via's protection spec (#489 s8 / #741 / #962), the
     same `{token: raw inner s-expr}` the parsers produce: an input via's own
@@ -526,16 +571,17 @@ def make_via(net_map: NetMap, x_mm: float, y_mm: float, size_mm: float,
         v.net = net
     elif net_name:
         print(f"Warning: net '{net_name}' not found on board; via will be netless")
-    # Blind/buried vias: kipy stores layer span on padstack.drill, not on
-    # the Via wrapper itself. Through-hole is the default (F.Cu→B.Cu) so
-    # only write when the caller asked for something else.
-    if top_layer != "F.Cu" or bottom_layer != "B.Cu":
+    # Blind/buried/micro: kipy stores the span on padstack.drill, not on the
+    # Via wrapper.
+    vt = kipy_via_type_value(via_type)
+    if vt is not None:
         try:
+            v.type = vt
             drill = v.padstack.drill
             drill.start_layer = layer_id_for(top_layer)
             drill.end_layer = layer_id_for(bottom_layer)
-        except (AttributeError, Exception) as e:
-            print(f"Warning: non-through-hole via ({top_layer}→{bottom_layer}) "
+        except Exception as e:                                   # noqa: BLE001
+            print(f"Warning: {via_type} via ({top_layer}->{bottom_layer}) "
                   f"not supported on this kipy version ({e}); "
                   f"falling back to through via")
     if tenting_attrs:
@@ -641,11 +687,22 @@ def make_debug_line(start_xy: tuple[float, float], end_xy: tuple[float, float],
 def make_zone(net_map: NetMap, polygon_mm, layer_name: str,
               net_name: Optional[str] = None,
               clearance_mm: float = 0.2,
-              min_thickness_mm: float = 0.1):
+              min_thickness_mm: float = 0.1,
+              priority: int = 0,
+              thermal_relief: bool = False):
     """Build a kipy Zone (copper fill) ready to be added to a commit.
 
     polygon_mm: iterable of (x_mm, y_mm) outline points. Must form a
         closed loop (last point auto-connects to first).
+
+    `priority` and `thermal_relief` are the zone dict's own (route_planes
+    puts both in every pour it returns), written as the CLI writer writes
+    them (kicad_writer.generate_zone_sexpr) and main's SWIG applier sets them:
+    overlapping pours MUST differ in priority, or KiCad has no defined winner
+    and tie-breaks on the zones' ids, so the fill moves between runs
+    (kicad_writer.zone_overlap_priorities); pads connect solid unless the run
+    asked for thermal relief, and the spokes are the writer's 0.2 mm gap and
+    width, not KiCad's 0.5 mm defaults.
     """
     Zone, ZoneType, PolyLine, PolyLineNode, PolygonWithHoles = _zone_types()
 
@@ -665,6 +722,21 @@ def make_zone(net_map: NetMap, polygon_mm, layer_name: str,
     zone.layers = [layer_id_for(layer_name)]
     zone.clearance = _mm_to_nm(clearance_mm)
     zone.min_thickness = _mm_to_nm(min_thickness_mm)
+    if priority:
+        zone.priority = int(priority)
+    try:
+        from kipy.proto.board.board_types_pb2 import ZoneConnectionStyle
+        conn = zone.connection
+        conn.zone_connection = (ZoneConnectionStyle.ZCS_THERMAL if thermal_relief
+                                else ZoneConnectionStyle.ZCS_FULL)
+        # On the proto: kicad-python 0.7.1's `thermal_spokes` property wraps
+        # a COPY (ThermalSpokeSettings(proto=...)), so a set through it is lost.
+        spokes = zone.proto.copper_settings.connection.thermal_spokes
+        spokes.gap.value_nm = _mm_to_nm(0.2)
+        spokes.width.value_nm = _mm_to_nm(0.2)
+    except Exception as e:                                       # noqa: BLE001
+        print(f"Warning: zone pad connection not set on this kipy ({e}); "
+              f"KiCad's default applies")
 
     if net_name:
         net = net_map.resolve(net_name=net_name)
@@ -675,29 +747,104 @@ def make_zone(net_map: NetMap, polygon_mm, layer_name: str,
     return zone
 
 
-def existing_zone_keys(board) -> set[tuple[str, str]]:
-    """Return the {(net_name, layer_name)} pairs of zones already on the board.
+def make_keepout_zone(polygon_mm, layer_names, name: str = ""):
+    """Build a copper-pour keep-out RULE AREA (#448's NPTH-slot keep-out) --
+    the CLI's kicad_writer.generate_keepout_zone_sexpr: pours kept out,
+    tracks, vias, pads and footprints allowed."""
+    Zone, ZoneType, PolyLine, PolyLineNode, PolygonWithHoles = _zone_types()
+    polyline = PolyLine()
+    for x_mm, y_mm in polygon_mm:
+        polyline.append(PolyLineNode.from_xy(_mm_to_nm(x_mm), _mm_to_nm(y_mm)))
+    poly_with_holes = PolygonWithHoles()
+    poly_with_holes.outline = polyline
+    zone = Zone()
+    zone.type = ZoneType.ZT_RULE_AREA
+    zone.outline = poly_with_holes
+    zone.layers = [layer_id_for(n) for n in layer_names]
+    if name:
+        zone.name = name
+    ra = zone.proto.rule_area_settings
+    ra.keepout_copper = True
+    ra.keepout_tracks = False
+    ra.keepout_vias = False
+    ra.keepout_pads = False
+    ra.keepout_footprints = False
+    return zone
 
-    Used by the planes tab to skip duplicate zone creation when running the
-    plane builder more than once.
-    """
+
+def _is_pour(zone) -> bool:
+    """A copper POUR: not a rule area and not a teardrop (#1164, which pcbnew
+    and kipy both carry as a zone). A zone without a `type` (an older kipy,
+    or a test stand-in) is taken as a pour, as it always was."""
+    zt = getattr(zone, "type", None)
+    if zt is None:
+        return True
+    try:
+        from kipy.proto.board.board_types_pb2 import ZoneType, TeardropType
+    except Exception:                                            # noqa: BLE001
+        return True
+    if zt in (getattr(ZoneType, "ZT_RULE_AREA", object()),
+              getattr(ZoneType, "ZT_TEARDROP", object()),
+              getattr(ZoneType, "ZT_GRAPHICAL", object())):
+        return False
+    # A teardrop can also come as a copper zone carrying teardrop settings --
+    # the form kicad_parser's kipy zone read flags (_kipy_zone_entries).
+    try:
+        td = zone.teardrop
+        if td is not None and TeardropType.Name(td.type) in ('TDT_VIA_PAD',
+                                                             'TDT_TRACK_END'):
+            return False
+    except Exception:                                            # noqa: BLE001
+        pass
+    return True
+
+
+def _live_pours(board):
+    """(pour keys, replaceable, zone names) of the board's zones.
+
+    pour keys: {(net_name, layer_name)} of the SINGLE-layer pours -- the
+    duplicate guard's set. A multi-layer pour is never a duplicate of a
+    single-layer one: route_planes pours the new zone BESIDE it at a higher
+    priority and plane_io never deletes it to replace one layer, so counting
+    its layers here skipped a pour the CLI makes (main's SWIG guard keys only
+    such a zone's first layer, GetLayer(), and diverges there instead).
+    replaceable: the same pours as {(net_name, layer_name): [zone]}, the ones
+    a `replace_existing` zone supersedes. zone names: every zone's name, rule
+    areas included, so a re-run never duplicates #448's keep-outs."""
     keys: set[tuple[str, str]] = set()
+    replaceable: dict = {}
+    names: set = set()
     try:
         with ipc_lock():
             zones = list(board.get_zones())
-    except AttributeError:
-        return keys
-    except Exception:
-        return keys
+    except Exception:                                            # noqa: BLE001
+        return keys, replaceable, names
     for z in zones:
+        zname = getattr(z, "name", "") or ""
+        if zname:
+            names.add(zname)
+        if not _is_pour(z):
+            continue
         net_name = ""
         net = getattr(z, "net", None)
         if net is not None:
             net_name = getattr(net, "name", "") or ""
-        layers = getattr(z, "layers", None) or []
-        for bl in layers:
-            keys.add((net_name, layer_name_for(bl)))
-    return keys
+        span = [layer_name_for(bl) for bl in (getattr(z, "layers", None) or [])]
+        if len(span) == 1 and span[0]:
+            keys.add((net_name, span[0]))
+            replaceable.setdefault((net_name, span[0]), []).append(z)
+    return keys, replaceable, names
+
+
+def existing_zone_keys(board) -> set[tuple[str, str]]:
+    """Return the {(net_name, layer_name)} pairs the board already pours with a
+    single-layer pour (see _live_pours).
+
+    Used by the planes tab to skip duplicate zone creation when running the
+    plane builder more than once. Teardrops and rule areas are not pours
+    (#1164) and do not count.
+    """
+    return _live_pours(board)[0]
 
 
 # --- Apply routing results --------------------------------------------------
@@ -1048,7 +1195,8 @@ def apply_planes_results(board, *, pcb_data,
     does not cover. Applied BEFORE any new copper, because the routes were
     computed assuming the swaps.
     """
-    counts = {"tracks": 0, "vias": 0, "zones": 0, "zones_skipped": 0, "removed": 0}
+    counts = {"tracks": 0, "vias": 0, "zones": 0, "zones_skipped": 0,
+              "zones_replaced": 0, "removed": 0}
     skipped: list[tuple[str, str]] = []
 
     def name_for(net_id):
@@ -1057,7 +1205,12 @@ def apply_planes_results(board, *, pcb_data,
         net = pcb_data.nets.get(net_id)
         return net.name if net is not None else None
 
-    existing = existing_zone_keys(board)
+    # Which (net, layer) pairs already POUR, and per pair the single-layer
+    # pours a `replace_existing` zone supersedes -- exactly the zones the CLI
+    # writer drops from the file (plane_io.filter_zones_from_content; a
+    # footprint's zones are not board zones). Teardrops and rule areas are no
+    # pour (#1164): they neither block a pour as a duplicate nor get replaced.
+    existing, replaceable, zone_names = _live_pours(board)
 
     with begin_commit(board, message) as commit:
         # Delete the ripped nets' existing copper before adding the re-routed
@@ -1090,6 +1243,7 @@ def apply_planes_results(board, *, pcb_data,
                 top_layer=top, bottom_layer=bot,
                 net_name=name_for(vd.get('net_id')),
                 tenting_attrs=vd.get('tenting_attrs'),
+                via_type=vd.get('via_type'),
             ))
             counts["vias"] += 1
 
@@ -1105,10 +1259,38 @@ def apply_planes_results(board, *, pcb_data,
             counts["tracks"] += 1
 
         for zd in (new_zones or []):
+            if zd.get('keepout'):
+                # NPTH-slot copper-pour keep-out rule area (#448) -- the CLI's
+                # generate_keepout_zone_sexpr. This loop used to build it as a
+                # net-less COPPER zone on F.Cu.
+                kname = zd.get('name', '')
+                if kname and kname in zone_names:
+                    counts["zones_skipped"] += 1
+                    continue
+                try:
+                    commit.add(make_keepout_zone(
+                        zd['polygon_points'], zd.get('layers') or [],
+                        name=kname))
+                    counts["zones"] += 1
+                except Exception as e:                           # noqa: BLE001
+                    print(f"Failed to add NPTH-slot keepout {kname}: {e}")
+                continue
             net_name = zd.get('net_name') or name_for(zd.get('net_id'))
             layer = zd.get('layer', 'F.Cu')
             key = (net_name or "", layer)
-            if key in existing:
+            if zd.get('replace_existing') and key in replaceable:
+                # "Skip existing zones" UNTICKED (route_planes.py without
+                # --skip-existing-zones): the engine replaces this net's pour
+                # on the layer, so the old one goes, as the CLI writer drops
+                # it. Once per pair -- a shared layer's split returns several
+                # polygons for one net, and the later ones must not delete the
+                # earlier.
+                for old in replaceable.pop(key):
+                    commit.remove(old)
+                    counts["zones_replaced"] += 1
+                existing.discard(key)
+                print(f"Replacing existing zone for '{key[0]}' on {key[1]}")
+            elif key in existing:
                 skipped.append(key)
                 counts["zones_skipped"] += 1
                 continue
@@ -1120,6 +1302,8 @@ def apply_planes_results(board, *, pcb_data,
                     net_name=net_name,
                     clearance_mm=zd.get('clearance', 0.2),
                     min_thickness_mm=zd.get('min_thickness', 0.1),
+                    priority=int(zd.get('priority', 0) or 0),
+                    thermal_relief=bool(zd.get('thermal_relief')),
                 ))
                 counts["zones"] += 1
             except Exception as e:
@@ -1266,7 +1450,8 @@ def apply_oracle_reconnect(board, *, nets, config, pcb_data,
                     commit.net_map, v.x, v.y, v.size, v.drill,
                     top_layer=layers[0], bottom_layer=layers[-1],
                     net_name=name_for(v.net_id),
-                    tenting_attrs=getattr(v, 'tenting_attrs', None)))
+                    tenting_attrs=getattr(v, 'tenting_attrs', None),
+                    via_type=getattr(v, 'via_type', None)))
         disclose_unwritten_via_protection(new_vias, name_for, pcb_data,
                                           "KiCad-oracle apply")
     return orc
@@ -1458,7 +1643,8 @@ def write_drc_settings_to_project(board, *, clearance=None, hole_to_hole=None,
 
 def apply_footprint_moves(board, placements, via_moves=None, new_segments=None,
                           pcb_data=None,
-                          message: str = "KiCadRoutingTools: optimize cap placement") -> int:
+                          message: str = "KiCadRoutingTools: optimize cap placement",
+                          applied_out=None) -> int:
     """Move footprints to new positions / orientations in one commit (#130).
 
     `placements` is the list returned by
@@ -1476,8 +1662,16 @@ def apply_footprint_moves(board, placements, via_moves=None, new_segments=None,
     graze the summary claims to have fixed persists. `via_moves` is a list of
     (old_x, old_y, via_dict) as the engine returns it. Moves ride the SAME
     commit as the placements so the board never sits in a half-repaired state.
+
+    A placement names a PCBData KEY, which for a duplicated reference is
+    `TP4~2` (#726), so the live footprints are keyed the way both parse paths
+    key them -- by bare reference the second block was never found. A part
+    that draws the board's own outline (#829, `owns_board_outline` in
+    `pcb_data`) is NOT moved and is named: moving it would resize the board,
+    where the CLI's write_placed_output raises. `applied_out`, when given, is
+    extended with the placements actually applied.
     """
-    from kicad_parser import _fp_reference
+    from kicad_parser import _fp_reference, disambiguate_references
     from routing_utils import pos_key
     try:
         from kipy.geometry import Angle
@@ -1504,14 +1698,28 @@ def apply_footprint_moves(board, placements, via_moves=None, new_segments=None,
 
     moved = 0
     with begin_commit(board, message) as commit:
-        fps = {}
-        for fp in board.get_footprints():
+        _live = list(board.get_footprints())
+        _raw = []
+        for fp in _live:
             ref = _fp_reference(fp)
-            if ref:
-                fps.setdefault(ref, fp)
+            if not ref:
+                try:
+                    ref = "#" + str(fp.id.value)
+                except Exception:                                # noqa: BLE001
+                    ref = "?"
+            _raw.append(ref)
+        fps = dict(zip(disambiguate_references(_raw), _live))
+        not_moved = []
         for p in placements:
-            fp = fps.get(p.get("reference"))
+            ref = p.get("reference")
+            fp = fps.get(ref)
             if fp is None:
+                not_moved.append(f"{ref} (not on the live board)")
+                continue
+            _pd = (pcb_data.footprints.get(ref)
+                   if pcb_data is not None else None)
+            if getattr(_pd, 'owns_board_outline', False):
+                not_moved.append(f"{ref} (draws the board outline, #829)")
                 continue
             fp.position = vec_mm(p["new_x"], p["new_y"])
             if Angle is not None and p.get("new_rotation") is not None:
@@ -1521,6 +1729,10 @@ def apply_footprint_moves(board, placements, via_moves=None, new_segments=None,
                     pass  # leave orientation unchanged if the API shape differs
             commit.update(fp)
             moved += 1
+            if applied_out is not None:
+                applied_out.append(p)
+        if not_moved:
+            print(f"  NOT MOVED: {', '.join(not_moved)}")
 
         # Via nudge (#313). Match the OLD position AND the net: a position-only
         # match could delete a DIFFERENT net's via sitting within a micron of the
@@ -1540,6 +1752,9 @@ def apply_footprint_moves(board, placements, via_moves=None, new_segments=None,
             old_key = pos_key(old_x, old_y)
             want_net = _net_name_of(vd)
             spec = dict(vd.get('tenting_attrs') or {})
+            # The moved via's type (#1268): the dict's, else the live via's
+            # own, as main's SWIG nudge reads pcbnew_via_type off the track.
+            vtype = vd.get('via_type')
             for vv in board.get_vias():
                 vname = ((getattr(vv.net, "name", "") or "")
                          if vv.net is not None else "")
@@ -1558,13 +1773,16 @@ def apply_footprint_moves(board, placements, via_moves=None, new_segments=None,
                                            else via_protection_attrs_from_path(
                                                get_board_full_path()))
                         spec = kipy_via_protection_attrs(vv, _file_specs)
+                    if vtype is None:
+                        from kicad_parser import kipy_via_type
+                        vtype = kipy_via_type(vv)
                     commit.remove(vv)
                     break
             layers = vd.get('layers') or ['F.Cu', 'B.Cu']
             commit.add(make_via(
                 commit.net_map, vd['x'], vd['y'], vd['size'], vd['drill'],
                 top_layer=layers[0], bottom_layer=layers[-1],
-                net_name=want_net, tenting_attrs=spec))
+                net_name=want_net, tenting_attrs=spec, via_type=vtype))
             nudged.append({'x': vd['x'], 'y': vd['y'],
                            'net_id': vd.get('net_id'), 'tenting_attrs': spec})
 
@@ -1640,6 +1858,7 @@ def _via_from_obj(net_map: NetMap, via, net_name_for) -> object:
         top_layer=top, bottom_layer=bot,
         net_name=net_name_for(via.net_id),
         tenting_attrs=getattr(via, "tenting_attrs", None),
+        via_type=getattr(via, "via_type", None),
     )
 
 

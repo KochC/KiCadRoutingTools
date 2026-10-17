@@ -114,8 +114,8 @@ ROWS = [
      (T1106,), 'KILLED'),
     # --- #1108: route_planes refusals exit non-zero -------------------------
     ('no-output-exits-zero', 'rp',
-     "    return 1 if _no_output else 0",
-     "    return 0",
+     "    return finish_design_rules(args, 1 if _no_output else 0)",
+     "    return finish_design_rules(args, 0)",
      (T1108,), 'KILLED'),
     ('count-mismatch-not-an-arg-error', 'rp',
      "        parser.error(\n"
@@ -125,7 +125,7 @@ ROWS = [
      (T1108,), 'KILLED'),
     # --- #1109: one pile predicate; the film says when it fell back ---------
     ('pile-misses-a-staging-ring', 'pstate',
-     "        return bool(self.unplaced or sig.get('s3_outside')",
+     "        return bool(self.unplaced or self.off_outline",
      "        return bool(self.unplaced or False",
      (T1109,), 'KILLED'),
     ('film-fallback-not-a-warning', 'film',

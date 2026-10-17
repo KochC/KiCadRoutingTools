@@ -183,9 +183,12 @@ def calculate_route_length(segments: List[Segment], vias: List[Via] = None, pcb_
 
     # Add via barrel lengths if pcb_data with stackup is provided
     if vias and pcb_data and hasattr(pcb_data, 'get_via_barrel_length'):
+        from geometry_utils import via_end_layers
         for via in vias:
             if via.layers and len(via.layers) >= 2:
-                barrel_len = pcb_data.get_via_barrel_length(via.layers[0], via.layers[1])
+                # A through via's barrel is the whole stack, whatever pair it
+                # carries (found reviewing #1268).
+                barrel_len = pcb_data.get_via_barrel_length(*via_end_layers(via))
                 total += barrel_len
 
     return total
@@ -205,10 +208,11 @@ def calculate_via_barrel_length(vias: List[Via], pcb_data) -> float:
     if not vias or not pcb_data or not hasattr(pcb_data, 'get_via_barrel_length'):
         return 0.0
 
+    from geometry_utils import via_end_layers
     total = 0.0
     for via in vias:
         if via.layers and len(via.layers) >= 2:
-            total += pcb_data.get_via_barrel_length(via.layers[0], via.layers[1])
+            total += pcb_data.get_via_barrel_length(*via_end_layers(via))
     return total
 
 
@@ -284,6 +288,172 @@ def pin_pair_path_length(pcb_data: PCBData, net_id: int,
     contact. Zone/pour connections are NOT traversed: a net that reaches its
     pads only through a plane has no track path and returns None.
     """
+    graph = _net_track_graph(pcb_data, net_id, (pad_a, pad_b), tolerance)
+    if graph is None:
+        return None
+    adjacency, pad_nodes = graph
+    starts = pad_nodes.get(id(pad_a)) or []
+    goals = set(pad_nodes.get(id(pad_b)) or [])
+    if not starts or not goals:
+        return None
+
+    import heapq
+    dist = {n: 0.0 for n in starts}
+    heap = [(0.0, i, n) for i, n in enumerate(starts)]
+    heapq.heapify(heap)
+    counter = len(starts)
+    while heap:
+        d, _, node = heapq.heappop(heap)
+        if d > dist.get(node, float('inf')) + 1e-12:
+            continue
+        if node in goals:
+            return d
+        for nxt, w in adjacency.get(node, ()):
+            nd = d + w
+            if nd < dist.get(nxt, float('inf')) - 1e-12:
+                dist[nxt] = nd
+                heapq.heappush(heap, (nd, counter, nxt))
+                counter += 1
+    return None
+
+
+def _copper_pads(pcb_data: PCBData, net_id: int) -> List[Pad]:
+    """The net's pads that carry copper (`pad_has_copper`): an NPTH pad has
+    none even when its layers list `*.Cu` (CLAUDE.md), and a paste-only pad is
+    a window, not a pin -- no track can ever join either."""
+    from kicad_parser import pad_has_copper
+    return [p for p in (pcb_data.pads_by_net.get(net_id) or ())
+            if pad_has_copper(p)]
+
+
+def net_pads_joined(pcb_data: PCBData, net_id: int, pads=None,
+                    tolerance: float = 0.02) -> bool:
+    """Are ALL of the net's copper pads joined to each other by its TRACK copper? (#1246)
+
+    The rule `pin_pair_path_length` applies to two pads, applied to every pad,
+    on the same graph: segments, T-junctions and vias join, zones/pours do NOT.
+    False for an unrouted net, a net carrying only fanout stubs, a broken net,
+    one whose pads meet only through a plane, and a net with fewer than two
+    copper pads. `pads` overrides which pads must be joined (default: every
+    copper pad of the net, NPTH and paste-only pads excluded).
+
+    This is what makes a total-copper length MEAN something: total copper on a
+    net whose pads are not joined is a stub length, or 0.0 with no copper at
+    all, and neither is the length of anything.
+    """
+    pads = list(_copper_pads(pcb_data, net_id) if pads is None else pads)
+    if len(pads) < 2:
+        return False
+    graph = _net_track_graph(pcb_data, net_id, pads, tolerance)
+    if graph is None:
+        return False
+    adjacency, pad_nodes = graph
+    seen = set(pad_nodes.get(id(pads[0])) or ())
+    todo = list(seen)
+    while todo:
+        node = todo.pop()
+        for nxt, _w in adjacency.get(node, ()):
+            if nxt not in seen:
+                seen.add(nxt)
+                todo.append(nxt)
+    return all(seen.intersection(pad_nodes.get(id(p)) or ()) for p in pads[1:])
+
+
+def pad_to_die_length(pads) -> float:
+    """Sum of the pads' pad-to-die lengths in mm (`Pad.die_length`, #1248)."""
+    return math.fsum(getattr(p, 'die_length', 0.0) or 0.0 for p in (pads or ()))
+
+
+def pad_to_die_delay(pads) -> float:
+    """Sum of the pads' pad-to-die delays in ps (`Pad.die_delay`, #1248)."""
+    return math.fsum(getattr(p, 'die_delay', 0.0) or 0.0 for p in (pads or ()))
+
+
+def net_pad_to_die_length(pcb_data: PCBData, net_id: int) -> float:
+    """The pad-to-die length KiCad's length/skew DRC adds to a net: EVERY pad of
+    the net (#1248). KiCad 10's DRC sums `GetPadToDieLength()` over each pad in
+    the rule's item set, next to the net's total track and via length
+    (drc_test_provider_matched_length -> LENGTH_DELAY_CALCULATION::
+    CalculateLengthDetails); its tuners add only the tuned path's START and END
+    pads, which is the same set on a 2-pad net."""
+    return pad_to_die_length((getattr(pcb_data, 'pads_by_net', None) or {}).get(net_id))
+
+
+def net_pad_to_die_delay(pcb_data: PCBData, net_id: int) -> float:
+    """The time twin of `net_pad_to_die_length`, in ps: KiCad 10 adds each
+    pad's `GetPadToDieDelay()` in the delay domain (it never converts a
+    die_length into a delay)."""
+    return pad_to_die_delay((getattr(pcb_data, 'pads_by_net', None) or {}).get(net_id))
+
+
+def net_match_length(pcb_data: PCBData, net_id: int, mode: str = 'total',
+                     tolerance: float = 0.02,
+                     include_pad_to_die: bool = True) -> Optional[float]:
+    """The length a length-match group grades ONE net at, or None when it cannot be measured (#1246).
+
+    One definition for every grader (`board_score --length-groups`, the
+    review-routed-board recipe), so a verdict depends on the board and not on
+    which mode or which tool asked:
+
+      mode 'total'     total net copper (segments + via barrels, as
+                       `net_copper_length`), but only when EVERY copper pad of
+                       the net is joined by track copper (`net_pads_joined`),
+                       plus every pad's pad-to-die length -- KiCad's
+                       length/skew DRC.
+      mode 'pin_pair'  the copper path between the net's first two pads
+                       (`pin_pair_path_length`) plus those two pads'
+                       pad-to-die lengths -- KiCad's tuner, which adds its
+                       start and end pads'.
+
+    `include_pad_to_die=False` leaves the pad-to-die term out (copper only).
+    Without it a board carrying `(die_length ...)` grades a spread KiCad does
+    not see (#1248).
+
+    None in both modes means "not routed yet" (unrouted, stub-only, broken, or
+    pads joined only through a zone). It is never 0.0 and never a stub length:
+    those are not the length of a signal, and grading them passed a copper-free
+    group and failed a stub-only one.
+    """
+    die = (net_match_pad_to_die(pcb_data, net_id, mode)
+           if include_pad_to_die else 0.0)
+    if mode == 'pin_pair':
+        pads = pcb_data.pads_by_net.get(net_id) or []
+        if len(pads) < 2:
+            return None
+        path = pin_pair_path_length(pcb_data, net_id, pads[0], pads[1],
+                                    tolerance=tolerance)
+        return None if path is None else path + die
+    if not net_pads_joined(pcb_data, net_id, tolerance=tolerance):
+        return None
+    return net_copper_length(pcb_data, net_id) + die
+
+
+def net_match_pad_to_die(pcb_data: PCBData, net_id: int,
+                         mode: str = 'total', attr: str = 'die_length') -> float:
+    """The pad-to-die term `net_match_length` adds in `mode` (#1248), in mm:
+    every pad of the net for 'total' (KiCad's DRC), the first two pads for
+    'pin_pair' (the pads that path joins; KiCad's tuner adds its start and end
+    pads').
+
+    `attr='die_delay'` sums the same pads' delays instead, in ps -- the time
+    twin over the same pad choice, never a converted length."""
+    _sum = pad_to_die_delay if attr == 'die_delay' else pad_to_die_length
+    if mode == 'pin_pair':
+        return _sum((pcb_data.pads_by_net.get(net_id) or [])[:2])
+    if mode != 'total':
+        raise ValueError(f"net_match_length: unknown mode {mode!r} "
+                         f"(expected 'total' or 'pin_pair')")
+    return _sum((getattr(pcb_data, 'pads_by_net', None) or {}).get(net_id))
+
+
+def _net_track_graph(pcb_data: PCBData, net_id: int, pads,
+                     tolerance: float = 0.02):
+    """(adjacency, pad_nodes) over ONE net's track copper, with `pads` attached.
+
+    The weighted graph `pin_pair_path_length` walks (see its docstring for the
+    joining rules); `pad_nodes` maps id(pad) to the pad's per-layer hub nodes.
+    None when the net has no segments at all.
+    """
     segments = [s for s in pcb_data.segments if s.net_id == net_id]
     if not segments:
         return None
@@ -328,17 +498,17 @@ def pin_pair_path_length(pcb_data: PCBData, net_id: int,
     for v in pcb_data.vias:
         if v.net_id != net_id or len(v.layers or ()) < 2:
             continue
-        span = list(v.layers)
-        if copper_layers and span[0] in copper_layers and span[1] in copper_layers:
-            i, j = copper_layers.index(span[0]), copper_layers.index(span[1])
-            spanned = copper_layers[min(i, j):max(i, j) + 1]
-        else:
-            spanned = span
+        # The via's copper by its TYPE (found reviewing #1268): every layer
+        # for a through via whatever its pair, the run between the ends for a
+        # typed blind/micro one.
+        from geometry_utils import via_copper_layers, via_end_layers
+        spanned = (via_copper_layers(v, copper_layers) if copper_layers
+                   else list(via_end_layers(v)))
         radius = max((getattr(v, 'size', 0) or 0) / 2, tolerance)
         discs.append((v.x, v.y, radius, spanned,
                       lambda x, y, _v=v, _r=radius: math.hypot(x - _v.x, y - _v.y) <= _r + tolerance,
                       'via', v))
-    for pad in (pad_a, pad_b):
+    for pad in pads:
         pad_layers = [l for l in expand_pad_layers(pad.layers, copper_layers)]
         radius = max(pad.size_x, pad.size_y) / 2
         discs.append((pad.global_x, pad.global_y, radius, pad_layers,
@@ -436,29 +606,7 @@ def pin_pair_path_length(pcb_data: PCBData, net_id: int,
                     add_edge(hubs[0], other, 0.0)
             pad_nodes[id(obj)] = hubs
 
-    starts = pad_nodes.get(id(pad_a)) or []
-    goals = set(pad_nodes.get(id(pad_b)) or [])
-    if not starts or not goals:
-        return None
-
-    import heapq
-    dist = {n: 0.0 for n in starts}
-    heap = [(0.0, i, n) for i, n in enumerate(starts)]
-    heapq.heapify(heap)
-    counter = len(starts)
-    while heap:
-        d, _, node = heapq.heappop(heap)
-        if d > dist.get(node, float('inf')) + 1e-12:
-            continue
-        if node in goals:
-            return d
-        for nxt, w in adjacency.get(node, ()):
-            nd = d + w
-            if nd < dist.get(nxt, float('inf')) - 1e-12:
-                dist[nxt] = nd
-                heapq.heappush(heap, (nd, counter, nxt))
-                counter += 1
-    return None
+    return adjacency, pad_nodes
 
 
 def routable_pad_count(pcb_data: PCBData, net_id: int, off_board=None) -> int:

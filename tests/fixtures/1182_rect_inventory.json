@@ -76,6 +76,9 @@
   "rect": 1,
   "rects": 1
  },
+ "quench.py::_NearIndex._refresh": {
+  "rect": 1
+ },
  "quench.py::_Part.__init__": {
   "bounds_by_rot": 4,
   "grade_by_rot": 3
@@ -97,7 +100,8 @@
   "bounds_by_rot": 2
  },
  "quench.py::_Part.rects": {
-  "rect": 2
+  "bounds_by_rot": 1,
+  "rect": 3
  },
  "quench.py::_clause_failing": {
   "grade_rects": 1
@@ -111,6 +115,9 @@
  "quench.py::quench.eval_pair": {
   "rect": 4,
   "rects": 2
+ },
+ "reconstruct.py::_edge_seated_on": {
+  "grade_rect": 1
  },
  "reconstruct.py::edge_metric": {
   "rect": 1
@@ -133,6 +140,9 @@
  "seeder.py::_already_on_its_edge": {
   "grade_rect": 1
  },
+ "seeder.py::_band_obstacles": {
+  "grade_rect": 1
+ },
  "seeder.py::_band_reading": {
   "grade_rect": 1
  },
@@ -141,6 +151,9 @@
  },
  "seeder.py::_courtyard_overlap": {
   "grade_rect": 2
+ },
+ "seeder.py::_depth_order": {
+  "grade_rect": 1
  },
  "seeder.py::_dispose_unseated": {
   "rect": 4
@@ -172,11 +185,25 @@
  "seeder.py::_overlap_at": {
   "rect": 2
  },
+ "seeder.py::_packed_starts": {
+  "grade_rect": 1
+ },
+ "seeder.py::_pad_copper_overhang": {
+  "grade_by_rot": 1
+ },
  "seeder.py::_row_extent": {
   "rect": 1
  },
  "seeder.py::_row_offsets": {
   "rect": 1
+ },
+ "seeder.py::_scope_box": {
+  "grade_rect": 1,
+  "rect": 1
+ },
+ "seeder.py::_scope_reach": {
+  "bounds_by_rot": 1,
+  "grade_by_rot": 1
  },
  "seeder.py::_seat_array": {
   "rect": 2

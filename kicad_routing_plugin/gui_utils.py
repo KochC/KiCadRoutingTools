@@ -24,6 +24,21 @@ def set_ui_status_mirror(fn):
     _UI_STATUS_MIRROR = fn
 
 
+#: Set True on a plan step's owner (the routing dialog, or the tab that runs
+#: the step) when its operation PRODUCED ITS RESULT -- applied to the live
+#: board, an empty result included. It is the GUI's "the step's output board
+#: exists": a CLI step that refuses, fails or is interrupted writes no output,
+#: so the next step of the chain fails on the missing file and the chain stops
+#: there. The plan executor clears it before each step and stops the plan when
+#: the step ends without it, so a refusal path nobody marks still stops.
+PLAN_STEP_PRODUCED = '_plan_step_produced'
+
+
+def mark_plan_step_produced(owner):
+    """Record that `owner`'s operation produced its result (see above)."""
+    setattr(owner, PLAN_STEP_PRODUCED, True)
+
+
 # Timestamp of the last UI-category event-loop pump (see ui_thread_status):
 # throttles the YieldFor so a fast message burst stays cheap.
 _LAST_UI_YIELD = 0.0
@@ -145,6 +160,42 @@ def ui_thread_status(status_text, progress_bar, message):
         _IN_UI_STATUS = False
 
 
+def layer_costs_for_layers(costs, layers, selected_layers, copper_layers):
+    """The Basic tab's Layer Costs values as one cost per entry of `layers`.
+
+    The control is read the way it is written: one value per SELECTED routing
+    layer, else one per board copper layer (its default, its tooltip's order
+    and an AI plan's order). Either way the values are placed on `layers` BY
+    NAME -- the engines price them positionally, and a plane step routes on
+    F.Cu + its pour layers + B.Cu, not on the selected layers. Returns [] when
+    the control is empty. A count that matches neither list is returned as
+    typed: the engine reads it positionally against `layers`, and refuses it
+    when it is not one value per layer (routing_config.layer_costs_count_error).
+    Raises ValueError, naming the layers, when the values are for the selected
+    layers and `layers` holds one that is not selected (found reviewing #1269:
+    the Planes tab handed create_plane the selected layers' costs against its
+    own layer list, so a 4-layer board's default costs priced the wrong
+    layers and left the unrequested inner layer routable)."""
+    costs = list(costs or [])
+    if not costs:
+        return []
+    by_name = None
+    for names in (selected_layers, copper_layers):
+        if names and len(costs) == len(names):
+            by_name = dict(zip(names, costs))
+            break
+    if by_name is None:
+        return costs
+    missing = [l for l in layers if l not in by_name]
+    if missing:
+        raise ValueError(
+            f"Layer Costs gives {len(costs)} value(s), one per selected layer "
+            f"({' '.join(selected_layers)}), but this step also routes on "
+            f"{' '.join(missing)}: give one value per copper layer "
+            f"({' '.join(copper_layers)}) instead")
+    return [by_name[l] for l in layers]
+
+
 from contextlib import contextmanager
 
 
@@ -177,7 +228,7 @@ def redirect_prints_to_log(append_log):
         sys.stdout = original
 
 
-def apply_drc_settings_fix(cfg, *, diff_pair=False):
+def apply_drc_settings_fix(cfg, *, diff_pair=False, fix_kwargs=None):
     """Loosen the open project's DRC floors to the routed values (issue #160).
 
     The IPC counterpart of the CLI route auto-fix. Shared by every routing tab
@@ -194,6 +245,12 @@ def apply_drc_settings_fix(cfg, *, diff_pair=False):
     `diff_pair=True` also lowers the Default net class's differential-pair
     geometry to the routed gap/width (the diff tab's track_width is the per-pair
     trace width).
+
+    `fix_kwargs` replaces the floors read off `cfg` with keywords decided
+    elsewhere -- the fanout tab's, from fix_kicad_drc_settings.
+    fanout_fix_kwargs, the ONE decision bga_fanout's / qfn_fanout's mains and
+    both GUI fronts read. The gate stays `cfg`'s, so every tab's writeback
+    still goes through this one choke point (#693).
     """
     if not (cfg and cfg.get('fix_drc_settings', True)):
         return None
@@ -202,7 +259,7 @@ def apply_drc_settings_fix(cfg, *, diff_pair=False):
         board = get_board()
         if board is None:
             return None
-        kwargs = dict(
+        kwargs = dict(fix_kwargs) if fix_kwargs is not None else dict(
             clearance=cfg.get('clearance'),
             hole_to_hole=cfg.get('hole_to_hole_clearance'),
             edge_clearance=cfg.get('board_edge_clearance'),
@@ -227,7 +284,7 @@ def apply_drc_settings_fix(cfg, *, diff_pair=False):
             # False default matches "the operator never ticked the override".
             clamp_nondefault_netclasses=bool(cfg.get('clamp_netclasses', False)),
         )
-        if diff_pair:
+        if diff_pair and fix_kwargs is None:
             kwargs['diff_pair_gap'] = cfg.get('diff_pair_gap')
             kwargs['diff_pair_width'] = cfg.get('track_width')
         proj = write_drc_settings_to_project(board, **kwargs)
@@ -236,6 +293,13 @@ def apply_drc_settings_fix(cfg, *, diff_pair=False):
             print("  NOTE: reload the project (close & reopen, or File - "
                   "Revert) so KiCad picks up the new DRC rules -- the IPC API "
                   "cannot change them in the live editor.")
+            # #581: an active same-net pad via clearance is recorded as
+            # route.py / route_diff.py / route_planes.py record it, inside the
+            # same fix gate, so later steps keep their vias off same-net pads.
+            _snpc = cfg.get('same_net_pad_clearance')
+            if _snpc is not None and _snpc > 0:
+                from protected_nets import persist_same_net_pad_clearance
+                persist_same_net_pad_clearance(proj, _snpc)
         return proj
     except Exception as e:
         print(f"(skipped DRC-settings write-back: {e})")

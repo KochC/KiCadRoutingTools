@@ -88,7 +88,7 @@ def main():
     # routing_dialog.py is this branch's swig_gui.py (renamed by the IPC port),
     # and the board comes through the fake-IPC harness like every ported gate.
     from kicad_routing_plugin.routing_dialog import RoutingDialog
-    from kicad_routing_plugin import ai_plan
+    from kicad_routing_plugin import ai_plan, gui_utils
     from fake_ipc_board import (install as _install_fake_board,
                                 build_pcb_data_like_ipc)
     from kicad_routing_plugin.settings_persistence import get_dialog_settings
@@ -128,6 +128,9 @@ def main():
         def invoke():
             seen.append(dlg._build_routing_config(
                 [], ['F.Cu', 'B.Cu'])['fix_drc_settings'])
+            # Report a produced result, as the route tab's apply does: a step
+            # that marks none stops the plan (ai_plan._step_refusal).
+            gui_utils.mark_plan_step_produced(dlg)
             if stop_at is not None and len(seen) == stop_at:
                 ex.stop()
         ex._action_parts = lambda action: (invoke, lambda: False)

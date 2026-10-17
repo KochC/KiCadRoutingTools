@@ -349,6 +349,22 @@ class CreatePlanesOptionsPanel(wx.Panel):
             "the plane instead of a single shared via (#487)")
         zone_sizer.Add(self.thermal_vias, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
 
+        # route_planes.py --skip-existing-zones, named after the create_plane
+        # param. Unchecked is the CLI default: a net's pour already on the
+        # target layer is REPLACED by one at this run's settings.
+        self.skip_existing_zones = wx.CheckBox(
+            self, label="Skip existing zones (keep a net's pour already on the layer)")
+        self.skip_existing_zones.SetValue(False)
+        self.skip_existing_zones.SetToolTip(
+            "Checked: a net that already has a pour on the target layer keeps "
+            "it as it is (no new zone; thermal via arrays and stitching still "
+            "apply). Unchecked (the CLI default): that pour is replaced by one "
+            "at this run's clearance, minimum width and outline. A pour that "
+            "also covers other layers is never deleted either way, and other "
+            "nets' pours on the layer are always kept.")
+        zone_sizer.Add(self.skip_existing_zones, 0,
+                       wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+
         sizer.Add(zone_sizer, 0, wx.EXPAND | wx.BOTTOM, 5)
 
         # (No Blocker Handling box: the pour step does no routing (#562
@@ -473,7 +489,56 @@ class CreatePlanesOptionsPanel(wx.Panel):
         gnd_grid.Add(self.gnd_via_net, 0, wx.EXPAND)
 
         gnd_sizer.Add(gnd_grid, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-        sizer.Add(gnd_sizer, 0, wx.EXPAND)
+        sizer.Add(gnd_sizer, 0, wx.EXPAND | wx.BOTTOM, 5)
+
+        # route_planes.py's zone-width and shared-layer knobs. Controls named
+        # after the create_plane params (min_thickness, plane_max_iterations,
+        # voronoi_seed_interval) so a plan step replaying --min-thickness /
+        # --plane-max-iterations / --voronoi-seed-interval sets them, and each
+        # starts at the CLI's argparse default.
+        adv_box = wx.StaticBox(self, label="Zone Width & Shared Layers (advanced)")
+        adv_sizer = wx.StaticBoxSizer(adv_box, wx.VERTICAL)
+        adv_grid = wx.FlexGridSizer(cols=2, hgap=10, vgap=5)
+        adv_grid.AddGrowableCol(1)
+
+        adv_grid.Add(wx.StaticText(self, label="Min Zone Width (mm):"), 0,
+                     wx.ALIGN_CENTER_VERTICAL)
+        r = defaults.PARAM_RANGES['plane_min_thickness']
+        self.min_thickness = wx.SpinCtrlDouble(
+            self, min=r['min'], max=r['max'],
+            initial=defaults.PLANE_MIN_THICKNESS, inc=r['inc'])
+        self.min_thickness.SetDigits(r['digits'])
+        self.min_thickness.SetToolTip(
+            "Minimum width of the poured copper: KiCad drops fill thinner "
+            "than this (route_planes.py --min-thickness)")
+        adv_grid.Add(self.min_thickness, 0, wx.EXPAND)
+
+        adv_grid.Add(wx.StaticText(self, label="Shared-Layer Max Iterations:"),
+                     0, wx.ALIGN_CENTER_VERTICAL)
+        r = defaults.PARAM_RANGES['max_iterations']
+        self.plane_max_iterations = wx.SpinCtrl(
+            self, min=r['min'], max=r['max'],
+            initial=defaults.MAX_ITERATIONS)
+        self.plane_max_iterations.SetToolTip(
+            "A* iteration budget for routing the spines that split a plane "
+            "layer several nets share (route_planes.py --plane-max-iterations)")
+        adv_grid.Add(self.plane_max_iterations, 0, wx.EXPAND)
+
+        adv_grid.Add(wx.StaticText(self, label="Shared-Layer Seed Interval (mm):"),
+                     0, wx.ALIGN_CENTER_VERTICAL)
+        r = defaults.PARAM_RANGES['voronoi_seed_interval']
+        self.voronoi_seed_interval = wx.SpinCtrlDouble(
+            self, min=r['min'], max=r['max'],
+            initial=defaults.VORONOI_SEED_INTERVAL, inc=r['inc'])
+        self.voronoi_seed_interval.SetDigits(r['digits'])
+        self.voronoi_seed_interval.SetToolTip(
+            "Longest gap between a spine's Voronoi seeds when several nets "
+            "share a plane layer: smaller follows each spine more closely "
+            "(route_planes.py --voronoi-seed-interval)")
+        adv_grid.Add(self.voronoi_seed_interval, 0, wx.EXPAND)
+
+        adv_sizer.Add(adv_grid, 0, wx.EXPAND | wx.ALL, 5)
+        sizer.Add(adv_sizer, 0, wx.EXPAND)
 
         self.SetSizer(sizer)
 
@@ -487,6 +552,7 @@ class CreatePlanesOptionsPanel(wx.Panel):
             'gnd_via_net': self.gnd_via_net.GetValue(),
             'thermal_relief': self.thermal_relief.GetValue(),
             'thermal_vias': self.thermal_vias.GetValue(),
+            'skip_existing_zones': self.skip_existing_zones.GetValue(),
             'stitch_vias': self.stitch_vias.GetValue(),
             'stitch_pitch': self.stitch_pitch.GetValue(),
             # 0 = auto/off in the controls -> None for the engine (CLI parity)
@@ -494,6 +560,9 @@ class CreatePlanesOptionsPanel(wx.Panel):
             'stitch_fence_pitch': self.stitch_fence_pitch.GetValue() or None,
             'stitch_inset': self.stitch_inset.GetValue() or None,
             'stitch_max_freq': self.stitch_max_freq.GetValue() or None,
+            'min_thickness': self.min_thickness.GetValue(),
+            'plane_max_iterations': int(self.plane_max_iterations.GetValue()),
+            'voronoi_seed_interval': self.voronoi_seed_interval.GetValue(),
         }
 
 
@@ -753,6 +822,14 @@ class PlanesTab(wx.Panel):
 
         config = self._build_mode_config()
         config['assignments'] = assignments
+        # A Net Clearances File route_planes.py would fail to read is refused
+        # before the run, as on the Route and Differential tabs.
+        from .routing_dialog import net_clearances_file_error
+        _ncl_err = net_clearances_file_error(config.get('net_clearances_path'))
+        if _ncl_err:
+            wx.MessageBox(_ncl_err, "Invalid Net Clearances File",
+                          wx.OK | wx.ICON_WARNING)
+            return
 
         # Disable UI
         self.action_btn.Disable()
@@ -800,6 +877,10 @@ class PlanesTab(wx.Panel):
 
         try:
             self._run_create_planes(config)
+            # #857: the Design rules line route_planes.py's main prints (the
+            # exit code is the CLI's alone).
+            from fab_tiers import finish_design_rules
+            finish_design_rules(None, 0)
 
         except Exception as e:
             import traceback
@@ -887,6 +968,16 @@ class PlanesTab(wx.Panel):
         _seen = set()
         all_layers = [l for l in (['F.Cu'] + _plane_layers_in_order + ['B.Cu'])
                       if not (l in _seen or _seen.add(l))]
+        # The Basic-tab layer costs, one per entry of all_layers BY NAME. They
+        # were handed over aligned to the SELECTED layers, which create_plane
+        # read positionally against all_layers -- on a 4-layer board the
+        # default costs priced the wrong layers and the full-stack append's
+        # FORBIDDEN entry for the unrequested inner layer fell off the end.
+        from .gui_utils import layer_costs_for_layers
+        plane_layer_costs = layer_costs_for_layers(
+            config.get('layer_costs_typed'), all_layers,
+            config.get('layer_costs_selected_layers') or [],
+            list(self.pcb_data.board_info.copper_layers or []))
 
         total_vias = 0
         total_traces = 0
@@ -927,7 +1018,7 @@ class PlanesTab(wx.Panel):
 
         # #439: build net_clearances from the live board so plane taps/vias and
         # ripped-net reroutes honor KiCad's cross-class max(A,B) -- mirrors
-        # route_planes.py and the route tab (swig_gui). Passing an explicit map
+        # route_planes.py and the route tab (routing_dialog). Passing an explicit map
         # STOPS the engine's internal always-cap auto-read, so honoring classes
         # (Min Clearance override unchecked) actually reaches the router.
         # Checking Min Clearance (== the CLI passing --clearance) caps each class
@@ -964,6 +1055,14 @@ class PlanesTab(wx.Panel):
         except Exception as e:
             print(f"Warning: Could not get net class clearances: {e}")
             _plane_net_clearances = None
+        # route_planes.py --net-clearances FILE (the Advanced tab's Net
+        # Clearances File): it replaces the class-derived map, as given, for
+        # the plane taps and the GND vias alike.
+        from .routing_dialog import explicit_net_clearances
+        _explicit = explicit_net_clearances(config.get('net_clearances_path'),
+                                            self.pcb_data)
+        if _explicit is not None:
+            _plane_net_clearances = _explicit
 
         failed_pads = 0
         try:
@@ -997,12 +1096,12 @@ class PlanesTab(wx.Panel):
                                                 defaults.RIPUP_BLOCKER_SELECT),
                 # #381 D6: per-layer cost bias from the shared Basic-tab control
                 # (route_planes.py passes --layer-costs); None -> engine default.
-                layer_costs=config.get('layer_costs') or None,
-                # #381 D6: plane knobs the CLI threads but the GUI dropped -- now
-                # config-driven, defaulting to the same value route_planes.py's
-                # argparse uses so current GUI behavior is unchanged unless a
-                # plan/control sets them.
-                voronoi_seed_interval=config.get('voronoi_seed_interval', 2.0),
+                layer_costs=plane_layer_costs or None,
+                # #381 D6: plane knobs the CLI threads, supplied by the
+                # create panel's controls of the same names (each starting at
+                # route_planes.py's argparse default).
+                voronoi_seed_interval=config.get('voronoi_seed_interval',
+                                                 defaults.VORONOI_SEED_INTERVAL),
                 plane_max_iterations=config.get('plane_max_iterations', defaults.MAX_ITERATIONS),
                 debug_lines=config.get('debug_lines', False),
                 add_teardrops=config.get('add_teardrops', False),
@@ -1048,11 +1147,13 @@ class PlanesTab(wx.Panel):
                 # #581: from the Basic tab via get_shared_params (explicit;
                 # -1 = via-in-pad allowed).
                 same_net_pad_clearance=config.get('same_net_pad_clearance', -1.0),
-                # #381 D6: config-driven (was hardcoded True). Interactive
-                # default stays True -- an interactive re-create on a live board
-                # should skip re-emitting an existing zone. A plan can override
-                # to False (the CLI default) to match a route_planes.py replay.
-                skip_existing_zones=config.get('skip_existing_zones', True),
+                # The "Skip existing zones" checkbox (route_planes.py
+                # --skip-existing-zones), default False like the CLI: a net's
+                # pour already on the layer is REPLACED, which the applier
+                # carries out on the live board (each returned zone says
+                # `replace_existing`). It was hardcoded True, so the GUI could
+                # never replay a step that omitted the flag.
+                skip_existing_zones=config.get('skip_existing_zones', False),
                 net_clearances=_plane_net_clearances,
                 clamp_netclasses=_plane_clamp,
                 clearance_ceiling=_plane_ceiling,
@@ -1176,12 +1277,16 @@ class PlanesTab(wx.Panel):
         # How many requested pours the ENGINE kept as-is because that net already
         # has a zone on that layer (skip_existing_zones). Without this the dialog
         # cannot distinguish "already there, nothing to do" from a real failure --
-        # both arrive as zero new zones.
+        # both arrive as zero new zones. Without the skip the engine pours every
+        # requested pair (replacing or out-ranking what is there), so nothing
+        # is kept.
         try:
+            from kicad_parser import pour_zones
             _have = {(z.net_name, z.layer)
-                     for z in (getattr(self.pcb_data, 'zones', None) or [])}
+                     for z in pour_zones(getattr(self.pcb_data, 'zones', None))}
             zones_kept = sum(1 for _n, _l in zip(expanded_nets, expanded_layers)
-                             if (_n, _l) in _have)
+                             if (_n, _l) in _have) \
+                if config.get('skip_existing_zones', False) else 0
         except Exception:
             zones_kept = 0
 
@@ -1244,6 +1349,10 @@ class PlanesTab(wx.Panel):
 
         # Apply results to board
         self._apply_results_to_board()
+        # The plan executor's "this step produced its result" (gui_utils);
+        # every return above this line is a cancel, no result or an error.
+        from .gui_utils import mark_plan_step_produced
+        mark_plan_step_produced(self)
 
         # Show completion message. Lead with ZONES: the pour is what this tab
         # produces. Vias/traces are legacy tap counters that are structurally 0
@@ -1259,6 +1368,12 @@ class PlanesTab(wx.Panel):
             msg += f" on {len(nets)} net(s)\n" if nets else "\n"
         else:
             msg = "No plane was created.\n\n"
+        replaced = getattr(self, '_last_zones_replaced', 0)
+        if replaced:
+            msg += (f"Replaced existing: {replaced} zone(s) -- the pour that "
+                    f"net already had on that layer, now at this run's "
+                    f"settings.\nCheck 'Skip existing zones' to keep such a "
+                    f"pour instead.\n")
         kept = zones_skipped + result.get('zones_kept', 0)
         if kept:
             # The usual reason a pour looks like it did nothing. Covers both the
@@ -1274,6 +1389,8 @@ class PlanesTab(wx.Panel):
             msg += f"Failed pads (no via placed): {failed_pads}\n"
 
         status = f"Created: {zones_added} zone(s)"
+        if replaced:
+            status += f", {replaced} replaced"
         if kept:
             status += f", {kept} kept (already present)"
         if failed_pads:
@@ -1338,6 +1455,7 @@ class PlanesTab(wx.Panel):
         # Reset before the early return below, so the completion message can
         # never report a PREVIOUS run's zone tally.
         self._last_zone_counts = (0, 0)
+        self._last_zones_replaced = 0
 
         new_vias = list(getattr(self, "_new_vias", []) or [])
         new_segments = list(getattr(self, "_new_segments", []) or [])
@@ -1404,8 +1522,10 @@ class PlanesTab(wx.Panel):
         # stopped placing taps (#492/#562), so a dialog reporting only those two
         # reads as "nothing happened" on a perfectly successful pour, and hides
         # the one number that explains a no-op: zones SKIPPED because the net
-        # already has a zone on that layer (skip_existing_zones, default on).
+        # already has a zone on that layer (the "Skip existing zones" box).
         self._last_zone_counts = (counts['zones'], counts['zones_skipped'])
+        # Replacements are reported apart: they are pours that DID change.
+        self._last_zones_replaced = counts.get('zones_replaced', 0)
         if counts.get('swapped_items'):
             print(f"Applied {counts['swapped_items']} reconnect swap/"
                   f"modification item(s) to the live board (#484)")

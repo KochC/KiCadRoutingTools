@@ -777,7 +777,17 @@ Look for DDR signal patterns in the net list that may need length matching:
 
 If DDR signals detected:
 - Note that `--length-match-group auto` should be used
-- DQ0-7 + DQS0 form byte lane 0, DQ8-15 + DQS1 form byte lane 1, etc.
+- DQ0-7 + DQS0 (+ DM0 or LPDDR's DMI0) form byte lane 0, DQ8-15 + DQS1 form byte lane 1,
+  etc.; address/command/clock form `command_address`. Each DRAM interface
+  (prefix, and `_A`/`_B` channel) gets its own lanes, so two channels' lanes
+  are never matched to each other
+- `auto` groups only the step's own `--nets`, by whole name token, and only
+  under a prefix the board proves is DRAM (#1247). Preview it with
+  `classify_ddr_nets` (snippet in the DDR section below). Any DDR net it
+  lists as not grouped needs its own `--length-match-group` patterns
+- If the DDR runs between two ball arrays (a SoC and its memory), plan the
+  topo bus step for it (Step 1a, experimental) -- `awx/route_bus.py --find`
+  names the bus.
 
 Report to user:
 - List of detected differential pairs (or "none found")
@@ -995,14 +1005,31 @@ In a GUI plan the rules ride the step's `keep_away` param, which is the Advanced
 tab's one-line Keep-away field: rules separated by spaces, used by both the Route
 and the Differential tabs.
 
+**Declare it once, in the design brief, when the board has one** (#1253). Put
+each rule in the brief's `keep_away` list (`<board>.design-brief.json`, one rule
+per entry, as a string or `{"rule": ..., "why": ...}`). `route.py`,
+`route_diff.py` and the GUI read that list off the brief beside the board and
+add it to any `--keep-away` they are given, so no step has to repeat it. The
+run prints `Keep-away: N rule(s) read from the design brief`. Every routed
+output carries the brief, so later steps keep the rules. A malformed rule in
+the brief stops the step with the rule parser's message (exit 2). The same
+list is graded on the PLACEMENT by `check_floorplan`, before any track exists.
+
 **Grade it, and report it.** A run with rules prints a `Keep-away (...)` line and
 writes `keep_away` into JSON_SUMMARY: `in_band_mm` and `nets_in_band`, plus
 per-net `in_band_mm`, `min_spacing_mm` and `closest_net`. The cost is soft, so
 in-band length that remains means the router found no other way through. That is
 a capacity answer (a corridor too narrow for the gap, or placement putting the
-groups side by side), and you must report it rather than hide it. Then suggest a
-placement change, a user-drawn guide corridor, or a `User.2` keepout around the
-analog block if it matters. `--keep-away-cost 0` measures a board against the
+groups side by side), and you must report it rather than hide it. Tell the two
+apart by grading the placement against the same rule: with the rule in the
+brief, `check_floorplan.py <board> --intent <intent>` (the intent emitted from
+that brief) prints a `keep_away` WARN for each part pair whose pads already sit
+inside the band, with both pads' sides, and a `keep-away <rule>: closest ...`
+line when none do. A pad pair inside the band is the placement; none is the
+corridor. Then suggest a placement change (naming the part pair the grade
+named), a user-drawn guide corridor, or a `User.2` keepout around the analog
+block if it matters. The placement grade is plan view: a pair on opposite faces
+is reported with its sides, and you judge it. `--keep-away-cost 0` measures a board against the
 rules without changing a single route.
 
 **Keep the better run.** Route the step once more with the same rules at
@@ -1238,6 +1265,14 @@ Based on the analysis, generate a step-by-step plan. The general order is:
    +3V3 pour ONE intact island, GND weld copper cut to a third, connectivity
    net-better, DRC clean. With planes poured signals-first style instead, the
    pour under a BGA arrives pre-shredded and every drop via needs repair welds.
+1a. **Buses between two ball arrays — the topo bus step (EXPERIMENTAL)** —
+   `awx/route_bus.py`, on the poured board, before any other fanout: each
+   array-to-array bus (DDR, LVDS, a QFN PHY's bus off a BGA) is planned and
+   laid whole -- its fanout at both arrays, the order and layers of every
+   lane, the vias -- and handed on protected. It is still experimental (the
+   `awx` research tree): **for now, use it on every such bus**, and check what
+   it hands on (Step 1a). The other arrays' fanouts follow it, round its
+   protected nets.
 1b. **Fanout** (if needed) - Escape routing on the poured board. Exclude the
    plane nets (`"*" "!GND" "!VCC"`) — that exclusion marks them for automatic
    **plane-drop vias** (#424), and because the pour already exists the drop
@@ -1358,6 +1393,123 @@ leave it unless a fab demands wider minimum copper.
 
 Expect `check_connected` to show the plane nets fully connected from here on
 (the drops + pour serve every BGA plane ball with no tap search).
+
+### Step 1a: Route the array-to-array buses (the topo bus step — EXPERIMENTAL)
+
+**Experimental.** `awx/route_bus.py` is the topological bus router of the `awx`
+research tree: it plans a bus between two parts WHOLE -- the order of every
+lane, which layer each runs on, where each changes layer, both arrays' fanout
+-- before laying any copper, instead of routing the nets one at a time. It is
+still being developed and its problems are being fixed so it always beats the
+A* router on a bus. **For now, advise it for every bus between two ball arrays
+(or a ball array and a QFN/QFP), and say in the plan that it is experimental.**
+Measured, each the same chain with and without it (KiCad's count of open nets
+on the finished board): zynq_ad9364 with four buses 10 against 30;
+sdi_mipi_conv 29 against 37; h616_lpddr4 2 to 4 against 5, with every LPDDR4
+net connected and 0 skew violations against 48. One run each -- per-board
+spread is 2 to 3 nets.
+
+Find the buses first (read-only):
+
+```bash
+python3 -X utf8 awx/route_bus.py board_step1.kicad_pcb --find
+```
+
+Then ONE call routes them all, one `--bus` each, largest first (a DDR before
+an LVDS bus off the same array), on the poured board:
+
+```bash
+python3 -X utf8 awx/route_bus.py board_step1.kicad_pcb board_step1a.kicad_pcb \
+    --rounds 2 --inproc \
+    --bus U1:U2:joint:F.Cu,B.Cu,In1.Cu,In2.Cu \
+    --clearance-ceiling 0.1 --track-width 0.1 --fanout-track-width 0.0975 \
+    --via-size 0.35 --via-drill 0.15 \
+    2>&1 | tee /tmp/step1a_bus.txt
+```
+
+- **LAYERS: name EVERY copper layer**, the planes' layers included. Unnamed,
+  the step routes on F.Cu and B.Cu alone (its `ROUTE_LAYERS` default), and
+  never narrow it by hand because the human routed the bus on two layers: on
+  h616_lpddr4 the LPDDR4 bus on F/B left lanes open in a corridor two 0402
+  pull-ups block on F.Cu, which the inner layers relieve. The step prices a
+  run on a plane's layer (a via per run), so lanes take a pour's layer only
+  where it saves one.
+- **MODE:** `joint` for a bus between two arrays (the default choice: each
+  round plans the arrays' other nets and plane drops round the bus, so the
+  later fanouts leave those arrays alone -- do NOT run `bga_fanout.py` on
+  them). `escape` dog-bones both arrays the human's way: use it for a second
+  bus on an array an earlier bus already fanned (the zynq's LVDS after its
+  DDR); on h616_lpddr4's LPDDR4 alone it handed on 23 of 45 nets against
+  joint's 45. `plain` for a bus to a row part (a QFN), and for one source
+  with several ends, `--bus U1:U4+U3:plain:...` (two buses that interleave on
+  one face, routed as one).
+- **Every ball of a bus array must leave the step served -- the rule that
+  decides the rest of the chain.** A ball is served when it has an escape
+  (a dog-bone via or stub), is dropped to its plane, or is strapped. `route.py`
+  cannot reach a ball that has none: the pad sits inside the pad field with no
+  stub, no rip or retry authority applies, and the net fails as "boxed in by
+  static obstacles". A fanout run AFTER the bus step cannot repair it either:
+  the bus's lanes and dog-bones already fill the field (on sdi_mipi_conv,
+  fanning U11 out after the bus step left MORE nets open, 43 against 35). So
+  the fanout of a bus's arrays is the bus step's own, planned with the bus (on
+  the zynq, every other ball of U1 was served: 98 escaped, 12 strapped, 5
+  dog-boned alone of 115), and the parts no bus touches are fanned out whole
+  with `bga_fanout.py` before `route.py` (Step 1b), never left for the router.
+  - The step's log says what it served: `joint field of U1: FEASIBLE -- bus
+    a/b, others N escaped + M strapped + K dog-boned alone of T, plane P
+    dropped`. Read it, then check the BOARD it hands on: count each bus
+    array's signal balls that carry no stub, via, plane link or strap. Every
+    ball counted is a net `route.py` will leave open.
+  - `escape` on a shared array does plan the array's other balls with the bus,
+    but on sdi_mipi_conv (DDR3 joint, then SDI escape on U11) the board it
+    handed on still had 25 bare U11 balls; the same two buses both `joint`
+    left none (U11 248 of 248 served, U12 90 of 90). After `escape` or
+    `plain`, make the count above before going on, and fan the bare balls out
+    only if the bus left room.
+  - Both-`joint` is not free: on that board the fanout audit then refused
+    every SDI lane (their balls sit on U11's far side from U15), so the bus
+    laid 2 lanes and `route.py` finished the rest -- 27 nets open against 29
+    with the escape bus and 37 with no bus step (one run each).
+- **Sizes:** the chain's own (Step 4's design rules), with
+  `--clearance-ceiling` as everywhere in a chain; `--fanout-track-width` the
+  escapes' track under the arrays.
+- **Time:** minutes to an hour a bus on four layers (h616_lpddr4's 45-net
+  LPDDR4: 47 minutes; the first 40 nets of the zynq's LVDS bus: 3). It is the slowest step of
+  the chain; it uses four threads at most.
+
+**What it hands on, and how to check it.** The last line of its log is the
+grade -- `BUS U1->U2 K=.. lanes=../.. vias=.. ... | on the board: ...
+connected=1 drc=.. planes=.. vs .. in` -- and `<out stem>.bus/summary.json`
+names every net routed and every one refused, with why. It exits 0 when the
+bus is handed on routed, connected and clean, and 1 when OUT is the board as it
+came (then the rest of the chain routes the whole bus with A*: carry on from
+OUT either way, it is not a chain failure). Its routed nets are **protected**
+in OUT's `.kicad_pro` (#521): later steps route round them and will not rip
+them. So:
+
+- the fanouts of the OTHER parts (Step 1b) exclude the bus's nets -- read
+  them from `kicad_routing_tools.protected_nets` in OUT's `.kicad_pro` and
+  pass each as `"!<net>"` in `--nets`;
+- the cap pass (Step 1c) runs once after those fanouts, as always (the bus
+  step already moved the passives beneath its own arrays);
+- `route_diff.py` (Step 2a) gets only the pairs the bus did NOT hand on:
+  a multipoint pair (a DDR clock to two channels and its termination parts)
+  is no bus lane, and the bus's own pairs are already routed;
+- `route.py --nets "*"` finishes everything else, as always.
+
+Check, besides the BUS line: `check_connected.py` on OUT, and its PLANES --
+refill and count each pour's islands. On h616_lpddr4 the LPDDR4 lanes on In2
+split the VCC_DRAM island under the memory in two, which the step's own
+`planes=` count did not flag, and `route.py` then could not reach one of its
+pads past the protected bus.
+
+**Known limits (it is experimental):** a bus's pairs run at the step's own
+pitch, not the net class's diff-pair gap (DDR 0.093/0.093 on h616_lpddr4,
+routed at 0.24 mm centre to centre), so state it where impedance matters; a
+bus ball on the SOURCE's far face (the side away from the destination) is
+refused and left to `route.py`; a small pour on a routing layer can be cut, as
+above. None of these is a reason to skip it: what it refuses or leaves open
+goes back to the A* chain as it came.
 
 ### Step 1b: Fanout U9 (PGA120) - All Non-Plane Nets
 Generates escape routing for ALL nets on the component EXCEPT those that the
@@ -1883,14 +2035,20 @@ route step's finalize like the main flow. If VCC wasn't fanned out, add
 For DDR memory or other length-matched buses, detect signals that need matching:
 
 ```python
-# Common DDR signal patterns
-ddr_patterns = ['DQ', 'DQS', 'DQM', 'DM', 'CLK', 'CK', 'CAS', 'RAS', 'WE', 'CS', 'ODT', 'CKE']
-ddr_nets = [n.name for n in pcb.nets.values()
-            if n.name and any(p in n.name.upper() for p in ddr_patterns)]
+# What `--length-match-group auto` will form -- the engine's own classifier.
+# Never substring-match: 'WE' is inside 'POWER', 'CK' inside 'JTAG_TCK' (#1247).
+from length_matching import classify_ddr_nets
+names = [n.name for n in pcb.nets.values() if n.name]
+ddr = classify_ddr_nets(names)
+ddr_groups = ddr['groups']           # {'byte_lane_0': [...], 'command_address': [...]}
+# Two interfaces on one board name theirs: 'byte_lane_0 @ /LPDDR5/LPDDR5_A.'
+left_out = ddr['lane_undeterminable'] + ddr['no_group_token']
 ```
 
 If DDR or length-matched signals detected, add to the plan:
-- `--length-match-group auto` for automatic DDR byte lane grouping
+- `--length-match-group auto` for automatic DDR byte lane grouping. It
+  groups only that step's `--nets`, so put the DDR nets the group needs in
+  the same step. Any DDR net in `left_out` needs explicit patterns
 - `--length-match-tolerance 0.1` for acceptable variance (mm)
 - `--time-matching` if routes span different layers (accounts for dielectric)
 
@@ -1901,6 +2059,11 @@ For high-speed signals with impedance requirements:
 - `--impedance 100` with `route_diff.py` for 100Ω differential
 
 ### Bus Detection
+
+A bus between two ball arrays (or an array and a QFN) is the topo bus step's
+(Step 1a, `awx/route_bus.py`, experimental) -- that is a different tool from
+the `route.py --bus` attraction below, which only pulls single routes
+together.
 
 For parallel data/address buses with clustered endpoints:
 - `--bus` enables automatic bus detection and parallel routing
@@ -3055,7 +3218,10 @@ next to the board, so the exact tuned choices replay with no LLM:
    ```
 
    The AI tab's Load button accepts this file and the plan executor runs
-   the same chain through the GUI engine path. KNOWN LIMITATION: env-only
+   the same chain through the GUI engine path. KNOWN LIMITATION: the topo
+   bus step (`awx/route_bus.py`, Step 1a) has no GUI action, and the
+   converter skips it ("kept-but-non-GUI command(s) skipped") -- a plan with
+   a bus step replays from the `.sh` alone. Env-only
    knobs (the Step 2c plan/attraction stack) do not survive into the JSON —
    only `--flag` params map to plan params. Until those knobs are promoted
    to first-class engine params + dialog controls (the #513 discipline),

@@ -44,7 +44,7 @@ import math
 import env_knobs
 from typing import List, Optional, Set, Tuple
 
-from kicad_parser import PCBData, Segment, Via
+from kicad_parser import PCBData, Segment, Via, is_immutable_copper
 from pcb_modification import bump_copper_epoch
 from routing_config import GridRouteConfig
 
@@ -60,7 +60,9 @@ def tap_relocation_max() -> int:
 def plane_zone_net_ids(pcb_data: PCBData) -> Set[int]:
     """Nets with a filled zone: removing one of their vias is repairable
     from the pour by the plane-repair step."""
-    return {z.net_id for z in pcb_data.zones if z.net_id > 0}
+    from kicad_parser import pour_zones
+    # A teardrop (#1164) is no pour: it repairs nothing a removed via left.
+    return {z.net_id for z in pour_zones(pcb_data.zones) if z.net_id > 0}
 
 
 def _attached_stub(pcb_data: PCBData, via: Via, max_len_mm: float = 2.0
@@ -104,8 +106,11 @@ def find_relocation_candidate(pcb_data: PCBData, config: GridRouteConfig,
     for v in pcb_data.vias:
         if v.net_id not in plane_ids or id(v) in excl:
             continue
+        if is_immutable_copper(v):
+            continue    # locked or sense-held copper never moves (#1261, #1279)
         d = math.hypot(v.x - ex, v.y - ey)
-        if d < best_d:
+        if d < best_d and not any(is_immutable_copper(s)
+                                  for s in _attached_stub(pcb_data, v)):
             best, best_d = v, d
     return best
 

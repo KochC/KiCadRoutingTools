@@ -22,6 +22,7 @@ from obstacle_costs import (
     compute_track_proximity_for_net
 )
 from blocking_analysis import analyze_frontier_blocking
+from protected_nets import rip_refusal
 from history_congestion import record_rip   # #590
 from polarity_swap import get_canonical_net_id
 from obstacle_cache import refresh_net_obstacles as _refresh_map   # #806
@@ -177,8 +178,9 @@ def rank_fallback_layers(config, pcb_data, obstacles, center_x: float, center_y:
     coord = GridCoord(config.grid_step)
     r = max(1, int(probe_radius_mm / config.grid_step))
     ranked = []
+    routable = set(config.routable_layers())
     for li, layer_name in enumerate(config.layers):
-        if layer_name == current_layer:
+        if layer_name == current_layer or layer_name not in routable:
             continue
         total = blocked = 0
         for dx in range(-r, r + 1):
@@ -445,7 +447,9 @@ def try_fallback_layer_swap(pcb_data, pair, pair_name: str, config,
                     rippable_blockers = []
                     seen_canonical_ids = set()
                     for b in blockers:
-                        if b.net_id in routed_results:
+                        if b.net_id in routed_results and not rip_refusal(
+                                pcb_data, b.net_id, "diff-pair fallback rip",
+                                diff_pair_by_net_id):
                             canonical = get_canonical_net_id(b.net_id, diff_pair_by_net_id)
                             if canonical not in seen_canonical_ids:
                                 seen_canonical_ids.add(canonical)

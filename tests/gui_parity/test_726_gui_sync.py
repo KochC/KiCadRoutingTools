@@ -63,14 +63,19 @@ because `run_all.py`'s glob only collects `tests/test_*.py`.
 # level: its `gui-sync-matches-by-bare-reference` row is deliberately absent,
 # with the reason.
 #
-# Restore this file WITH the function if a live-board position sync ever comes
-# back; the three properties its docstring above enumerates are what it must
-# pin.
+# A live-board position sync CAME BACK with the main b118ad48 sync:
+# routing_dialog._sync_footprint_poses patches the dialog's cached PCBData in
+# place from a fresh kipy build, matching footprints by PCBData KEY. The three
+# properties the docstring above enumerates are pinned on it, on esp_prog's
+# duplicated `Ref*`, by tests/test_ipc_live_apply_ports.py (F), in process;
+# the keys a fresh kipy build carries are tests/test_726_kipy_reference_keys.py.
+# NOT COVERED: the same over a running KiCad's footprint enumeration order.
 import sys
 
 if __name__ == '__main__':
     print("SKIP: gui_utils.sync_footprint_positions_from_board does not exist "
-          "on ipc-migration (the IPC port removed the live-board position "
-          "sync). The keying half of #726 is graded by "
+          "on ipc-migration; its IPC twin, routing_dialog._sync_footprint_poses, "
+          "is pinned for #726's three properties by "
+          "tests/test_ipc_live_apply_ports.py (F), and the kipy keying by "
           "tests/test_726_kipy_reference_keys.py.")
     sys.exit(77)

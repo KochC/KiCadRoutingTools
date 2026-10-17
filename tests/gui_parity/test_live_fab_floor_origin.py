@@ -19,7 +19,9 @@ tab's apply phase routes print() into its log):
   * FAB FLOOR RELAXED names ORIGINAL -> now and counts real copper under it;
   * a second step, which lowers nothing more, still says the board is under
     its original (the run-14 rule);
-  * a board whose floors the step does not lower gets no banner.
+  * a board whose floors the step does not lower gets no banner;
+  * the fanout tab's step, where update_live_drc_floors is the only writer,
+    records the same origin and prints the same banner.
 
 Needs KiCad python (pcbnew); re-execs into it like its siblings.
 
