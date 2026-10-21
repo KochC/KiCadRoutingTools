@@ -321,7 +321,7 @@ def stub_pieces(reach, lanes=False):
             r = s_.width / 2
             out.append((min(ax, cx) - r, min(ay, cy) - r, max(ax, cx) + r, max(ay, cy) + r,
                         ALL() if inner else {F(s_.layer)},
-                        'stub ' + (own_ or ctx.pcb.nets[s_.net_id].name.split('/')[-1]), own_))
+                        'stub ' + (own_ or whole_ctx.copper_name(ctx, s_)), own_))
     return out
 
 
@@ -339,7 +339,7 @@ for v_ in ctx.base_vias:
         if (awx_settings.get('SVIA_RING') or '1') == '1':
             # (its reach for a lane: the router's ring about the grid point it rounds to -- pairs.svia_reach)
             r = max(r, _pairs.svia_reach(ctx.cfg, v_.x, v_.y, v_.size))
-        VSTUB.append((v_.x - r, v_.y - r, v_.x + r, v_.y + r, ALL(), 'svia ' + (own_ or ctx.pcb.nets[v_.net_id].name.split('/')[-1]), own_))
+        VSTUB.append((v_.x - r, v_.y - r, v_.x + r, v_.y + r, ALL(), 'svia ' + (own_ or whole_ctx.copper_name(ctx, v_)), own_))
     elif v_.net_id not in NET_LANE and (min(b[0] for b in BOX) - FIELD_MARGIN <= v_.x <= max(b[2] for b in BOX)
                                         + FIELD_MARGIN and min(b[1] for b in BOX) - FIELD_MARGIN <= v_.y
                                         <= max(b[3] for b in BOX) + FIELD_MARGIN):

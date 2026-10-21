@@ -122,6 +122,13 @@ def part_islands(ctx, skip=(), split=None):
     return out
 
 
+def copper_name(ctx, item):
+    """the short name of a base segment's or via's net; copper of NO net -- a footprint's own copper (#908: net 0,
+    its part in owner_ref), which no board's nets list -- by its part"""
+    n_ = ctx.pcb.nets.get(item.net_id) if item.net_id else None
+    return n_.name.split('/')[-1] if n_ is not None else (getattr(item, 'owner_ref', '') or 'no net')
+
+
 def foreign_teeth(ctx, M, boxes):
     """the TEETH of the nets outside the bus M: each end of their stubs (ctx.base_segments) on an array's box line
     (`boxes`: whole_frame's pad boxes, grown to the line the stubs end on), as (x, y, the track's half width, its
@@ -138,7 +145,7 @@ def foreign_teeth(ctx, M, boxes):
         for (x, y) in ((s_.start_x, s_.start_y), (s_.end_x, s_.end_y)):
             if any(((abs(x - b[0]) < tol or abs(x - b[2]) < tol) and b[1] - tol <= y <= b[3] + tol)
                    or ((abs(y - b[1]) < tol or abs(y - b[3]) < tol) and b[0] - tol <= x <= b[2] + tol) for b in boxes):
-                out.append((x, y, s_.width / 2, s_.layer, ctx.pcb.nets[s_.net_id].name.split('/')[-1]))
+                out.append((x, y, s_.width / 2, s_.layer, copper_name(ctx, s_)))
     return out
 
 
