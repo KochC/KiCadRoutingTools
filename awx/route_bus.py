@@ -842,13 +842,14 @@ def _cropped(pcb, foot):
 
 
 def _caged(pcb, pad, track, via, clearance):
-    """no track `track` wide gets from `pad` to the rest of its net within CAGE_VIEW of it -- nor, where the view holds
-    none of the rest, to the view's edge -- changing layers where a via `via` wide fits on every layer or at a via of
-    the net's own. check_reachability's question (placement.reachability: its slack field, its own-copper islands) at
-    one width: each layer's room thresholded and labelled, the layers joined where a via goes, not a widest path. The
-    net's own vias join layers here as its copper does -- check_reachability joins them only where a new via of its
-    --via fits, and read main's imx6ulz U1.N4, escaped through its own 0.3 mm via, CAGED. Pours are not read: a
-    foreign one is filled round what is laid, and a ball's own counts as no copper to reach"""
+    """no track `track` wide gets from `pad` to the rest of its net within CAGE_VIEW of it, nor to the view's edge --
+    changing layers where a via `via` wide fits on every layer or at a via of the net's own. check_reachability's
+    question (placement.reachability: its slack field, its own-copper islands) at one width: each layer's room
+    thresholded and labelled, the layers joined where a via goes, not a widest path. Two answers differ from its: the
+    view's edge is always a way out (it takes the edge only when the view holds none of the net), and the net's own
+    vias join layers here as its copper does -- check_reachability joins them only where a new via of its --via fits,
+    and read main's imx6ulz U1.N4, escaped through its own 0.3 mm via, CAGED. Pours are not read: a foreign one is
+    filled round what is laid, and a ball's own counts as no copper to reach"""
     import numpy as np
     from scipy import ndimage
     if os.path.join(HERE, '..', 'py_placer') not in sys.path:
@@ -906,17 +907,19 @@ def _caged(pcb, pad, track, via, clearance):
             union([lab[cy, cx] for lab in labs])
         return labs, find, n
     # the ball's own island: its net's copper joined through its own vias; the target, the rest of its net in the view
+    # and the view's EDGE, always: room that leaves the view left any cage round the ball, and the rest of the net
+    # past it is out of this check's sight (kintex_pcie U1.B3: NT7's pad, the one piece of MGTAVTT in its view, walled
+    # off by the lanes, while its way between the balls to G2's island and that island's stub to the face crossed
+    # the view's edge)
     olabs, ofind, on = joined(owns, own_via, False)
     sy, sx = int((pad.global_y - view[1]) / step), int((pad.global_x - view[0]) / step)
     if not olabs[0][sy, sx]:
         return False                        # (no copper of its own at its centre: not this check's to say)
     sroot = ofind(int(olabs[0][sy, sx]))
     roots = np.array([ofind(i) for i in range(on + 1)])
-    tgt = [o & (roots[ol] != sroot) for o, ol in zip(owns, olabs)]
-    if not any(t.any() for t in tgt):
-        edge = np.zeros((h, w), dtype=bool)
-        edge[0, :] = edge[-1, :] = edge[:, 0] = edge[:, -1] = True
-        tgt = [edge] * len(layers)
+    edge = np.zeros((h, w), dtype=bool)
+    edge[0, :] = edge[-1, :] = edge[:, 0] = edge[:, -1] = True
+    tgt = [(o & (roots[ol] != sroot)) | edge for o, ol in zip(owns, olabs)]
     flabs, ffind, _n = joined(frees, own_via, True)
     if not flabs[0][sy, sx]:
         return True
