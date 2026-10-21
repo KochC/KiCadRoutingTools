@@ -1472,6 +1472,25 @@ def lift(m):
     res['lanes'].pop(m, None)
 
 
+def shape_count(pieces):
+    """the audit's SHAPE findings on a lane's pieces (plan_audit.check_shape, its tests on each layer's runs): a turn
+    over 100 degrees at a vertex or over the lane's own scale, and a notch"""
+    W_, NOTCH_ = TW + CL, TW + g
+    runs = []
+    for (a_, b_, L) in pieces:
+        if runs and runs[-1][0] == L and runs[-1][1][-1] == a_:
+            runs[-1][1].append(b_)
+        else:
+            runs.append((L, [a_, b_]))
+    n_ = 0
+    for _L, run in runs:
+        tr = _pa._turns(run)
+        n_ += sum(1 for _v, t, _l in tr if abs(t) > 100) + sum(1 for _v, t in _pa._scale_turns(run, W_) if abs(t) > 100)
+        n_ += sum(1 for (_v1, t1, l1), (_v2, t2, _l2) in zip(tr, tr[1:])
+                  if abs(t1) > 60 and abs(t2) > 60 and t1 * t2 < 0 and l1 < NOTCH_)
+    return n_
+
+
 failed = {}
 folded = {}
 WIDE = set()        # the lanes laid only with their layer changes past the plan's reach (route's wide)
@@ -1558,6 +1577,11 @@ for sw in range(SWEEPS):
                {'ends': keep.get('ends'), 'cross': keep.get('cross')})     # a pair's end connectors and crossover too
         lift(n)
         out, why = route_memo(n, strict=n not in folded, wide=n in WIDE)
+        # (...and kept where it was when its new path turns back on itself more than the old: zynq_ad9364's DDR3_DQ14,
+        # its via's place taken by the join of DQ13 laid after it -- 0.4191 from the via, where a via keeps 0.4198 from
+        # a piece off the grid -- dived over its own stub, folded 128 degrees, and the loop solved again twice)
+        if out is not None and shape_count(out[0]) > shape_count(old[0]):
+            out = None
         place(n, out if out is not None else old)
     nb1 = sum(len(L_['pieces']) for L_ in res['lanes'].values())
     log(f'  sweep {sw + 1}: pieces {nb0} -> {nb1}')
