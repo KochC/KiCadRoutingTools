@@ -856,10 +856,19 @@ the end-layer changes, a least-weight cover of the crossings between lanes on
 one layer end to end, the settling of a lane whose end layers differ, and the
 coupling of two such lanes. The best few states are then ranked **exact** on
 their orders: the whole solve's order model without its lengths, CP-SAT on
-one worker to a deterministic work limit (`EXACT_WORK`, 60). The limit stands
-well above what a proof takes on a Mac, because a machine's deterministic time
-is its own: H3 K51's best ends prove at 17 on a Mac and need more than 20 on
-Linux, and an unproved state ranks last.
+one worker to a deterministic work limit (`EXACT_WORK`, 60). The model gives
+no crossing a position. One bool orders the three crossings of three lanes
+that all cross, each lane's crossings keep one order (any three of them
+transitive), and each of a lane's changes falls before or after each of its
+crossings; a run's layer is one bool a layer. The search is core-guided,
+since the objective sums the lanes' changes and nearly every lane has none.
+Each set of lanes that all cross one another, more than there are layers,
+has that many more of them change layer: the colouring's bound, which the
+search would otherwise prove by search. h616_lpddr4's thirteen states of one
+choice took 963 s with a position per crossing, five of them unproved, and
+take 29 s, every one proved. The limit stands far above a proof, because a
+machine's deterministic time is its own; a route stopped at it keeps the
+best plan it found (6 of the 326 in six boards' bus steps).
 
 **The objective**, one sum in vias:
 
@@ -982,10 +991,9 @@ two-end bus's fanout went from 163 s to 98 s, its plan the same. Each cut's
 searched ends are routed exact first, and the search's other best ends only
 when those come within `EXACT_MARGIN` of beating the far cut: on
 h616_lpddr4's LPDDR4 bus on four layers every one of the 57 cuts its two
-fanouts tried lost, each after up to seven exact routes at the work limit.
-With one each, that bus's first winding took 151 s for 436, and the two-end
-bus's cuts and their outcomes are the same, round for round. A wound state
-of 300 crossings still runs its one exact route to the limit.
+fanouts tried lost, each after up to seven exact routes, then run to the
+work limit. With one each, that bus's first winding took 151 s for 436, and
+the two-end bus's cuts and their outcomes are the same, round for round.
 
 **Scored in Rust** (`ends_kernel.py`, `grid_router.EndsKernel`). On more
 routing layers than two the model's estimate -- the objective its searches

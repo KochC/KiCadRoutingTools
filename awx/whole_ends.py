@@ -94,7 +94,7 @@ WIND_GAIN = 1.0           # ...a cut taken only when its ends lay fewer vias and
 #                           it, the model's own error on a wound plan (its rides, the stubs the fanout lays) -- h3 K28
 #                           took two cuts at 1.2 and 0.18 and laid 30 vias and 584 mm against the far cut's 32 and 544
 EXACT_WORK = 60.0         # CP-SAT's deterministic work limit for one exact route (a machine's deterministic time is
-#                           its own: H3 K51's best ends proved at 17 on a Mac and stopped unproved at 20 on Linux)
+#                           its own, so the limit stands far above a proof's: H3 K51's best ends prove within 1.1)
 _EXACT_MEMO = {}          # an exact route's model (its text's hash) -> its answer: one model is one answer, solved once in
 #                           the process -- a re-plan asks the first plan's models again (the two-end USB and Ethernet
 #                           bus's fanout: 7 of its 27 four-layer exact routes, at 3 to 14 s each)
@@ -102,7 +102,11 @@ _EXACT_MEMO = {}          # an exact route's model (its text's hash) -> its answ
 
 def _exact_solve(m):
     """(status, the value of each variable by index, or None) of the exact route's model `m`: one worker, the work
-    EXACT_WORK -- the same answer on every run. Memoised on the model itself (_EXACT_MEMO)"""
+    EXACT_WORK -- the same answer on every run -- searching CORE-GUIDED (the objective is a sum of the lanes' changes and
+    dropped vias, nearly all of them none: the bound raised by the cores of 'none here' that cannot all hold). The
+    default search routed h616_lpddr4's thirteen states of one choice in 963 s, five of them unproved; core-guided, in
+    192 s, every one proved, and in 29 s on orders (_crossing_orders) with the layers bools. Memoised on the model
+    itself (_EXACT_MEMO)"""
     import hashlib
     from ortools.sat.python import cp_model
     key = hashlib.sha1(str(m.Proto()).encode()).hexdigest()
@@ -110,10 +114,97 @@ def _exact_solve(m):
         sol = cp_model.CpSolver()
         sol.parameters.num_workers = 1
         sol.parameters.max_deterministic_time = EXACT_WORK
+        sol.parameters.optimize_with_core = True
         r = sol.Solve(m)
         _EXACT_MEMO[key] = (r, [sol.Value(m.GetIntVarFromProtoIndex(i)) for i in range(len(m.Proto().variables))]
                             if r in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None)
     return _EXACT_MEMO[key]
+
+
+def _crossing_orders(m, lanes, Ln, X):
+    """(before, act) of an exact route's model `m` on its crossings X (the inverted pairs of the order Ln), ordered
+    WITHOUT positions: a bool per fully inverted triple orders its three crossings (the braid triple rule: ij, ik, jk
+    or the reverse), a triple of two inversions its two, and each lane's crossings, so ordered, transitively
+    (consistent on every triple, a lane's order is an arrangement's: Goodman and Pollack's local sequences). Each
+    lane's EXACT_KMAX changes act[k] (in turn: act[k] needs act[k - 1]) and before[(lane, crossing)][k], change k
+    before the crossing, never falling along the lane's order. Positions (an integer per crossing, and per change)
+    held one order in every relabelling of them: thirteen states of a choice of h616_lpddr4's routed in 192 s on
+    positions, 99 s on orders"""
+    Xs = set(X)
+    rel = {}                            # (lane, p, q): its crossing with p before its crossing with q
+    neg = lambda x: (not x) if isinstance(x, bool) else x.Not()
+
+    def order(l_, p, q, lit):
+        rel[(l_, p, q)], rel[(l_, q, p)] = lit, neg(lit)
+    for i, j, k in itertools.combinations(Ln, 3):
+        ij, ik, jk = (i, j) in Xs, (i, k) in Xs, (j, k) in Xs
+        if ij and ik and jk:
+            b_ = m.NewBoolVar('')       # ij < ik < jk, else jk < ik < ij
+            order(i, j, k, b_); order(j, i, k, b_); order(k, i, j, b_)
+        elif ij and ik:
+            order(i, j, k, True)
+        elif ik and jk:
+            order(k, j, i, True)
+
+    def clause(lits):
+        if not any(x is True for x in lits):
+            m.AddBoolOr([x for x in lits if x is not False])
+    ev = {l_: [] for l_ in lanes}
+    for key_ in X:
+        for l_ in key_:
+            ev[l_].append(key_)
+    other = lambda l_, key_: key_[1] if key_[0] == l_ else key_[0]
+    before, acts = {}, {}
+    for l_ in lanes:
+        ps = [other(l_, key_) for key_ in ev[l_]]
+        for p, q, r in itertools.combinations(ps, 3):
+            x, y, z = rel[(l_, p, q)], rel[(l_, q, r)], rel[(l_, p, r)]
+            if not all(isinstance(v, bool) for v in (x, y, z)):
+                clause([neg(x), neg(y), z]); clause([x, y, neg(z)])
+        act = [m.NewBoolVar('') for _ in range(EXACT_KMAX)]
+        for k in range(1, EXACT_KMAX):
+            m.AddImplication(act[k], act[k - 1])
+        for key_ in ev[l_]:
+            bits = [m.NewBoolVar('') for _ in range(EXACT_KMAX)]
+            for k in range(EXACT_KMAX):
+                m.AddImplication(bits[k], act[k])
+                if k:
+                    m.AddImplication(bits[k], bits[k - 1])
+            before[(l_, key_)] = bits
+        for k1, k2 in itertools.combinations(ev[l_], 2):
+            r_ = rel[(l_, other(l_, k1), other(l_, k2))]
+            for k in range(EXACT_KMAX):
+                clause([neg(r_), before[(l_, k1)][k].Not(), before[(l_, k2)][k]])
+                clause([r_, before[(l_, k2)][k].Not(), before[(l_, k1)][k]])
+        acts[l_] = act
+    return before, acts
+
+
+def _clique_bound(m, act, lanes, X, NL):
+    """each maximal clique of an exact route's crossing graph (lanes every two of which cross) past NL lanes: that many
+    of them change layer at least (`act`: each lane's changes), for lanes that keep one layer and all cross need a
+    layer each. The graph is a permutation's, so perfect: without those cliques its lanes could keep a layer each.
+    Redundant, the colouring's pigeonhole, which the core-guided search otherwise proves by search -- and on
+    h616_lpddr4's thirteen models of one choice, under one of five solver seeds, did not within EXACT_WORK (a bound
+    stuck at its least); with it, all thirteen proved under each of the five"""
+    ix = {l_: i for i, l_ in enumerate(lanes)}
+    nb = {l_: set() for l_ in lanes}
+    for a, b in X:
+        nb[a].add(b); nb[b].add(a)
+    srt = lambda S: sorted(S, key=ix.get)  # (lane order, never a set's: the same model on every run)
+
+    def bk(R, P, Q):                    # (Bron and Kerbosch's, pivoting)
+        if not P and not Q:
+            if len(R) > NL:
+                m.Add(sum(act[l_][0] for l_ in srt(R)) >= len(R) - NL)
+            return
+        u = max(srt(P | Q), key=lambda v: len(nb[v] & P))
+        for v in srt(P - nb[u]):
+            bk(R | {v}, P & nb[v], Q & nb[v])
+            P, Q = P - {v}, Q | {v}
+    bk(set(), set(lanes), set())
+
+
 LOAD_OK = 0.5             # a lane's congestion on the trunk (score) the solve takes freely ...
 W_CONG = 20.0             # ... past it, vias per the square of the overload
 X_TRUNK = 0.2             # a crossing on the trunk, in vias
@@ -1398,11 +1489,12 @@ class Ends:
 
     def exact_route_nl(self, state, lanes, kp, kd, ends, sv, xo, npair, sep=()):
         """(route vias, nets over two, changes per lane, vias dropped per lane) of a state EXACT on its orders on MORE
-        ROUTING LAYERS THAN TWO -- the whole solve's N-layer model without its lengths: every inverted pair crossing once,
-        the braid triple rule, each lane's runs between its changes on one layer each (y), two crossing lanes on
-        different layers there, a fixed end's run on its layer and a via end's on any (its via dropped on its neck's),
-        an opposite-hands pair a change at least, two via ends whose runs meet (`sep`, end_clashes) on two layers --
-        CP-SAT on the solve's objective (nets over two first, then vias).
+        ROUTING LAYERS THAN TWO -- the whole solve's N-layer model without its lengths: every inverted pair crossing once
+        in an order (_crossing_orders), each lane's runs between its changes on one layer each (y, a bool a layer), two
+        crossing lanes on different layers there, a fixed end's run on its layer and a via end's on any (its via dropped
+        on its neck's), an opposite-hands pair a change at least, two via ends whose runs meet (`sep`, end_clashes) on
+        two layers -- CP-SAT on the solve's objective (nets over two first, then vias). All of it bools: the layers as
+        integers (an element of y at the count of changes before each crossing) took 99 s where these take 29.
         One worker, a deterministic work limit; None when it finds no plan in that work"""
         key = ('nl', self.wcut) + tuple(sorted(state.items()))
         if key in self._xroute:
@@ -1417,72 +1509,52 @@ class Ends:
         fi = {l_: i for i, l_ in enumerate(Fn)}
         X = [(a, b) for a, b in itertools.combinations(Ln, 2) if (li[a] < li[b]) == (fi[a] > fi[b])]
         m = cp_model.CpModel()
-        H = 2 * len(X) + 2
-        t = {k: m.NewIntVar(1, H, '') for k in X}
-        for i, j, k in itertools.combinations(Ln, 3):
-            ij, ik, jk = (i, j) in t, (i, k) in t, (j, k) in t
-            if ij and ik and jk:
-                b_ = m.NewBoolVar('')
-                m.Add(t[(i, j)] < t[(i, k)]).OnlyEnforceIf(b_); m.Add(t[(i, k)] < t[(j, k)]).OnlyEnforceIf(b_)
-                m.Add(t[(j, k)] < t[(i, k)]).OnlyEnforceIf(b_.Not()); m.Add(t[(i, k)] < t[(i, j)]).OnlyEnforceIf(b_.Not())
-            elif ij and ik:
-                m.Add(t[(i, j)] < t[(i, k)])
-            elif ik and jk:
-                m.Add(t[(j, k)] < t[(i, k)])
-        ev = {l_: [k for k in X if l_ in k] for l_ in lanes}
+        before, acts = _crossing_orders(m, lanes, Ln, X)
+        ys, drops, cost = {}, {}, []
         for l_ in lanes:
-            if len(ev[l_]) > 1:
-                m.AddAllDifferent([t[k] for k in ev[l_]])
-        before, ys, acts, drops, cost = {}, {}, {}, {}, []
-        for l_ in lanes:
-            cs = [m.NewIntVar(0, H + 1, '') for _ in range(EXACT_KMAX)]
-            act = [m.NewBoolVar('') for _ in range(EXACT_KMAX)]
+            act = acts[l_]
+            y = [[m.NewBoolVar('') for _ in range(self.NL)] for _ in range(EXACT_KMAX + 1)]
+            for k in range(EXACT_KMAX + 1):
+                m.AddExactlyOne(y[k])           # (y[k][q]: the run after change k on layer q)
             for k in range(EXACT_KMAX):
-                m.Add(cs[k] <= H).OnlyEnforceIf(act[k]); m.Add(cs[k] == H + 1).OnlyEnforceIf(act[k].Not())
-                if k:
-                    m.Add(cs[k] > cs[k - 1]).OnlyEnforceIf(act[k]); m.AddImplication(act[k], act[k - 1])
-            for key_ in ev[l_]:
-                bits = []
-                for k in range(EXACT_KMAX):
-                    bb = m.NewBoolVar('')
-                    m.Add(cs[k] < t[key_]).OnlyEnforceIf(bb); m.Add(cs[k] > t[key_]).OnlyEnforceIf([bb.Not(), act[k]])
-                    m.AddImplication(bb, act[k]); bits.append(bb)
-                before[(l_, key_)] = bits
-            y = [m.NewIntVar(0, self.NL - 1, '') for _ in range(EXACT_KMAX + 1)]
+                for q in range(self.NL):        # a change to another layer; none, the same one
+                    m.AddBoolOr([act[k], y[k][q].Not(), y[k + 1][q]])
+                    m.AddBoolOr([act[k], y[k][q], y[k + 1][q].Not()])
+                    m.AddBoolOr([act[k].Not(), y[k][q].Not(), y[k + 1][q].Not()])
             dr_ = []
             for y_e, (fx, nk, ok_) in ((y[0], ends[l_][0]), (y[EXACT_KMAX], ends[l_][1])):
                 if fx is not None:
-                    m.Add(y_e == fx)
+                    m.Add(y_e[fx] == 1)
                     continue
                 for q in range(self.NL):
                     if q not in ok_:
-                        m.Add(y_e != q)          # (a layer its runs cannot lie on)
+                        m.Add(y_e[q] == 0)      # (a layer its runs cannot lie on)
                 if nk is not None and nk in ok_:
-                    d_ = m.NewBoolVar('')
-                    m.Add(y_e == nk).OnlyEnforceIf(d_); m.Add(y_e != nk).OnlyEnforceIf(d_.Not())
-                    dr_.append(d_)
-            for k in range(EXACT_KMAX):
-                m.Add(y[k + 1] != y[k]).OnlyEnforceIf(act[k]); m.Add(y[k + 1] == y[k]).OnlyEnforceIf(act[k].Not())
+                    dr_.append(y_e[nk])
             if xo.get(l_):
                 m.Add(act[0] == 1)              # an opposite-hands pair crosses over at a dive
-            ys[l_], acts[l_], drops[l_] = y, act, dr_
+            ys[l_], drops[l_] = y, dr_
             n_ = sum(act)
             ov = m.NewIntVar(0, EXACT_KMAX + 8, '')
             m.Add(ov >= sv[l_] + n_ - sum(dr_) - VIA_PREF)
             cost.append(int(W_OVER) * ov + npair[l_] * (n_ - sum(dr_)))
         for (la_, ka_), (lb_, kb_) in sep:
             if la_ in ys and lb_ in ys:
-                m.Add(ys[la_][0 if ka_ == 0 else EXACT_KMAX] != ys[lb_][0 if kb_ == 0 else EXACT_KMAX])
+                for q in range(self.NL):
+                    m.AddBoolOr([ys[la_][0 if ka_ == 0 else EXACT_KMAX][q].Not(),
+                                 ys[lb_][0 if kb_ == 0 else EXACT_KMAX][q].Not()])
+        lay = {}
+        for (l_, key_), bits in before.items():
+            on = [m.NewBoolVar('') for _ in range(self.NL)]     # (on[q]: the lane on q at the crossing)
+            for k in range(EXACT_KMAX + 1):
+                at = ([bits[k - 1].Not()] if k else []) + ([bits[k]] if k < EXACT_KMAX else [])
+                for q in range(self.NL):
+                    m.AddBoolOr(at + [ys[l_][k][q].Not(), on[q]])
+            lay[(l_, key_)] = on
         for key_ in X:
-            a, b = key_
-            la = []
-            for l_ in (a, b):
-                i_ = m.NewIntVar(0, EXACT_KMAX, '')
-                m.Add(i_ == sum(before[(l_, key_)]))
-                L_ = m.NewIntVar(0, self.NL - 1, '')
-                m.AddElement(i_, ys[l_], L_)
-                la.append(L_)
-            m.Add(la[0] != la[1])
+            for q in range(self.NL):
+                m.AddBoolOr([lay[(key_[0], key_)][q].Not(), lay[(key_[1], key_)][q].Not()])
+        _clique_bound(m, acts, lanes, X, self.NL)
         m.Minimize(sum(cost))
         _r, vals = _exact_solve(m)
         out = None
@@ -1496,7 +1568,7 @@ class Ends:
 
     def exact_route(self, state, lanes, kp, kd, tl, dl, sv, xo, npair):
         """(route vias, nets over two, changes per lane) of a state EXACT on its orders: the whole solve's order model
-        without its lengths -- every inverted pair crossing once at a position, the braid triple rule, each lane's
+        without its lengths -- every inverted pair crossing once in an order (_crossing_orders), each lane's
         changes between its crossings, two crossing lanes on different layers there, an opposite-hands pair crossed
         over at a dive -- CP-SAT on the solve's own objective (nets over two vias first, then vias, a pair's change two):
         its optimum, or the best plan it finds within its work limit. Two lanes at one place round a box (an F end stacked over a B one) are taken in the order
@@ -1515,45 +1587,17 @@ class Ends:
         fi = {l_: i for i, l_ in enumerate(Fn)}
         X = [(a, b) for a, b in itertools.combinations(Ln, 2) if (li[a] < li[b]) == (fi[a] > fi[b])]
         m = cp_model.CpModel()
-        H = 2 * len(X) + 2
-        t = {k: m.NewIntVar(1, H, '') for k in X}
-        for i, j, k in itertools.combinations(Ln, 3):
-            ij, ik, jk = (i, j) in t, (i, k) in t, (j, k) in t
-            if ij and ik and jk:
-                b_ = m.NewBoolVar('')
-                m.Add(t[(i, j)] < t[(i, k)]).OnlyEnforceIf(b_); m.Add(t[(i, k)] < t[(j, k)]).OnlyEnforceIf(b_)
-                m.Add(t[(j, k)] < t[(i, k)]).OnlyEnforceIf(b_.Not()); m.Add(t[(i, k)] < t[(i, j)]).OnlyEnforceIf(b_.Not())
-            elif ij and ik:
-                m.Add(t[(i, j)] < t[(i, k)])
-            elif ik and jk:
-                m.Add(t[(j, k)] < t[(i, k)])
-        ev = {l_: [k for k in X if l_ in k] for l_ in lanes}
-        for l_ in lanes:
-            if len(ev[l_]) > 1:
-                m.AddAllDifferent([t[k] for k in ev[l_]])
+        before, act_of = _crossing_orders(m, lanes, Ln, X)
         F_ = lambda L: int(L == 'B.Cu')
-        before, act_of, cost = {}, {}, []
+        cost = []
         for l_ in lanes:
-            cs = [m.NewIntVar(0, H + 1, '') for _ in range(EXACT_KMAX)]
-            act = [m.NewBoolVar('') for _ in range(EXACT_KMAX)]
-            for k in range(EXACT_KMAX):
-                m.Add(cs[k] <= H).OnlyEnforceIf(act[k]); m.Add(cs[k] == H + 1).OnlyEnforceIf(act[k].Not())
-                if k:
-                    m.Add(cs[k] > cs[k - 1]).OnlyEnforceIf(act[k]); m.AddImplication(act[k], act[k - 1])
-            for key_ in ev[l_]:
-                bits = []
-                for k in range(EXACT_KMAX):
-                    bb = m.NewBoolVar('')
-                    m.Add(cs[k] < t[key_]).OnlyEnforceIf(bb); m.Add(cs[k] > t[key_]).OnlyEnforceIf([bb.Not(), act[k]])
-                    m.AddImplication(bb, act[k]); bits.append(bb)
-                before[(l_, key_)] = bits
+            act = act_of[l_]
             m.AddBoolXOr(act + ([m.NewConstant(1)] if tl[l_] == dl[l_] else []))
             if xo.get(l_):
                 m.Add(act[0] == 1)              # an opposite-hands pair crosses over at a dive
             n_ = sum(act)
             ov = m.NewIntVar(0, EXACT_KMAX + 8, '')
             m.Add(ov >= sv[l_] + n_ - VIA_PREF)
-            act_of[l_] = act
             cost.append(int(W_OVER) * ov + npair[l_] * n_)
         for key_ in X:
             a, b = key_
@@ -1561,6 +1605,7 @@ class Ends:
             if F_(tl[a]) ^ F_(tl[b]):
                 lits = lits + [m.NewConstant(1)]
             m.AddBoolXOr(lits)
+        _clique_bound(m, act_of, lanes, X, 2)
         m.Minimize(sum(cost))
         _r, vals = _exact_solve(m)
         out = None
