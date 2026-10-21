@@ -38,7 +38,9 @@ import collections
 import contextlib
 import dataclasses
 import gc
+import heapq
 import io
+import itertools
 import math
 import os
 import sys
@@ -816,6 +818,16 @@ def build_menus(pcb, ref, bus, others, other_layers, far=None, drops=(), climb=C
             cache[key] = te.build_obstacles(pcb, nid, {nid}, layer, margin=sz['cl'] + sz['tw'] / 2,
                                             skip_refs=skip if via else ())
         return cache[key]
+    seg_memo = {}
+
+    def seg_ok(nid, layer, a, b):
+        # (obs(nid, layer).seg_clear(a, b), each leg asked once: a ball's climbs share their first stretches, and a
+        # run on RUN is asked on each of its layers by enumerate_moves and again for its runs_on)
+        key = (nid, layer, a[0], a[1], b[0], b[1])
+        ok = seg_memo.get(key)
+        if ok is None:
+            ok = seg_memo[key] = obs(nid, layer).seg_clear(a, b)
+        return ok
     items, menu, balls, dmenu = {}, {}, {}, {}
     bus_layers = bus_route_layers(pcb)
     rls = run_layers()
@@ -869,8 +881,8 @@ def build_menus(pcb, ref, bus, others, other_layers, far=None, drops=(), climb=C
 
         def clear(a, b, L, _n=p.net_id, _runs=runs):
             if L == RUN:
-                return any(obs(_n, L_).seg_clear(a, b) for L_ in _runs)
-            return obs(_n, L).seg_clear(a, b)
+                return any(seg_ok(_n, L_, a, b) for L_ in _runs)
+            return seg_ok(_n, L, a, b)
         centre = (p.global_x, p.global_y)
         # (a via is a barrel through EVERY copper layer, whatever layers the move runs on -- as a drop's is,
         # _via_clear: checked on the move's own layers alone, an other net's dog-bone via on F/B stood on the bus's
@@ -901,7 +913,7 @@ def build_menus(pcb, ref, bus, others, other_layers, far=None, drops=(), climb=C
                     kept.append(m)
                     continue
                 m.runs_on = tuple(L_ for L_ in runs
-                                  if all(obs(p.net_id, L_).seg_clear(a, b) for a, b, l_ in m.legs if l_ == RUN))
+                                  if all(seg_ok(p.net_id, L_, a, b) for a, b, l_ in m.legs if l_ == RUN))
                 if m.runs_on:
                     kept.append(m)
             moves = kept
@@ -1349,17 +1361,25 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
 
     def exclude(lit, others):
         # `lit` excludes every option of `others`: the groups holding several of them a row each, the most first
-        # (exact: a group's members never stand together past its cap anyway), the rest a clause each
+        # (exact: a group's members never stand together past its cap anyway), the rest a clause each. Each group's
+        # count of them is kept as rows take them, the most (the lowest group first among equals) off a heap whose
+        # stale counts are passed over -- the same rows in the same order as counting them all again for every row
         rem = set(others)
-        while rem:
-            cnt = collections.Counter(gi for x in rem for gi in memb.get(x, ()))
-            best = max(cnt.items(), key=lambda t: (t[1], -t[0]), default=None)
-            if best is None or best[1] < 2:
-                break
-            g, cap = cover[best[0]]
+        cnt = collections.Counter(itertools.chain.from_iterable(memb.get(x, ()) for x in rem))
+        heap = [(-n, gi) for gi, n in cnt.items() if n >= 2]
+        heapq.heapify(heap)
+        while rem and heap:
+            n, gi = heapq.heappop(heap)
+            if -n != cnt[gi]:
+                continue
+            g, cap = cover[gi]
             hit = [x for x in g if x in rem]
             mdl.Add(cap * lit + sum(v[k][i] for k, i in hit) <= cap)
             rem.difference_update(hit)
+            for gj, d_ in collections.Counter(itertools.chain.from_iterable(memb.get(x, ()) for x in hit)).items():
+                cnt[gj] -= d_
+                if cnt[gj] >= 2:
+                    heapq.heappush(heap, (-cnt[gj], gj))
         for k, i in sorted(rem):
             mdl.AddBoolOr([lit.Not(), v[k][i].Not()])
     # every move of A against every move of B: y_A covers A's moves, y_B B's, and a move on both sides stands with

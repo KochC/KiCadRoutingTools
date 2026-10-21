@@ -151,7 +151,8 @@ def conflict_groups(menu, stack=True, stack_pitch=None, via_r=None, reach_extra=
     else:
         def reach(m):
             return via_r(m) + reach_extra
-    R_max = max((reach(m) for mem in by_site.values() for _k, _i, m in mem), default=sm._VIA_REACH)
+    reach_of = {(k, i): reach(m) for mem in by_site.values() for k, i, m in mem}   # (once a move, not once a span)
+    R_max = max(reach_of.values(), default=sm._VIA_REACH)
     span_c = int(R_max * 10) + 2                          # 0.1 mm cells either side that can hold a reached lane
     coord_index = collections.defaultdict(list)          # (axis, 0.1 mm cell) -> lane coordinates
     by_coord = collections.defaultdict(list)
@@ -162,19 +163,19 @@ def conflict_groups(menu, stack=True, stack_pitch=None, via_r=None, reach_extra=
     for sk, mem in by_site.items():
         for axis in ('row', 'col'):
             perp = sk[1] if axis == 'row' else sk[0]
+            # each of the site's moves: its via across the lane (p_), along it (al), and its reach
+            at = [((k, i),) + ((m.site[1], m.site[0]) if axis == 'row' else tuple(m.site)) + (reach_of[(k, i)],)
+                  for k, i, m in mem]
             cand = set()
             for dc in range(-span_c, span_c + 1):
                 cand.update(coord_index.get((axis, int(perp * 10) + dc), ()))
             for c in cand:
+                near = [(ki, al, R_) for ki, p_, al, R_ in at if abs(p_ - c) < R_]    # (the lane within its reach)
+                if not near:
+                    continue
                 reached = collections.defaultdict(set)   # frozenset of the site's moves -> the runs' moves
                 for s in by_coord[(axis, c)]:
-                    who = []
-                    for k, i, m in mem:
-                        sx, sy = m.site
-                        p_, al = (sy, sx) if axis == 'row' else (sx, sy)
-                        R_ = reach(m)
-                        if abs(p_ - c) < R_ and s[3] - R_ < al < s[4] + R_:
-                            who.append((k, i))
+                    who = [ki for ki, al, R_ in near if s[3] - R_ < al < s[4] + R_]
                     if who:
                         reached[frozenset(who)].add(s[5])
                 for who, runs in reached.items():

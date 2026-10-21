@@ -111,10 +111,11 @@ def pair_nets(pcb, src, dst):
     # (coherent_nets.admissible: two ends on the two arrays, plus a pad
     # served under a ball or a pair's termination part the pair passes
     # through -- the zynq's R20 on CK, 2026-09-20)
+    # (the two parts first: admissible is the costly test, and a board's other nets never need it)
     from coherent_nets import admissible
     return sorted(n.name for n in pcb.nets.values()
-                  if admissible(pcb, n)
-                  and {src, dst} <= {p.component_ref for p in n.pads}
+                  if {src, dst} <= {p.component_ref for p in n.pads}
+                  and admissible(pcb, n)
                   and {p.component_ref for p in n.pads if len(pcb.footprints.get(p.component_ref).pads) > 2
                        if pcb.footprints.get(p.component_ref)} <= {src, dst})
 
