@@ -7,7 +7,11 @@ from __future__ import annotations
 #: the board. Read by krt_registry.py -- by AST, never imported.
 KRT_TOOL = {'scope': [], 'kind': 'instrument'}
 
+import collections
 import functools
+import hashlib
+import pickle
+import threading
 from array import array
 import os
 import re
@@ -7200,23 +7204,60 @@ def parse_kicad_pcb(filepath: str, guide_layer: str = "User.1",
 
     Returns:
         PCBData object containing all parsed data
+
+    A board whose text was parsed before in this process (the same path, the
+    same bytes, the same layers) is answered from that parse (`_BOARD_MEMO`):
+    a copy of its own, as a fresh parse would be.
     """
     global _PARSE_MEMO
+    content = read_board_text(filepath)
+    key = (os.path.abspath(filepath) if filepath else "", guide_layer,
+           keepout_layer,
+           hashlib.blake2b(content.encode('utf-8', 'surrogatepass'),
+                           digest_size=20).digest())
+    with _BOARD_MEMO_LOCK:
+        kept = _BOARD_MEMO.get(key)
+        if kept is not None:
+            _BOARD_MEMO.move_to_end(key)
+    if kept is not None:
+        return pickle.loads(kept)
     outer = _PARSE_MEMO is None
     if outer:
         _PARSE_MEMO = {'live': {}, 'masked_from': {}, 'ends': {}, 'shapes': {}}
     try:
-        return _parse_kicad_pcb(filepath, guide_layer, keepout_layer)
+        pcb = _parse_kicad_pcb(filepath, guide_layer, keepout_layer, content)
     finally:
         if outer:
             _PARSE_MEMO = None
         release_text_caches()
+    try:
+        kept = pickle.dumps(pcb, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        return pcb
+    with _BOARD_MEMO_LOCK:
+        _BOARD_MEMO[key] = kept
+        while len(_BOARD_MEMO) > _BOARD_MEMO_SIZE:
+            _BOARD_MEMO.popitem(last=False)
+    return pcb
+
+
+#: Boards parsed in this process, by what a parse reads: the path (the
+#: PCBData's `source_path`), the guide and keepout layers, and a hash of the
+#: text -- never the file's mtime, which a rewrite within its clock tick
+#: leaves unchanged. Each is kept pickled, and every caller gets its own copy
+#: (pickle.loads keeps the pads a net and its footprint share as one object),
+#: since callers add copper to the board they are handed. A bus step reads its
+#: unchanged fanout boards over and over: sdi_mipi_conv's DDR3 fanout parsed 33
+#: boards in 62 s, 28 of them a file parsed before. A 20 MB board: its parse
+#: 1.2 s, the hash 12 ms, the copy 6 ms. Warnings a parse prints (duplicate
+#: references) are printed at its first parse only.
+_BOARD_MEMO: "collections.OrderedDict[tuple, bytes]" = collections.OrderedDict()
+_BOARD_MEMO_LOCK = threading.Lock()
+_BOARD_MEMO_SIZE = 16
 
 
 def _parse_kicad_pcb(filepath: str, guide_layer: str,
-                     keepout_layer: str) -> PCBData:
-    content = read_board_text(filepath)
-
+                     keepout_layer: str, content: str) -> PCBData:
     kicad_version = detect_kicad_version(content)
     if 0 < kicad_version < FIRST_SUPPORTED_BOARD_VERSION:
         raise UnsupportedBoardFormat(
