@@ -1496,15 +1496,20 @@ class Ends:
         two layers -- CP-SAT on the solve's objective (nets over two first, then vias). All of it bools: the layers as
         integers (an element of y at the count of changes before each crossing) took 99 s where these take 29.
         One worker, a deterministic work limit; None when it finds no plan in that work"""
-        key = ('nl', self.wcut) + tuple(sorted(state.items()))
-        if key in self._xroute:
-            return self._xroute[key]
         from ortools.sat.python import cp_model
         idx = {l_: i for i, l_ in enumerate(lanes)}
         rkd = {l_: i for i, l_ in enumerate(sorted(lanes, key=lambda l_: kd[l_]))}
         rkp = {l_: i for i, l_ in enumerate(sorted(lanes, key=lambda l_: kp[l_]))}
         Ln = sorted(lanes, key=lambda l_: (round(kp[l_][0], 3), rkd[l_], idx[l_]))
         Fn = sorted(lanes, key=lambda l_: (round(kd[l_][0], 3), rkp[l_], idx[l_]))
+        # (kept by what the model is built from, never by the state alone: _score scores one state at each far-face cut
+        # that ties, each cut with its own destination order, crossings and estimate. Kept by the state and the winding
+        # cut, a tied cut's route was the first cut's answer -- on zynq_ad9364's DDR fanout, all 38 times one was met)
+        key = ('nl', self.NL, tuple(lanes), tuple(Ln), tuple(Fn),
+               tuple((l_, tuple((f_, n_, None if ok_ is None else tuple(sorted(ok_))) for f_, n_, ok_ in ends[l_]),
+                      sv[l_], xo.get(l_), npair[l_]) for l_ in lanes), tuple(sep))
+        if key in self._xroute:
+            return self._xroute[key]
         li = {l_: i for i, l_ in enumerate(Ln)}
         fi = {l_: i for i, l_ in enumerate(Fn)}
         X = [(a, b) for a, b in itertools.combinations(Ln, 2) if (li[a] < li[b]) == (fi[a] > fi[b])]
@@ -1574,15 +1579,17 @@ class Ends:
         its optimum, or the best plan it finds within its work limit. Two lanes at one place round a box (an F end stacked over a B one) are taken in the order
         that does not cross them there. One worker and a deterministic work limit: the same answer on every machine;
         None when it finds no plan in that work (the estimate stands)"""
-        key = (self.wcut,) + tuple(sorted(state.items()))
-        if key in self._xroute:
-            return self._xroute[key]
         from ortools.sat.python import cp_model
         idx = {l_: i for i, l_ in enumerate(lanes)}
         rkd = {l_: i for i, l_ in enumerate(sorted(lanes, key=lambda l_: kd[l_]))}
         rkp = {l_: i for i, l_ in enumerate(sorted(lanes, key=lambda l_: kp[l_]))}
         Ln = sorted(lanes, key=lambda l_: (round(kp[l_][0], 3), rkd[l_], idx[l_]))
         Fn = sorted(lanes, key=lambda l_: (round(kd[l_][0], 3), rkp[l_], idx[l_]))
+        # (kept by what the model is built from, as exact_route_nl's: a far-face cut that ties has orders of its own)
+        key = ('2l', tuple(lanes), tuple(Ln), tuple(Fn),
+               tuple((l_, tl[l_], dl[l_], sv[l_], xo.get(l_), npair[l_]) for l_ in lanes))
+        if key in self._xroute:
+            return self._xroute[key]
         li = {l_: i for i, l_ in enumerate(Ln)}
         fi = {l_: i for i, l_ in enumerate(Fn)}
         X = [(a, b) for a, b in itertools.combinations(Ln, 2) if (li[a] < li[b]) == (fi[a] > fi[b])]
