@@ -83,6 +83,13 @@ SHARE_TOL = 1e-3           # two vias of one net this close, at one size, are on
 # batch is a task per thread. zynq three layers, U1 / U5: four threads and 20 batches 709 / 827 MB for the solve, two
 # and 60 batches 552 / 755 MB at the same cost (97 worse on U1's 73,631, 16 better on U5's 34,812) in 17 s more
 SOLVE_BATCHES = int(awx_settings.get('JOINT_SOLVE_BATCHES', '60'))
+# ...and where phase 2 starts from the array's last plan in the process (_LAST_PLAN), laid out whole: the search starts
+# at a plan's cost, not at phase 1's (any plan serving every ball, no cost: h616_lpddr4's U1 302,608 against 54,941
+# after 60 batches), and in 30 batches stands about where 60 from phase 1's do -- h616_lpddr4's bus step's six such
+# plans 1,350 worse to 460 better (a via is 300), zynq_ad9364's DDR two the same and 10 worse. The bus steps' joint
+# plans: h616_lpddr4 519 -> 386 s, zynq_ad9364 580 -> 454, sdi_mipi_conv 740 -> 437
+SOLVE_BATCHES_STARTED = 30
+START_WORK = 30.0          # deterministic work to lay that start out whole (one worker)
 SOLVE_WORKERS = 2
 # phase 1's deterministic time, per question asked. At 120 the zynq U1 plane tier ran out of it on three layers and
 # left six drops unplanned; at 240 it proved every drop (in 60 s)
@@ -1034,6 +1041,20 @@ def build_menus(pcb, ref, bus, others, other_layers, far=None, drops=(), climb=C
 
 _SOLVED = {}         # a plan's model, with what phase 2 prices -> both phases' answers (plan_array: one model, one answer)
 _SOLVING = {}        # ...and the models being solved (a future each): a plan meeting one waits for its answer
+# each array's last plan in the process, by ball: the option it took, by its copper (_opt_sig) -- recorded where the
+# plan is made (_finish, on the thread that asks, in the program's order), so the next plan of the array starts from it
+_LAST_PLAN = {}
+
+
+def _opt_sig(kind, o, pc):
+    """an option by what it is -- its kind, its copper (legs, vias and their sizes) to the micron, and an escape's own
+    shape, face, layer, exit, climb and street (a surface escape has no legs): the same option in another plan's menu
+    of the array"""
+    r_ = lambda q: (round(q[0], 3), round(q[1], 3)) if q is not None else None
+    sh = (o.kind, o.direction, o.layer, r_(o.exit_pt), r_(o.site), o.climb, o.street) if kind == 'escape' else \
+        (getattr(o, 'layer', None), bool(getattr(o, 'inpad', False)))
+    return (kind, sh, tuple((r_(a), r_(b), L) for a, b, L in pc.legs),
+            tuple((r_(s[0]), round(s[1], 4), round(s[2], 4)) for s in pc.vias))
 
 
 def _solved(skey):
@@ -1079,7 +1100,8 @@ def _solved_key(mdl, ref, keys, served, items, bus_s, oth_s, drop_s, bm, rank, w
                 time_limit, batches, workers):
     """the key a plan's answers are kept by in _SOLVED: the model's bytes as phase 1 meets it (its options, conflicts and
     hints), hashed, with what the phases read beside it -- the tiers' balls, their ranks and weights, each option's cost,
-    the sites' vias, the work. None under a wall-clock limit, whose answer is not reproducible"""
+    the sites' vias, the work. None under a wall-clock limit, whose answer is not reproducible. (Not phase 2's start
+    from the array's last plan: the model's first answer is its answer, whatever plan of the array came before)"""
     if time_limit:
         return None
     import hashlib
@@ -1096,7 +1118,7 @@ def _solved_key(mdl, ref, keys, served, items, bus_s, oth_s, drop_s, bm, rank, w
     h.update(repr((ref, [(k, k in served, items[k][0] in bus_s, items[k][0] in oth_s, items[k][0] in drop_s,
                           rank.get(k), wt.get(k), cvals[k], [x.Index() for x in v[k]]) for k in keys],
                    legs, [u.Index() for u in site_used], C_VIA, P1_DET, rls, batches or SOLVE_BATCHES,
-                   workers or SOLVE_WORKERS, SUBSOLVERS, SUBSOLVERS_RUNS)).encode())
+                   workers or SOLVE_WORKERS, SUBSOLVERS, SUBSOLVERS_RUNS, SOLVE_BATCHES_STARTED)).encode())
     return h.hexdigest()
 
 
@@ -1658,6 +1680,16 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
     # it was, the answer is ready when the destination's done -- or, where its copper did reach the source's field, the
     # model differs and is solved (fanout_from_plan.joint_destination)
     cvals = {key: [cost(key, kind, o) for kind, o, _pc in opts[key]] for key in keys}
+    # (phase 2's start: each ball's option the array's last plan took, where this menu has it -- read here, on the thread
+    # that asks, so the plans of the array follow from one another in the program's order)
+    last_ = _LAST_PLAN.get(ref) or {}
+    start = {}
+    for key in keys:
+        g_ = last_.get(key)
+        if g_ is not None:
+            i0 = next((i for i, (kind, o_, pc) in enumerate(opts[key]) if _opt_sig(kind, o_, pc) == g_), None)
+            if i0 is not None:
+                start[key] = i0
     skey = _solved_key(mdl, ref, keys, served, items, bus_s, oth_s, drop_s, bm, rank, wt, cvals, v, site_used, rls,
                        time_limit, batches, workers)
     legs_ = {k for _b, kp, kn in bm.pairs for k in (kp, kn)}
@@ -1735,6 +1767,57 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
                 obj.append((w - cvals[key][i]) * v[key][i])
         obj += [-C_VIA * u for u in site_used]
         mdl.Maximize(sum(obj))
+        # STARTED from the array's last plan (`start`), where phase 1 held any ball: its options in place of phase 1's
+        # answer, laid out whole -- every hinted value held, the rest completed by one worker -- and then EVERY
+        # variable's hint, so the search has that plan from its first batch (an incomplete hint is not a plan: it
+        # started from the first feasibility jump's). Where a few of its options no longer stand together (h616's U2:
+        # the held berths' plan and the destination's escape, 3 of 183 balls), the most of it that does: a first plan
+        # keeping as many of them as it can (one worker, no presolve: 2 s), laid out whole in its turn. Where neither is
+        # a plan of this model, phase 1's answer as before
+        def lay_out(val):
+            mdl.ClearHints()
+            for key in keys:
+                for var in v[key]:
+                    mdl.AddHint(var, val(var))
+            sw = cp_model.CpSolver()
+            sw.parameters.num_workers = 1
+            sw.parameters.fix_variables_to_their_hinted_value = True
+            sw.parameters.stop_after_first_solution = True
+            sw.parameters.max_deterministic_time = START_WORK
+            return sw if sw.Solve(mdl) in (cp_model.OPTIMAL, cp_model.FEASIBLE) else None
+        sw = None
+        if held and start:
+            hv = dict(hint_vals)
+            for key, i0 in start.items():
+                for i, var in enumerate(v[key]):
+                    hv[var.Index()] = int(i == i0)
+            sw = lay_out(lambda var: hv[var.Index()])
+            if sw is None:
+                mdl.ClearHints()
+                for key, i0 in start.items():
+                    mdl.AddHint(v[key][i0], 1)
+                mdl.ClearObjective()
+                mdl.Maximize(sum(v[key][i0] for key, i0 in start.items()))
+                sa = cp_model.CpSolver()
+                sa.parameters.num_workers = 1
+                sa.parameters.cp_model_presolve = False
+                sa.parameters.stop_after_first_solution = True
+                sa.parameters.max_deterministic_time = START_WORK
+                st_a = sa.Solve(mdl)
+                mdl.ClearObjective()
+                mdl.Maximize(sum(obj))
+                if st_a in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                    sw = lay_out(sa.Value)
+            mdl.ClearHints()
+            if sw is not None:
+                for i_ in range(len(mdl.Proto().variables)):
+                    var = mdl.GetIntVarFromProtoIndex(i_)
+                    mdl.AddHint(var, sw.Value(var))
+            else:
+                for key in keys:
+                    for var in v[key]:
+                        mdl.AddHint(var, hint_vals[var.Index()])
+        started = sw is not None
         s_ = cp_model.CpSolver()
         # REPRODUCIBLE, as the whole solve is (whole_solve): stopped by a count of interleaved batches, the workers
         # sharing no clauses -- the same model gives the same answer (a wall-clock limit on eight workers gave two answers
@@ -1742,7 +1825,7 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
         # reproducible.
         s_.parameters.num_workers = workers or SOLVE_WORKERS
         s_.parameters.interleave_search = True
-        s_.parameters.max_num_deterministic_batches = batches or SOLVE_BATCHES
+        s_.parameters.max_num_deterministic_batches = batches or (SOLVE_BATCHES_STARTED if started else SOLVE_BATCHES)
         s_.parameters.share_glue_clauses = False
         s_.parameters.share_binary_clauses = False
         s_.parameters.subsolvers.extend(SUBSOLVERS_RUNS if rls else SUBSOLVERS)
@@ -1754,7 +1837,7 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
         ans = dict(held=list(held_keys), hint=hint_vals, st1=st1, tiers=list(tier_rep),
                    left_out=sorted(left_out, key=repr), let_go=list(let_go), st=st, vals=vals_, t_p1=t_p1,
                    bound=s_.BestObjectiveBound(), wall=s_.WallTime(), branches=s_.NumBranches(),
-                   conflicts_cp=s_.NumConflicts())
+                   conflicts_cp=s_.NumConflicts(), started=len(start) if started else 0)
         if skey is not None:
             _SOLVED[skey] = ans
         return ans
@@ -1770,6 +1853,10 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
                     if vals_[var.Index()]:
                         chosen[key] = opts[key][i][:2]
                         ci[key] = i
+            # (the array's last plan, for its next: each ball's option as the solve took it, over the balls an earlier
+            # plan of the array named and this one did not)
+            _LAST_PLAN.setdefault(ref, {}).update(
+                {key: _opt_sig(*opts[key][i]) for key, i in ci.items()})
         piece = {key: opts[key][ci[key]][2] for key in chosen}
         uncoloured = []
         if rls:
@@ -1935,6 +2022,7 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
             + f'served first {rep["phase1"]} in '
             f'{rep["phase1_secs"]} s' + (f', let go (a proved conflict) {rep["let_go"]}' if rep['let_go'] else '')
             + (' (the model planned before: its answer kept)' if kept else '')
+            + (f'; the cost from the array\'s last plan ({ans["started"]} balls)' if ans.get('started') else '')
             # (each tier's own status where one is not OPTIMAL: a tier out of its time is not held, and its balls are phase
             # 2's -- the line's FEASIBLE said only that an earlier tier held, and hid the plane tier that left six drops)
             + (f' (tiers {", ".join(f"{t} {n} {s}" for t, n, s in tier_rep)})'
