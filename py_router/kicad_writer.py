@@ -205,6 +205,27 @@ def _functional_footprint_spans(content: str):
     return spans
 
 
+def _block_end(content: str, start: int) -> int:
+    """The index just past the paren that closes the one at `start` (every
+    paren counted, as the walk it replaces counted them); `start` itself where
+    it never closes. Jumps from paren to paren rather than walking every
+    character: a 20 MB board's 98,000 `fp_line` blocks were most of what the
+    silkscreen pass cost once its spans stopped being rescanned."""
+    depth = 0
+    o = content.find('(', start)
+    c = content.find(')', start)
+    while c != -1:
+        if o != -1 and o < c:
+            depth += 1
+            o = content.find('(', o + 1)
+        else:
+            depth -= 1
+            if depth == 0:
+                return c + 1
+            c = content.find(')', c + 1)
+    return start
+
+
 def _in_any_span(pos: int, spans) -> bool:
     """Is `pos` inside one of `spans`? Linear; the list is one entry per
     pad-bearing footprint and the caller asks once per graphic primitive."""
@@ -242,16 +263,19 @@ def move_copper_graphics_to_silkscreen(content: str) -> str:
     """
     kept = 0
     count = 0
+    # The pad-bearing footprints' spans index the text a tag pass READS, which
+    # the pass before rewrote wherever it relocated something: each relocation
+    # grows the text by 3 bytes (F.Cu -> F.SilkS), so spans taken before it
+    # drift out of alignment. Measured: past ~33 relocated board-level logos a
+    # pad-bearing footprint's own land-pattern copper was relocated anyway --
+    # the exact deletion this gate exists to stop, and silently, because the
+    # "Kept ..." line drifts away with it. So they are taken when a pass first
+    # asks, and dropped after any pass that relocated something; a pass that
+    # relocated nothing hands on its text unchanged. (Rescanned for every tag,
+    # they were 4.0 of the 4.8 s this took on a 20 MB board that moved nothing.)
+    _keep_spans = None
     for tag in _COPPER_GRAPHIC_TAGS:
-        # RECOMPUTED per tag pass, not hoisted: this loop rewrites `content`
-        # at the end of every iteration and each relocation grows the text by
-        # 3 bytes (F.Cu -> F.SilkS), so spans taken once from the original
-        # text drift out of alignment from the second tag onward. Measured:
-        # past ~33 relocated board-level logos a pad-bearing footprint's own
-        # land-pattern copper was relocated anyway -- the exact deletion this
-        # gate exists to stop, and silently, because the "Kept ..." line
-        # drifts away with it.
-        _keep_spans = _functional_footprint_spans(content)
+        moved_before = count
         token = '(' + tag
         tlen = len(token)
         result_parts = []
@@ -266,16 +290,7 @@ def move_copper_graphics_to_silkscreen(content: str) -> str:
             if nxt and (nxt.isalnum() or nxt == '_'):
                 i = start + tlen
                 continue
-            depth = 0
-            end = start
-            for j in range(start, len(content)):
-                if content[j] == '(':
-                    depth += 1
-                elif content[j] == ')':
-                    depth -= 1
-                    if depth == 0:
-                        end = j + 1
-                        break
+            end = _block_end(content, start)
             block = content[start:end]
             layer_match = re.search(r'\(layer\s+"(F\.Cu|B\.Cu)"\)', block)
             # #337: a NET-TIED copper graphic is FUNCTIONAL copper (the router
@@ -283,23 +298,28 @@ def move_copper_graphics_to_silkscreen(content: str) -> str:
             # copper) -- relocating it to silk would DELETE a real connection and
             # re-expose the shorts #337 catches. Only net-less decoration (a
             # copper logo, net 0 / no net) is safe to move off copper.
-            net_match = re.search(r'\(net\s+(\d+)(?:\s+"([^"]*)")?\)', block)
-            net_tied = net_match and (int(net_match.group(1)) != 0
-                                      or (net_match.group(2) or '') != '')
-            # #369 A6: KiCad 10 boards reference nets by NAME only -- the
-            # numeric-first regex missed (net "GND") entirely, classing real
-            # net-tied copper as decoration and deleting the connection the
-            # router still models (#337 immutable-copper class).
-            if not net_tied:
-                name_match = re.search(r'\(net\s+"((?:[^"\\]|\\.)*)"\)', block)
-                net_tied = bool(name_match and name_match.group(1) != '')
-            if (layer_match and not net_tied and tag in _FP_MODELLED_TAGS
-                    and _in_any_span(start, _keep_spans)):
-                # #908: this footprint has pads, so its copper is the part's
-                # own land pattern, not decoration. Leave it on copper -- the
-                # parser models it, so nothing routes over it any more.
-                kept += 1
-                layer_match = None
+            net_tied = False
+            if layer_match:
+                net_match = re.search(r'\(net\s+(\d+)(?:\s+"([^"]*)")?\)', block)
+                net_tied = net_match and (int(net_match.group(1)) != 0
+                                          or (net_match.group(2) or '') != '')
+                # #369 A6: KiCad 10 boards reference nets by NAME only -- the
+                # numeric-first regex missed (net "GND") entirely, classing real
+                # net-tied copper as decoration and deleting the connection the
+                # router still models (#337 immutable-copper class).
+                if not net_tied:
+                    name_match = re.search(r'\(net\s+"((?:[^"\\]|\\.)*)"\)', block)
+                    net_tied = bool(name_match and name_match.group(1) != '')
+            if layer_match and not net_tied and tag in _FP_MODELLED_TAGS:
+                if _keep_spans is None:
+                    _keep_spans = _functional_footprint_spans(content)
+                if _in_any_span(start, _keep_spans):
+                    # #908: this footprint has pads, so its copper is the
+                    # part's own land pattern, not decoration. Leave it on
+                    # copper -- the parser models it, so nothing routes over
+                    # it any more.
+                    kept += 1
+                    layer_match = None
             if layer_match and not net_tied:
                 layer = layer_match.group(1)
                 new_layer = 'F.SilkS' if layer == 'F.Cu' else 'B.SilkS'
@@ -311,6 +331,8 @@ def move_copper_graphics_to_silkscreen(content: str) -> str:
             i = end
         result_parts.append(content[last_end:])
         content = ''.join(result_parts)
+        if count != moved_before:
+            _keep_spans = None
 
     if count > 0:
         print(f"  Moved {count} copper graphic(s)/logo(s) to silkscreen")
