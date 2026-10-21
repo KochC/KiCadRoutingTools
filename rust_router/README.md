@@ -311,6 +311,23 @@ src/
 
 ## Version History
 
+### 0.24.0 (2026-10-20)
+
+- **`EndsKernel`**: the whole route's ENDS ESTIMATE (`awx/whole_ends.py`,
+  `Ends._score` on more routing layers than two, one destination) and the
+  ends search's own loop (`Ends.search`: each improving change of one lane's
+  tooth or berth, one other lane ejected where it alone is in the way, sweep
+  after sweep), scored from tables `awx/ends_kernel.py` reads off a model once
+  -- each option's point, layer domain, legs, conflict keys and hands; each
+  tooth and berth's ride together; each pair of options' stacked exits and runs
+  met; the plane ways each option kills; the feedback's tables -- each state's
+  objective memoised in the kernel. Ported exactly: the same operations in the
+  same order as the Python, so the same doubles, Python's compensated float
+  `sum()` (3.12 and later) included. zynq7020_som's first ends choice: 374 000
+  states, 200 s in Python, 6.4 s, the same choice. `ENDS_KERNEL=0` scores in
+  Python, `ENDS_KERNEL=check` scores every state both ways and raises on a
+  difference.
+
 ### 0.23.1 (2026-10-13)
 
 - **`pair_search`**: the whole-route snap's grid search for a PAIR

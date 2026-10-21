@@ -391,6 +391,26 @@ went from 42 of 49 dropped, on 42 vias, to all 49 on 26, and on U1 from 92 of
 and the pairs, the other nets, the plane balls), each held before the next; a
 tier left undecided in its time is asked instead for the most of it served,
 and that is held (U1's 98 plane balls, undecided at four times the time).
+Those tiers are asked with no LP: each is a yes or no over booleans, and the
+relaxation only slowed the search to it. zynq7020_som's U2, 483 balls and
+187,032 constraints, proved its three tiers in 17 s where they took 234, the
+same balls served. A ball whose net has no other pad on the board (a
+no-connect) is not planned (`route_bus.array_others`), as `bga_fanout` fans
+none: planned, it took room from the nets that go somewhere, the engine laid
+it nothing, and the bare ball sent the whole array a rung down the fab ladder
+(59 of U2's 315 other nets there).
+
+**One model, one answer.** Both phases are deterministic, so a plan's answer
+is kept by its model -- the model's bytes and everything phase 2 prices,
+hashed (`joint_escape._SOLVED`) -- and a model met again is not solved again.
+That lets the fanout solve plans side by side, as CP-SAT gives up the GIL as
+it solves: the two plans of `joint_berths` at once, and the source's other
+balls' plan (`joint_others`) beside the destination's
+(`fanout_from_plan.speculate_others`). Where the destination's copper leaves
+the source's model as it was, `joint_others` finds its answer ready; where
+it does not, it solves its own. Each model is built, and each plan made from
+its answer, on the fanout's own thread. zynq7020_som's first-round fanout went
+from 271 s to 190 s, its copper the same.
 
 **The destination's berths, held where the ends chose them.** The joint plan
 of the destination array that places the bus's berths (`joint_berths`) is
@@ -403,6 +423,20 @@ answer, any plan serving every ball, and does not find its way back. On
 h616_lpddr4's U2 it put SRST and SDQM3 on the far face, each crossing the
 whole bus (119 crossings to 195, and the solve found no plan); held, every
 ball was still served and the objective was higher.
+
+**A tie via's site is its net's via from the start.** A destination ball with
+a pad of its own net under it on the other layer -- a terminating resistor on
+the back, under a DDR clock pair's balls -- is tied by a via at the ball once
+its berth is laid (`fanout_from_plan.tie_vias_under`). Both plans of the
+destination (`joint_berths`, `joint_destination`) see those sites as vias of
+their nets, the ends' menus drop another net's berth that runs or stands on
+one, and the tie itself is not laid on another net's track. Unseen,
+zynq7020_som's DDR_CK_P escaped along its ball row across DDR_CK_N's ball, the
+tie via was laid on that run, and the bus handed on a short. The resistor's
+place is the design's: it is none of the movable passives the plans lay
+through, and the cap step leaves it where it is (`joint_escape.tied_passives`,
+a passive with a signal pad of the run's nets under one of its balls). Moved,
+the resistor was turned a quarter off CK_P's ball, and the pair was open.
 
 **The other nets escape on the plane layers too, where they must.** They are
 offered every copper layer, and a leg on a plane layer -- an inner layer with
@@ -952,6 +986,19 @@ fanouts tried lost, each after up to seven exact routes at the work limit.
 With one each, that bus's first winding took 151 s for 436, and the two-end
 bus's cuts and their outcomes are the same, round for round. A wound state
 of 300 crossings still runs its one exact route to the limit.
+
+**Scored in Rust** (`ends_kernel.py`, `grid_router.EndsKernel`). On more
+routing layers than two the model's estimate -- the objective its searches
+ask of some 400,000 states a choice -- and the local search's loop run in the
+router's Rust core, on tables read off the model once; the Python keeps the
+exact route and the parts of a kept state. The kernel forms the same doubles
+in the same order (Python's float `sum` is compensated from 3.12 on, and the
+kernel's is too there), so the searches walk the same states and keep the same
+ends. In Python the searches' threads took turns at the GIL: zynq7020_som's
+first choice took 200 s, and takes 6. `ENDS_KERNEL=0` scores in Python alone,
+`check` both on every state, a difference raised with the two sets of terms.
+Two routing layers, a branched bus and the risk price (`ENDS_CORNER`) are
+scored in Python.
 
 **Laid as asked, or not kept.** The destination is chosen, fanned out and
 audited in passes (`DST_ITERS`, 8):
@@ -1896,7 +1943,7 @@ With nothing supplied, as on the benches:
 | `escape_plan.py`, `dogbone_arrays.py` | the escape fanout (`route_bus --escape`): both arrays dog-boned, and each round's ends chosen among the escapes that field has (ball lines, sidesteps, streets) and laid as they are (`tests/test_622_escape_plan.py`); no lane laid whose runs come within the rule of a kept lane's or of its own other leg's (`clear_lanes`: `tests/test_622_escape_clear_lanes.py`); on a shared array, a lane the ends gave no end that the joint field escaped held to the tooth its plan chose and given a berth with the others held (`free_ends`); a joint field that leaves a lane no way to its chosen end laid without it when it ends at least as many lanes as the dog-boned field (`without_lanes`, `lanes_ended`: `tests/test_622_escape_clear_lanes.py`) |
 | `joint_escape.py`, `conflict_groups.py` | the joint fanout (`route_bus --joint-fanout`): an array's other balls planned together in one CP-SAT solve and laid by the under-pad engine's joint escape (a drop at a finer rung's via: `tests/test_622_drop_fine_via.py`; nothing in a laid pair's pocket: `test_622_pair_teeth.py`; no escape between two laid lanes that close round it: `test_622_lane_walls.py`); the escapes' conflicts as cliques and bicliques (`tests/test_622_conflict_groups.py`); a shared array planned whole round an escape bus's teeth (`route_bus --escape`, `ESCAPE_JOINT`: `escape_field`); a later round's pieces carried onto its board once (`carry`: `tests/test_622_joint_rounds.py`) |
 | `whole_route.py`, `modal_whole.py` | one rung end to end -- fanout, solve, loop, route, checks, feedback rounds -- graded in one line (`WHOLE K=..`); the loop's layer cuts from the audit and the snap (`tests/test_622_layer_cuts.py`); a lane its fanout gave no end, or ran and did not lay, left out of the round, open (`with_ends`: `tests/test_622_whole_route_no_ends.py`); the ladder in the cloud, one container per rung |
-| `whole_ends.py`, `whole_frame.py`, `whole_feedback.py` | the choice of ends (the fanout's `PLAN_JUDGE=ends`; every plane ball kept a way down: `tests/test_622_walled_balls.py`); the frame of a bench (a part on a ring's stack: `tests/test_622_ring_room.py`); what goes back to the fanout (`tests/test_622_ends_fixes.py`, `test_622_exit_front.py`, `test_622_feedback_rounds.py`; an item for a lane the round's ends have no option for keys nothing: `fb_tables`) |
+| `whole_ends.py`, `ends_kernel.py`, `whole_frame.py`, `whole_feedback.py` | the choice of ends (the fanout's `PLAN_JUDGE=ends`; every plane ball kept a way down: `tests/test_622_walled_balls.py`; its estimate scored in Rust, `ENDS_KERNEL=check` both ways); the frame of a bench (a part on a ring's stack: `tests/test_622_ring_room.py`); what goes back to the fanout (`tests/test_622_ends_fixes.py`, `test_622_exit_front.py`, `test_622_feedback_rounds.py`; an item for a lane the round's ends have no option for keys nothing: `fb_tables`) |
 | `whole_solve.py`, `whole_geo.py`, `whole_polish.py`, `whole_snap.py` | the crossing and layer solve, the geometry LP (a part seen from several frames: `tests/test_622_part_frames.py`; islands made of pads: `tests/test_622_pad_islands.py`), the polish, the snap onto the router's grid |
 | `whole_audit.py`, `whole_gate.py`, `whole_lint.py`, `whole_render.py`, `whole_ctx.py` | a plan installed and audited, gated, linted, drawn; the bench they share, read as the ends model reads it (`tests/test_622_candidate_ctx.py`: an all-pair bus's plan sidecar read by the pairs' legs) |
 | `whole_ladder.py` | the ladders on this machine: rungs side by side, each stopped at a cap with every stage it started, one grade line each |

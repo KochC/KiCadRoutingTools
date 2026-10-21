@@ -18,6 +18,7 @@ mod dubins;
 mod pose_router;
 mod lane_search;
 mod pair_search;
+mod ends_kernel;
 
 pub use obstacle_map::GridObstacleMap;
 pub use router::GridRouter;
@@ -145,6 +146,7 @@ fn grid_router(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<GridObstacleMap>()?;
     m.add_class::<GridRouter>()?;
     m.add_class::<PoseRouter>()?;
+    m.add_class::<ends_kernel::EndsKernel>()?;
     m.add_function(wrap_pyfunction!(identify_blocking_obstacles, m)?)?;
     m.add_function(wrap_pyfunction!(lane_search::lane_search, m)?)?;
     m.add_function(wrap_pyfunction!(pair_search::pair_search, m)?)?;

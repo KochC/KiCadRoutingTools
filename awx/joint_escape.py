@@ -598,7 +598,7 @@ def passives_fixed():
     return awx_settings.get('FANOUT_PASSIVES_FIXED') == '1'
 
 
-def movable_refs(pcb, ref):
+def movable_refs(pcb, ref, nets=()):
     """the movable passives: the parts the cap placement step that follows moves (place_fanout_clearance, by its own
     rule: placement.fanout_clearance.movable_cap_refs -- unlocked two-pad C/R/FB parts within its near margin of a
     BGA's ball field), so the joint escape plans and lays its VIAS as if they were not there (its tracks go round
@@ -625,17 +625,46 @@ def movable_refs(pcb, ref):
             got = frozenset(movable_cap_refs(pcb, path, beneath_only=True))
         if key:
             _MOVABLE[key] = got
-    return got - {ref}
+    return got - {ref} - tied_passives(pcb, got, nets)
 
 
 _MOVABLE = {}       # (a board file, its mtime and size) -> its movable caps: the courtyards read off it once
 
 
-def passives_beyond(board, refs):
+def tied_passives(pcb, refs, nets):
+    """the passives among `refs` served THROUGH A BALL: a pad of theirs, of a signal, under a ball of its own net on the
+    other layer (pairs.under_pad -- a terminating resistor on the back under a DDR clock pair's balls), of one of the
+    run's `nets` (full or short names): tied by a via at the ball (fanout_from_plan.tie_vias_under) or by the ball's own
+    via in its pad. Their place is the design's: the plans route round them as fixed copper and the cap step leaves
+    them (passives_beyond). Moved as any passive beneath the array, the zynq7020's R50 was turned a quarter off
+    DDR_CK_P's ball, and the pair was handed on open"""
+    import braid as te
+    import pairs as _pairs
+    # (a signal's: a plane net's passive -- a decoupling cap's pad under a power ball -- has its own way down, and
+    # moving it off the copper is the cap step's whole work)
+    planes = {z.net_id for z in (pcb.zones or []) if z.net_id}
+    want = {short_name(n) for n in nets}
+    out = set()
+    for r in refs:
+        fp = pcb.footprints.get(r)
+        if fp is None:
+            continue
+        for q in fp.pads:
+            if q.net_id and q.net_id not in planes and short_name(q.net_name or '') in want and \
+                    any(p.component_ref != r and _pairs.under_pad(p, q, te.VIA_SIZE)
+                        for p in pcb.pads_by_net.get(q.net_id, ())):
+                out.add(r)
+                break
+    return frozenset(out)
+
+
+def passives_beyond(board, refs, nets=()):
     """the passives the cap step (place_fanout_clearance --beneath-only) would move on BOARD that stand beneath NONE of
     the arrays `refs` -- beneath another array, whose step this is not: a bus step's cap nudge locks them (--lock), so it
     moves only the parts beneath its own arrays. Unscoped, the zynq's DDR step (U1 -> U2) moved RX4 and C177 beneath U5,
-    the LVDS bus's array, and the LVDS step on its board found them where its own nudge would never have left them"""
+    the LVDS bus's array, and the LVDS step on its board found them where its own nudge would never have left them.
+    ...and the ones served through a ball of the run's `nets` (tied_passives), beneath its own arrays or not: their
+    place is the design's"""
     if os.path.join(HERE, '..', 'py_placer') not in sys.path:
         sys.path.insert(0, os.path.join(HERE, '..', 'py_placer'))
     from placement.fanout_clearance import movable_cap_refs, package_box
@@ -647,7 +676,8 @@ def passives_beyond(board, refs):
         court = extract_courtyard_bboxes(board)
     boxes = [package_box(pcb.footprints[r], court) for r in refs if r in pcb.footprints]
     under = lambda f: any(b[0] <= f.x <= b[2] and b[1] <= f.y <= b[3] for b in boxes)   # noqa: E731
-    return sorted(r for r in moving if r in pcb.footprints and not under(pcb.footprints[r]))
+    return sorted({r for r in moving if r in pcb.footprints and not under(pcb.footprints[r])}
+                  | tied_passives(pcb, moving, nets))
 
 
 def bus_route_layers(pcb):
@@ -773,7 +803,7 @@ def build_menus(pcb, ref, bus, others, other_layers, far=None, drops=(), climb=C
     oth_s = {short_name(n) for n in others}
     drop_s = {short_name(n) for n in drops} - bus_s - oth_s
     sz = _sizes(pcb, foot)
-    skip = movable_refs(pcb, ref)
+    skip = movable_refs(pcb, ref, bus)
     cache = {}
 
     def obs(nid, layer, via=False):
@@ -990,9 +1020,77 @@ def build_menus(pcb, ref, bus, others, other_layers, far=None, drops=(), climb=C
                                  via_r=via_r, pairs=legs, lane_faces=lane_faces(rays), unheld=unheld)
 
 
+_SOLVED = {}         # a plan's model, with what phase 2 prices -> both phases' answers (plan_array: one model, one answer)
+_SOLVING = {}        # ...and the models being solved (a future each): a plan meeting one waits for its answer
+
+
+def _solved(skey):
+    """the answer kept for the model `skey` -- waited for where it is being solved; None where it is not known, or its
+    solve failed (the plan then solves it itself)"""
+    if skey is None:
+        return None
+    got = _SOLVED.get(skey)
+    fut = _SOLVING.get(skey) if got is None else None
+    if fut is not None:
+        try:
+            got = fut.result()
+        except Exception:
+            got = None
+    return got
+
+
+def _status_name(st):
+    """a CP-SAT status's name (an answer kept has no solver of its own to ask)"""
+    from ortools.sat.python import cp_model
+    return cp_model.CpSolver().StatusName(st)
+
+
+class _Deferred:
+    """a plan whose solve runs on another thread (plan_array's `executor`): result() its (hints, report) -- the rest of
+    the plan, which prints, made on the thread that asks: a second thread swapping sys.stdout leaves it on a buffer"""
+
+    def __init__(self, fn, fut=None):
+        self._fn, self._res, self._fut = fn, None, fut
+
+    def wait(self):
+        """until the solve has ended (its failure only an answer not kept), the rest of the plan not made"""
+        if self._fut is not None:
+            self._fut.exception()
+
+    def result(self):
+        if self._fn is not None:
+            self._res, self._fn = self._fn(), None
+        return self._res
+
+
+def _solved_key(mdl, ref, keys, served, items, bus_s, oth_s, drop_s, bm, rank, wt, cvals, v, site_used, rls,
+                time_limit, batches, workers):
+    """the key a plan's answers are kept by in _SOLVED: the model's bytes as phase 1 meets it (its options, conflicts and
+    hints), hashed, with what the phases read beside it -- the tiers' balls, their ranks and weights, each option's cost,
+    the sites' vias, the work. None under a wall-clock limit, whose answer is not reproducible"""
+    if time_limit:
+        return None
+    import hashlib
+    import tempfile
+    fd, path = tempfile.mkstemp(suffix='.pb')
+    os.close(fd)
+    try:
+        mdl.ExportToFile(path)
+        with open(path, 'rb') as f:
+            h = hashlib.sha1(f.read())
+    finally:
+        os.remove(path)
+    legs = sorted({k for _b, kp, kn in bm.pairs for k in (kp, kn)}, key=repr)
+    h.update(repr((ref, [(k, k in served, items[k][0] in bus_s, items[k][0] in oth_s, items[k][0] in drop_s,
+                          rank.get(k), wt.get(k), cvals[k], [x.Index() for x in v[k]]) for k in keys],
+                   legs, [u.Index() for u in site_used], C_VIA, P1_DET, rls, batches or SOLVE_BATCHES,
+                   workers or SOLVE_WORKERS, SUBSOLVERS, SUBSOLVERS_RUNS)).encode())
+    return h.hexdigest()
+
+
 def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops=(), climb=CLIMB, street=2,
                batches=None, workers=None, time_limit=None, log=print, debug=False, only=None, hands=None,
-               vias_only=False, exit_rays=False, escape_to=None, hold=None):
+               vias_only=False, exit_rays=False, escape_to=None, hold=None, executor=None):
     """(hints, report): one planned move for every signal ball of `ref` on `pcb` -- the bus's nets (`bus`, full or
     short names) escaping on F.Cu/B.Cu, never by the `far` face; `others` escaping on `other_layers`, or a multi-ball
     net's ball strapped to a neighbour of its net; and every ball of the plane nets `drops` dropped to its plane --
@@ -1532,271 +1630,333 @@ def plan_array(pcb, ref, bus, others, other_layers, far=None, prefer=None, drops
     # (the menus' and the conflicts' garbage collected before the solves: their cycles otherwise wait for the
     # collector and stand under the solver's peak)
     gc.collect()
-    t_p1 = time.time()
-    let_go = []
     idx = {served[k].Index(): k for k in served}
-    s1 = cp_model.CpSolver()
-    s1.parameters.num_workers = 1
-    s1.parameters.max_deterministic_time = P1_DET
-    if time_limit:
-        s1.parameters.max_time_in_seconds = time_limit
+    # ONE MODEL, ONE ANSWER: both phases' answers kept per model in the process (_SOLVED) -- its bytes and everything
+    # phase 2 prices, hashed. Both phases are deterministic (one worker by work; interleaved batches), so a model met
+    # again has the answer solving it again would give. The fanout plans the source's other balls (joint_others) on
+    # the board the destination's plan then lays its copper on, far from them; asked beside that plan on the board as
+    # it was, the answer is ready when the destination's done -- or, where its copper did reach the source's field, the
+    # model differs and is solved (fanout_from_plan.joint_destination)
+    cvals = {key: [cost(key, kind, o) for kind, o, _pc in opts[key]] for key in keys}
+    skey = _solved_key(mdl, ref, keys, served, items, bus_s, oth_s, drop_s, bm, rank, wt, cvals, v, site_used, rls,
+                       time_limit, batches, workers)
     legs_ = {k for _b, kp, kn in bm.pairs for k in (kp, kn)}
     tiers = [('bus and pairs', [k for k in keys if k in served and (items[k][0] in bus_s or k in legs_)]),
              ('others', [k for k in keys if k in served and k not in legs_ and items[k][0] in oth_s]),
              ('plane', [k for k in keys if k in served and items[k][0] in drop_s])]
-    held_keys, hint_vals, st1, tier_rep, left_out = [], None, None, [], set()
-    for tname, tier in tiers:
-        if not tier:
-            continue
-        while True:
-            mdl.ClearAssumptions()
-            mdl.AddAssumptions([served[k] for k in held_keys + tier if k not in let_go])
-            st1 = s1.Solve(mdl)
-            if st1 != cp_model.INFEASIBLE:
-                break
-            core = sorted(idx[c] for c in s1.SufficientAssumptionsForInfeasibility() if c in idx)
-            cand = [k for k in core if k in tier] or core
-            if not cand:
-                break
-            let_go.append(min(cand, key=lambda k_: (rank[k_], k_)))
-        st_name = s1.StatusName(st1)
-        if st1 == cp_model.UNKNOWN:
-            # out of time on the whole tier, undecided: the MOST of it served instead, the earlier tiers held, and
-            # those held. zynq U1's 98 plane balls on four layers: every one at once undecided at 240 and at 960,
-            # and phase 2's count and cost together left 7 of them unserved; given four times its budget, 2
-            mdl.ClearAssumptions()
-            mdl.AddAssumptions([served[k] for k in held_keys])
-            mdl.Maximize(sum(served[k] for k in tier if k not in let_go))
-            st1 = s1.Solve(mdl)
-            mdl.ClearObjective()
-            out_ = [k for k in tier if k not in let_go and not s1.Value(served[k])] \
-                if st1 in (cp_model.OPTIMAL, cp_model.FEASIBLE) else []
-            left_out.update(out_)
-            st_name += f', the most of it {s1.StatusName(st1)}' + (f' ({len(tier) - len(out_)})' if out_ else '')
-        tier_rep.append((tname, len(tier), st_name))
-        if st1 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            break
-        held_keys += [k for k in tier if k not in let_go and k not in left_out]
-        hint_vals = {var.Index(): s1.Value(var) for key in keys for var in v[key]}
-    mdl.ClearAssumptions()
-    held = bool(held_keys)
-    if held:
-        mdl.ClearHints()            # (phase 1's answer replaces the preferred teeth as the start)
-        for key in keys:
-            for var in v[key]:
-                mdl.AddHint(var, hint_vals[var.Index()])
-        for key in held_keys:
-            mdl.Add(served[key] == 1)
-        st1 = cp_model.FEASIBLE if st1 not in (cp_model.OPTIMAL, cp_model.FEASIBLE) else st1
-    held_set = set(held_keys)
-    t_p1 = time.time() - t_p1
-    # PHASE 2, the cost, every ball phase 1 held kept served; a ball it did not hold -- let go, or of a tier it ran out
-    # of time on -- earns its weight if it can be served after all (count and cost together for those).
-    obj = []
-    for key in keys:
-        w = 0 if key in held_set else wt[key]
-        for i, (kind, o, _pc) in enumerate(opts[key]):
-            obj.append((w - cost(key, kind, o)) * v[key][i])
-    obj += [-C_VIA * u for u in site_used]
-    mdl.Maximize(sum(obj))
-    s_ = cp_model.CpSolver()
-    # REPRODUCIBLE, as the whole solve is (whole_solve): stopped by a count of interleaved batches, the workers
-    # sharing no clauses -- the same model gives the same answer (a wall-clock limit on eight workers gave two answers
-    # in two runs of zynq U1's array). `time_limit` caps the wall clock on top, and an answer it stops is not
-    # reproducible.
-    s_.parameters.num_workers = workers or SOLVE_WORKERS
-    s_.parameters.interleave_search = True
-    s_.parameters.max_num_deterministic_batches = batches or SOLVE_BATCHES
-    s_.parameters.share_glue_clauses = False
-    s_.parameters.share_binary_clauses = False
-    s_.parameters.subsolvers.extend(SUBSOLVERS_RUNS if rls else SUBSOLVERS)
-    if time_limit:
-        s_.parameters.max_time_in_seconds = time_limit
-    st = s_.Solve(mdl)
-    chosen, ci = {}, {}              # ball -> (kind, option); ball -> its index
-    if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        for key in keys:
-            for i, var in enumerate(v[key]):
-                if s_.Value(var):
-                    chosen[key] = opts[key][i][:2]
-                    ci[key] = i
-    piece = {key: opts[key][ci[key]][2] for key in chosen}
-    uncoloured = []
-    if rls:
-        # each chosen run on RUN its layer: the plan let K runs share a lane, an exit cluster, a crossing; those of
-        # one such group must stand on as many layers (colour_runs), a pair's two legs on one, a bus lane's on the
-        # layer its preferred tooth leaves by where it can
-        runs_ = {key: o.runs_on for key, (kind, o) in chosen.items() if kind == 'escape' and o.layer == RUN}
-        sel = {(key, ci[key]) for key in runs_}
-        edges = set()
-        for g in list(cap_g) + [tuple(set(a) | set(b)) for a, b in cap_b]:
-            mem = sorted(x[0] for x in g if x in sel)
-            for x in range(len(mem)):
-                for y in range(x + 1, len(mem)):
-                    edges.add((mem[x], mem[y]))
-        together = [(kp, kn) for _b, kp, kn in bm.pairs if kp in runs_ and kn in runs_]
-        want = {key: ((prefer or {}).get(items[key][0]) or {}).get('layer') for key in runs_
-                if items[key][0] in bus_s}
-        colour, uncoloured = colour_runs(runs_, sorted(edges), together, want)
-        for key, L in colour.items():
-            kind, o = chosen[key]
-            o2 = dataclasses.replace(o, layer=L, legs=[(a, b, L if l_ == RUN else l_) for a, b, l_ in o.legs])
-            chosen[key] = (kind, o2)
-            pc = piece[key]
-            piece[key] = Piece(pc.net, list(o2.legs), pc.vias, pc.balls)
-        for key in uncoloured:
-            del chosen[key], ci[key], piece[key]
-    repaired = []
-    if uncoloured and (escape_to or hold):
-        # (escape_to / hold) a ball whose run the colouring could not place takes its cheapest option that STANDS with
-        # the coloured plan in the laid geometry (_hit): a run on one of its layers that is free there, an escape off
-        # RUN, a drop, its dog-bone alone -- a pair both its legs' dog-bones; never a strap, which leans on a neighbour's
-        # choice. The capacity rows count a lane group's runs per layer and cannot see a run pushed from group to group
-        # (zynq U1, the LVDS teeth held: OTG_DATA6 chosen, no layer left for it, the ball left bare)
-        def stands(k, pc):
-            bx = _box(pc, sz['grow'])
-            for k2, pc2 in piece.items():
-                b2 = _box(pc2, sz['grow'])
-                if bx[0] > b2[2] or b2[0] > bx[2] or bx[1] > b2[3] or b2[1] > bx[3]:
-                    continue
-                if _hit(pc, pc2, items[k][0] == items[k2][0], sz):
-                    return False
-            return True
+    got_ = _solved(skey)
 
-        def ways(k):
-            for i, (kind, o, pc) in sorted(enumerate(opts[k]), key=lambda t: (cost(k, t[1][0], t[1][1]), t[0])):
-                if kind == 'strap':
-                    continue
-                if kind == 'escape' and o.layer == RUN:
-                    for L in (getattr(o, 'runs_on', None) or ()):
-                        o2 = dataclasses.replace(o, layer=L, legs=[(a, b, L if l_ == RUN else l_) for a, b, l_ in o.legs])
-                        yield i, kind, o2, Piece(pc.net, list(o2.legs), pc.vias, pc.balls)
-                else:
-                    yield i, kind, o, pc
-        leg_of = {k_: (kp, kn) for _b, kp, kn in bm.pairs for k_ in (kp, kn)}
-        for key in sorted(uncoloured):
-            if key in chosen:
+    def solve_phases():
+        """both phases on the model -- CP-SAT alone, nothing printed, so they may run on another thread (plan_array's
+        `executor`) -- their answer kept by its key (_SOLVED)"""
+        t_p1 = time.time()
+        let_go = []
+        s1 = cp_model.CpSolver()
+        s1.parameters.num_workers = 1
+        s1.parameters.max_deterministic_time = P1_DET
+        # (no LP: the question is a yes or no over booleans -- each ball one option, conflicting options never together --
+        # and the relaxation only slowed the search to it. zynq7020_som's U2, 483 balls and 187,032 constraints, its three
+        # tiers proved in 17 s where they took 234 with the LP; the same balls served)
+        s1.parameters.linearization_level = 0
+        if time_limit:
+            s1.parameters.max_time_in_seconds = time_limit
+        held_keys, hint_vals, st1, tier_rep, left_out = [], None, None, [], set()
+        for tname, tier in tiers:
+            if not tier:
                 continue
-            if key in leg_of:
-                kp, kn = leg_of[key]
-                if kp in chosen or kn in chosen:
-                    continue
-                for ip, (kd, op, pp) in enumerate(opts[kp]):
-                    if kd != 'stub' or not stands(kp, pp):
-                        continue
-                    hit = next(((jn, on, pn) for jn, (kd2, on, pn) in enumerate(opts[kn])
-                                if kd2 == 'stub' and stands(kn, pn) and not _hit(pp, pn, False, sz)), None)
-                    if hit:
-                        for k_, i_, o_, p_ in ((kp, ip, op, pp), (kn,) + hit):
-                            chosen[k_], ci[k_], piece[k_] = ('stub', o_), i_, p_
-                            repaired.append(k_)
-                        break
-                continue
-            for i, kind, o, pc in ways(key):
-                if stands(key, pc):
-                    chosen[key], ci[key], piece[key] = (kind, o), i, pc
-                    repaired.append(key)
+            while True:
+                mdl.ClearAssumptions()
+                mdl.AddAssumptions([served[k] for k in held_keys + tier if k not in let_go])
+                st1 = s1.Solve(mdl)
+                if st1 != cp_model.INFEASIBLE:
                     break
-        if repaired:
-            log(f'  joint escape of {ref}: {len(repaired)} uncoloured ball(s) given an option that stands with the '
-                f'plan: {sorted(repaired)}')
-    # the choice against the laid geometry, apart from the lane model the pairs came from: two chosen options of two
-    # balls whose copper the engine could not both lay (the lane model does not see, e.g., two plain moves crossing)
-    clashes = []
-    ck = sorted(chosen)
-    for x_, a in enumerate(ck):
-        ba = boxes[(a, ci[a])]
-        for b in ck[x_ + 1:]:
-            bb = boxes[(b, ci[b])]
-            if ba[0] > bb[2] or bb[0] > ba[2] or ba[1] > bb[3] or bb[1] > ba[3]:
-                continue
-            if _hit(piece[a], piece[b], items[a][0] == items[b][0], sz):
-                clashes.append((a, b))
-    gap_sites = {site_key(items[k][0], o.site) for k, (kind, o) in chosen.items() if kind == 'drop' and not o.inpad}
-    obj_orig = sum((W_BUS if items[k][0] in bus_s else (W_DROP if items[k][0] in drop_s else W_OTHER))
-                   - cost(k, kind, o) for k, (kind, o) in chosen.items()) - C_VIA * len(gap_sites)
-    hints = {}
-    pair_of = {k_: b_ for b_, kp, kn in bm.pairs for k_ in (kp, kn)}
-    for key, (kind, o) in chosen.items():
-        at = (round(balls[key][0], 3), round(balls[key][1], 3))
-        if kind == 'escape':
-            h = sr.full_move(o)
-            # the move's own legs, always: the plan proved ITS legs clear of each other, and an exit alone is laid by
-            # a search that reaches it by any cells (full_move carries them only under PLAN_PAGES)
-            h['legs'] = [(tuple(a), tuple(b), L) for (a, b, L) in o.legs]
-        elif kind == 'strap':
-            h = {'kind': 'strap', 'to': tuple(o.b), 'layer': o.layer}
-        elif kind == 'stub':
-            h = {'kind': 'stub', 'site': tuple(o.site), 'layer': o.layer}   # (laid by lay, before the engine)
-        else:
-            h = {'kind': 'drop', 'site': tuple(o.site), 'layer': o.layer, 'inpad': bool(o.inpad)}
-            if not o.inpad and o.r < sz['vr'] - 1e-9:
-                h['via'] = (round(2 * o.r, 4), round(2 * o.dr, 4))     # (a finer rung's: the engine lays it so)
-        h['strict'] = True
-        if key in pair_of and kind == 'escape':
-            h['pair'] = pair_of[key]           # (lay keeps the pair's gate)
-        hints[at] = h
-    kinds = collections.Counter((('bus' if items[k][0] in bus_s else 'plane' if items[k][0] in drop_s
-                                  else 'other'), kind) for k, (kind, _o) in chosen.items())
-    rep = dict(status=s_.StatusName(st), balls=len(items), moves=n_moves, conflicts=len(pairs), conflict_groups=len(groups), conflict_bicliques=len(bigroups),
-               bus_escaped=kinds[('bus', 'escape')],
-               bus_balls=sum(1 for k in items if items[k][0] in bus_s),
-               others_escaped=kinds[('other', 'escape')], others_strapped=kinds[('other', 'strap')],
-               others_stubbed=kinds[('other', 'stub')],
-               others_balls=sum(1 for k in items if items[k][0] in oth_s),
-               dropped=kinds[('plane', 'drop')], plane_strapped=kinds[('plane', 'strap')],
-               dropped_in_pad=sum(1 for k, (kind, o) in chosen.items() if kind == 'drop' and o.inpad),
-               drop_vias=len(gap_sites) + sum(1 for k, (kind, o) in chosen.items() if kind == 'drop' and o.inpad),
-               plane_balls=sum(1 for k in items if items[k][0] in drop_s),
-               no_move=sorted(k for k in items if not opts[k]),
-               unplanned=sorted(k for k in items if k not in chosen), clashes=clashes,
-               climbed=sum(1 for k, (kind, o) in chosen.items() if kind == 'escape' and getattr(o, 'climb', 0)),
-               streets=sum(1 for k, (kind, o) in chosen.items() if kind == 'escape' and getattr(o, 'street', 0)),
-               faces=dict(collections.Counter(f'{"bus" if items[k][0] in bus_s else "other"} {o.direction} '
-                                              f'{o.layer} {o.kind}' for k, (kind, o) in chosen.items()
-                                              if kind == 'escape')),
-               # (no tier with a ball to serve -- every ball planned again without an option, zynq U2's four plane
-               # balls held round the cap step's passives -- asks phase 1 nothing, and its solver has no status)
-               let_go=list(let_go), phase1=s1.StatusName(st1) if st1 is not None else 'nothing to ask',
-               phase1_secs=round(t_p1, 1), phase1_tiers=tier_rep,
-               uncoloured=list(uncoloured),
-               run_layers=dict(collections.Counter(o.layer for k, (kind, o) in chosen.items()
-                                                   if kind == 'escape' and o.kind != 'surface')) if rls else None,
-               pairs=len(bm.pairs), pairs_escaped=sum(1 for _b, kp, kn in bm.pairs if kp in chosen and kn in chosen),
-               hands_held=sorted(hand_rep['held']), hands_free=sorted(hand_rep['free']),
-               secs=round(time.time() - t0, 1))
-    if debug:
-        # the model's pieces, for checking the answer against them (the conflict pairs, the options) and the solve's
-        # own account of itself (objective, proved bound, wall time, branches)
-        rep['debug'] = dict(items=items, opts=opts, pairs=pairs, groups=groups, bigroups=bigroups, chosen=chosen, cost=cost, sizes=sz,
-                            objective=obj_orig if chosen else None, bound=s_.BestObjectiveBound(),
-                            wall=s_.WallTime(), branches=s_.NumBranches(), conflicts_cp=s_.NumConflicts())
-    log(f'  joint escape of {ref}: {rep["status"]} -- bus {rep["bus_escaped"]}/{rep["bus_balls"]}, others '
-        f'{rep["others_escaped"]} escaped + {rep["others_strapped"]} strapped'
-        + (f' + {rep["others_stubbed"]} dog-boned alone' if rep['others_stubbed'] else '')
-        + f' of {rep["others_balls"]}, plane '
-        f'{rep["dropped"]} dropped ({rep["dropped_in_pad"]} in pad)'
-        + (f' + {rep["plane_strapped"]} strapped' if rep['plane_strapped'] else '') + f' of {rep["plane_balls"]}'
-        + (f' on {rep["drop_vias"]} vias' if rep['drop_vias'] != rep['dropped'] else '') + '; '
-        f'{rep["climbed"]} climbs, {rep["streets"]} street vias chosen; {len(rep["no_move"])} balls with no option; '
-        f'{len(clashes)} chosen pairs clash in the laid geometry; '
-        + (f'runs on {rep["run_layers"]}' + (f', {len(uncoloured)} no layer held {uncoloured}' if uncoloured else '')
-           + '; ' if rls else '')
-        + f'served first {rep["phase1"]} in '
-        f'{rep["phase1_secs"]} s' + (f', let go (a proved conflict) {rep["let_go"]}' if rep['let_go'] else '')
-        # (each tier's own status where one is not OPTIMAL: a tier out of its time is not held, and its balls are phase
-        # 2's -- the line's FEASIBLE said only that an earlier tier held, and hid the plane tier that left six drops)
-        + (f' (tiers {", ".join(f"{t} {n} {s}" for t, n, s in tier_rep)})'
-           if any(s != 'OPTIMAL' for _t, _n, s in tier_rep) else '')
-        + (f'; pairs held to the other end\'s hand {len(rep["hands_held"])}'
-           + (f', NO exit pair of it {rep["hands_free"]}' if rep['hands_free'] else '') if hands else '')
-        + f'; {rep["secs"]} s')
-    # (the model and its solvers collected here, not at the collector's leisure: the CP-SAT model and its variables
-    # hold each other, and left standing they were under the engine's lay that follows -- the zynq chain's U1 source
-    # realize at 1.09 GB, its plan's own peak 0.77)
-    del mdl, s1, s_, v, served
+                core = sorted(idx[c] for c in s1.SufficientAssumptionsForInfeasibility() if c in idx)
+                cand = [k for k in core if k in tier] or core
+                if not cand:
+                    break
+                let_go.append(min(cand, key=lambda k_: (rank[k_], k_)))
+            st_name = s1.StatusName(st1)
+            if st1 == cp_model.UNKNOWN:
+                # out of time on the whole tier, undecided: the MOST of it served instead, the earlier tiers held, and
+                # those held. zynq U1's 98 plane balls on four layers: every one at once undecided at 240 and at 960,
+                # and phase 2's count and cost together left 7 of them unserved; given four times its budget, 2
+                mdl.ClearAssumptions()
+                mdl.AddAssumptions([served[k] for k in held_keys])
+                mdl.Maximize(sum(served[k] for k in tier if k not in let_go))
+                st1 = s1.Solve(mdl)
+                mdl.ClearObjective()
+                out_ = [k for k in tier if k not in let_go and not s1.Value(served[k])] \
+                    if st1 in (cp_model.OPTIMAL, cp_model.FEASIBLE) else []
+                left_out.update(out_)
+                st_name += f', the most of it {s1.StatusName(st1)}' + (f' ({len(tier) - len(out_)})' if out_ else '')
+            tier_rep.append((tname, len(tier), st_name))
+            if st1 not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                break
+            held_keys += [k for k in tier if k not in let_go and k not in left_out]
+            hint_vals = {var.Index(): s1.Value(var) for key in keys for var in v[key]}
+        mdl.ClearAssumptions()
+        held = bool(held_keys)
+        if held:
+            mdl.ClearHints()            # (phase 1's answer replaces the preferred teeth as the start)
+            for key in keys:
+                for var in v[key]:
+                    mdl.AddHint(var, hint_vals[var.Index()])
+            for key in held_keys:
+                mdl.Add(served[key] == 1)
+            st1 = cp_model.FEASIBLE if st1 not in (cp_model.OPTIMAL, cp_model.FEASIBLE) else st1
+        held_set = set(held_keys)
+        t_p1 = time.time() - t_p1
+        # PHASE 2, the cost, every ball phase 1 held kept served; a ball it did not hold -- let go, or of a tier it ran out
+        # of time on -- earns its weight if it can be served after all (count and cost together for those).
+        obj = []
+        for key in keys:
+            w = 0 if key in held_set else wt[key]
+            for i, (kind, o, _pc) in enumerate(opts[key]):
+                obj.append((w - cvals[key][i]) * v[key][i])
+        obj += [-C_VIA * u for u in site_used]
+        mdl.Maximize(sum(obj))
+        s_ = cp_model.CpSolver()
+        # REPRODUCIBLE, as the whole solve is (whole_solve): stopped by a count of interleaved batches, the workers
+        # sharing no clauses -- the same model gives the same answer (a wall-clock limit on eight workers gave two answers
+        # in two runs of zynq U1's array). `time_limit` caps the wall clock on top, and an answer it stops is not
+        # reproducible.
+        s_.parameters.num_workers = workers or SOLVE_WORKERS
+        s_.parameters.interleave_search = True
+        s_.parameters.max_num_deterministic_batches = batches or SOLVE_BATCHES
+        s_.parameters.share_glue_clauses = False
+        s_.parameters.share_binary_clauses = False
+        s_.parameters.subsolvers.extend(SUBSOLVERS_RUNS if rls else SUBSOLVERS)
+        if time_limit:
+            s_.parameters.max_time_in_seconds = time_limit
+        st = s_.Solve(mdl)
+        vals_ = {var.Index(): s_.Value(var) for key in keys for var in v[key]} \
+            if st in (cp_model.OPTIMAL, cp_model.FEASIBLE) else {}
+        ans = dict(held=list(held_keys), hint=hint_vals, st1=st1, tiers=list(tier_rep),
+                   left_out=sorted(left_out, key=repr), let_go=list(let_go), st=st, vals=vals_, t_p1=t_p1,
+                   bound=s_.BestObjectiveBound(), wall=s_.WallTime(), branches=s_.NumBranches(),
+                   conflicts_cp=s_.NumConflicts())
+        if skey is not None:
+            _SOLVED[skey] = ans
+        return ans
+
+    def _finish(ans, kept):
+        """the plan from both phases' answer `ans` (`kept`: a model met before, its answer kept)"""
+        let_go, st1, tier_rep, t_p1, st, vals_ = (ans['let_go'], ans['st1'], ans['tiers'], ans['t_p1'], ans['st'],
+                                                  ans['vals'])
+        chosen, ci = {}, {}              # ball -> (kind, option); ball -> its index
+        if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            for key in keys:
+                for i, var in enumerate(v[key]):
+                    if vals_[var.Index()]:
+                        chosen[key] = opts[key][i][:2]
+                        ci[key] = i
+        piece = {key: opts[key][ci[key]][2] for key in chosen}
+        uncoloured = []
+        if rls:
+            # each chosen run on RUN its layer: the plan let K runs share a lane, an exit cluster, a crossing; those of
+            # one such group must stand on as many layers (colour_runs), a pair's two legs on one, a bus lane's on the
+            # layer its preferred tooth leaves by where it can
+            runs_ = {key: o.runs_on for key, (kind, o) in chosen.items() if kind == 'escape' and o.layer == RUN}
+            sel = {(key, ci[key]) for key in runs_}
+            edges = set()
+            for g in list(cap_g) + [tuple(set(a) | set(b)) for a, b in cap_b]:
+                mem = sorted(x[0] for x in g if x in sel)
+                for x in range(len(mem)):
+                    for y in range(x + 1, len(mem)):
+                        edges.add((mem[x], mem[y]))
+            together = [(kp, kn) for _b, kp, kn in bm.pairs if kp in runs_ and kn in runs_]
+            want = {key: ((prefer or {}).get(items[key][0]) or {}).get('layer') for key in runs_
+                    if items[key][0] in bus_s}
+            colour, uncoloured = colour_runs(runs_, sorted(edges), together, want)
+            for key, L in colour.items():
+                kind, o = chosen[key]
+                o2 = dataclasses.replace(o, layer=L, legs=[(a, b, L if l_ == RUN else l_) for a, b, l_ in o.legs])
+                chosen[key] = (kind, o2)
+                pc = piece[key]
+                piece[key] = Piece(pc.net, list(o2.legs), pc.vias, pc.balls)
+            for key in uncoloured:
+                del chosen[key], ci[key], piece[key]
+        repaired = []
+        if uncoloured and (escape_to or hold):
+            # (escape_to / hold) a ball whose run the colouring could not place takes its cheapest option that STANDS with
+            # the coloured plan in the laid geometry (_hit): a run on one of its layers that is free there, an escape off
+            # RUN, a drop, its dog-bone alone -- a pair both its legs' dog-bones; never a strap, which leans on a neighbour's
+            # choice. The capacity rows count a lane group's runs per layer and cannot see a run pushed from group to group
+            # (zynq U1, the LVDS teeth held: OTG_DATA6 chosen, no layer left for it, the ball left bare)
+            def stands(k, pc):
+                bx = _box(pc, sz['grow'])
+                for k2, pc2 in piece.items():
+                    b2 = _box(pc2, sz['grow'])
+                    if bx[0] > b2[2] or b2[0] > bx[2] or bx[1] > b2[3] or b2[1] > bx[3]:
+                        continue
+                    if _hit(pc, pc2, items[k][0] == items[k2][0], sz):
+                        return False
+                return True
+
+            def ways(k):
+                for i, (kind, o, pc) in sorted(enumerate(opts[k]), key=lambda t: (cost(k, t[1][0], t[1][1]), t[0])):
+                    if kind == 'strap':
+                        continue
+                    if kind == 'escape' and o.layer == RUN:
+                        for L in (getattr(o, 'runs_on', None) or ()):
+                            o2 = dataclasses.replace(o, layer=L, legs=[(a, b, L if l_ == RUN else l_) for a, b, l_ in o.legs])
+                            yield i, kind, o2, Piece(pc.net, list(o2.legs), pc.vias, pc.balls)
+                    else:
+                        yield i, kind, o, pc
+            leg_of = {k_: (kp, kn) for _b, kp, kn in bm.pairs for k_ in (kp, kn)}
+            for key in sorted(uncoloured):
+                if key in chosen:
+                    continue
+                if key in leg_of:
+                    kp, kn = leg_of[key]
+                    if kp in chosen or kn in chosen:
+                        continue
+                    for ip, (kd, op, pp) in enumerate(opts[kp]):
+                        if kd != 'stub' or not stands(kp, pp):
+                            continue
+                        hit = next(((jn, on, pn) for jn, (kd2, on, pn) in enumerate(opts[kn])
+                                    if kd2 == 'stub' and stands(kn, pn) and not _hit(pp, pn, False, sz)), None)
+                        if hit:
+                            for k_, i_, o_, p_ in ((kp, ip, op, pp), (kn,) + hit):
+                                chosen[k_], ci[k_], piece[k_] = ('stub', o_), i_, p_
+                                repaired.append(k_)
+                            break
+                    continue
+                for i, kind, o, pc in ways(key):
+                    if stands(key, pc):
+                        chosen[key], ci[key], piece[key] = (kind, o), i, pc
+                        repaired.append(key)
+                        break
+            if repaired:
+                log(f'  joint escape of {ref}: {len(repaired)} uncoloured ball(s) given an option that stands with the '
+                    f'plan: {sorted(repaired)}')
+        # the choice against the laid geometry, apart from the lane model the pairs came from: two chosen options of two
+        # balls whose copper the engine could not both lay (the lane model does not see, e.g., two plain moves crossing)
+        clashes = []
+        ck = sorted(chosen)
+        for x_, a in enumerate(ck):
+            ba = boxes[(a, ci[a])]
+            for b in ck[x_ + 1:]:
+                bb = boxes[(b, ci[b])]
+                if ba[0] > bb[2] or bb[0] > ba[2] or ba[1] > bb[3] or bb[1] > ba[3]:
+                    continue
+                if _hit(piece[a], piece[b], items[a][0] == items[b][0], sz):
+                    clashes.append((a, b))
+        gap_sites = {site_key(items[k][0], o.site) for k, (kind, o) in chosen.items() if kind == 'drop' and not o.inpad}
+        obj_orig = sum((W_BUS if items[k][0] in bus_s else (W_DROP if items[k][0] in drop_s else W_OTHER))
+                       - cost(k, kind, o) for k, (kind, o) in chosen.items()) - C_VIA * len(gap_sites)
+        hints = {}
+        pair_of = {k_: b_ for b_, kp, kn in bm.pairs for k_ in (kp, kn)}
+        for key, (kind, o) in chosen.items():
+            at = (round(balls[key][0], 3), round(balls[key][1], 3))
+            if kind == 'escape':
+                h = sr.full_move(o)
+                # the move's own legs, always: the plan proved ITS legs clear of each other, and an exit alone is laid by
+                # a search that reaches it by any cells (full_move carries them only under PLAN_PAGES)
+                h['legs'] = [(tuple(a), tuple(b), L) for (a, b, L) in o.legs]
+            elif kind == 'strap':
+                h = {'kind': 'strap', 'to': tuple(o.b), 'layer': o.layer}
+            elif kind == 'stub':
+                h = {'kind': 'stub', 'site': tuple(o.site), 'layer': o.layer}   # (laid by lay, before the engine)
+            else:
+                h = {'kind': 'drop', 'site': tuple(o.site), 'layer': o.layer, 'inpad': bool(o.inpad)}
+                if not o.inpad and o.r < sz['vr'] - 1e-9:
+                    h['via'] = (round(2 * o.r, 4), round(2 * o.dr, 4))     # (a finer rung's: the engine lays it so)
+            h['strict'] = True
+            if key in pair_of and kind == 'escape':
+                h['pair'] = pair_of[key]           # (lay keeps the pair's gate)
+            hints[at] = h
+        kinds = collections.Counter((('bus' if items[k][0] in bus_s else 'plane' if items[k][0] in drop_s
+                                      else 'other'), kind) for k, (kind, _o) in chosen.items())
+        rep = dict(status=_status_name(st), balls=len(items), moves=n_moves, conflicts=len(pairs), conflict_groups=len(groups), conflict_bicliques=len(bigroups),
+                   bus_escaped=kinds[('bus', 'escape')],
+                   bus_balls=sum(1 for k in items if items[k][0] in bus_s),
+                   others_escaped=kinds[('other', 'escape')], others_strapped=kinds[('other', 'strap')],
+                   others_stubbed=kinds[('other', 'stub')],
+                   others_balls=sum(1 for k in items if items[k][0] in oth_s),
+                   dropped=kinds[('plane', 'drop')], plane_strapped=kinds[('plane', 'strap')],
+                   dropped_in_pad=sum(1 for k, (kind, o) in chosen.items() if kind == 'drop' and o.inpad),
+                   drop_vias=len(gap_sites) + sum(1 for k, (kind, o) in chosen.items() if kind == 'drop' and o.inpad),
+                   plane_balls=sum(1 for k in items if items[k][0] in drop_s),
+                   no_move=sorted(k for k in items if not opts[k]),
+                   unplanned=sorted(k for k in items if k not in chosen), clashes=clashes,
+                   climbed=sum(1 for k, (kind, o) in chosen.items() if kind == 'escape' and getattr(o, 'climb', 0)),
+                   streets=sum(1 for k, (kind, o) in chosen.items() if kind == 'escape' and getattr(o, 'street', 0)),
+                   faces=dict(collections.Counter(f'{"bus" if items[k][0] in bus_s else "other"} {o.direction} '
+                                                  f'{o.layer} {o.kind}' for k, (kind, o) in chosen.items()
+                                                  if kind == 'escape')),
+                   # (no tier with a ball to serve -- every ball planned again without an option, zynq U2's four plane
+                   # balls held round the cap step's passives -- asks phase 1 nothing, and its solver has no status)
+                   let_go=list(let_go), phase1=_status_name(st1) if st1 is not None else 'nothing to ask',
+                   phase1_secs=round(t_p1, 1), phase1_tiers=tier_rep,
+                   uncoloured=list(uncoloured),
+                   run_layers=dict(collections.Counter(o.layer for k, (kind, o) in chosen.items()
+                                                       if kind == 'escape' and o.kind != 'surface')) if rls else None,
+                   pairs=len(bm.pairs), pairs_escaped=sum(1 for _b, kp, kn in bm.pairs if kp in chosen and kn in chosen),
+                   hands_held=sorted(hand_rep['held']), hands_free=sorted(hand_rep['free']),
+                   secs=round(time.time() - t0, 1))
+        if debug:
+            # the model's pieces, for checking the answer against them (the conflict pairs, the options) and the solve's
+            # own account of itself (objective, proved bound, wall time, branches)
+            rep['debug'] = dict(items=items, opts=opts, pairs=pairs, groups=groups, bigroups=bigroups, chosen=chosen, cost=cost, sizes=sz,
+                                objective=obj_orig if chosen else None, bound=ans['bound'],
+                                wall=ans['wall'], branches=ans['branches'], conflicts_cp=ans['conflicts_cp'])
+        log(f'  joint escape of {ref}: {rep["status"]} -- bus {rep["bus_escaped"]}/{rep["bus_balls"]}, others '
+            f'{rep["others_escaped"]} escaped + {rep["others_strapped"]} strapped'
+            + (f' + {rep["others_stubbed"]} dog-boned alone' if rep['others_stubbed'] else '')
+            + f' of {rep["others_balls"]}, plane '
+            f'{rep["dropped"]} dropped ({rep["dropped_in_pad"]} in pad)'
+            + (f' + {rep["plane_strapped"]} strapped' if rep['plane_strapped'] else '') + f' of {rep["plane_balls"]}'
+            + (f' on {rep["drop_vias"]} vias' if rep['drop_vias'] != rep['dropped'] else '') + '; '
+            f'{rep["climbed"]} climbs, {rep["streets"]} street vias chosen; {len(rep["no_move"])} balls with no option; '
+            f'{len(clashes)} chosen pairs clash in the laid geometry; '
+            + (f'runs on {rep["run_layers"]}' + (f', {len(uncoloured)} no layer held {uncoloured}' if uncoloured else '')
+               + '; ' if rls else '')
+            + f'served first {rep["phase1"]} in '
+            f'{rep["phase1_secs"]} s' + (f', let go (a proved conflict) {rep["let_go"]}' if rep['let_go'] else '')
+            + (' (the model planned before: its answer kept)' if kept else '')
+            # (each tier's own status where one is not OPTIMAL: a tier out of its time is not held, and its balls are phase
+            # 2's -- the line's FEASIBLE said only that an earlier tier held, and hid the plane tier that left six drops)
+            + (f' (tiers {", ".join(f"{t} {n} {s}" for t, n, s in tier_rep)})'
+               if any(s != 'OPTIMAL' for _t, _n, s in tier_rep) else '')
+            + (f'; pairs held to the other end\'s hand {len(rep["hands_held"])}'
+               + (f', NO exit pair of it {rep["hands_free"]}' if rep['hands_free'] else '') if hands else '')
+            + f'; {rep["secs"]} s')
+        return hints, rep
+
+    if executor is not None:
+        if got_ is not None:
+            return _Deferred(lambda: _finish(got_, True))
+        fut = executor.submit(solve_phases)
+        if skey is not None:
+            _SOLVING[skey] = fut
+            fut.add_done_callback(lambda f_, k_=skey: _SOLVING.pop(k_, None))
+        return _Deferred(lambda: _finish(fut.result(), False), fut)
+    if got_ is None:
+        from concurrent.futures import Future
+        fut = Future() if skey is not None else None
+        if fut is not None:
+            _SOLVING[skey] = fut
+        try:
+            ans = solve_phases()
+        except BaseException as e:
+            if fut is not None:
+                fut.set_exception(e)
+            raise
+        finally:
+            if skey is not None:
+                _SOLVING.pop(skey, None)
+        if fut is not None:
+            fut.set_result(ans)
+    else:
+        ans = got_
+    res = _finish(ans, got_ is not None)
+    # (the model collected here, not at the collector's leisure: the CP-SAT model and its variables hold each other,
+    # and left standing they were under the engine's lay that follows -- the zynq chain's U1 source realize at 1.09
+    # GB, its plan's own peak 0.77)
+    del mdl, v, served
     gc.collect()
-    return hints, rep
+    return res
 
 
 def lay(board, out, ref, bus, others, other_layers, hints, other_pairs=(), plane_drop='auto'):
@@ -2148,7 +2308,7 @@ def planeless_balls(pcb, ref, drops):
 
 
 def fan_array(board, out, ref, bus, others, other_layers, far=None, prefer=None, drops=(), log=print, only=None,
-              rungs=None, filter_nets=(), **solve):
+              rungs=None, filter_nets=(), stand_in=(), **solve):
     """The array's joint escape at ONE size for the whole fanout: planned and laid at the chain's fan track and via,
     and -- only when a ball is left bare or a plane ball undropped -- the whole of it again at the next rung of the
     fab ladder, the via and the track stepped down TOGETHER (list_nets.escalation_rungs, as the under-pad shrink
@@ -2184,6 +2344,7 @@ def fan_array(board, out, ref, bus, others, other_layers, far=None, prefer=None,
             _rules.install(r)
             with contextlib.redirect_stdout(io.StringIO()):
                 pcb = parse_kicad_pcb(board)
+            pcb.vias.extend(stand_in)        # (vias to come the plan leaves room for: fanout_from_plan's tie vias)
             hints, rep = plan_array(pcb, ref, bus, others, other_layers, far=far, prefer=prefer, drops=drops, log=log,
                                     only=only, **solve)
             # (the plan's debug -- its every option, group and pair -- let go before the lay but its choice)

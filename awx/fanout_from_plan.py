@@ -375,6 +375,30 @@ def plan_state(pcb, names, banned=frozenset()):
             own = te._owner(ends[nm][0], [s for s in pcb.segments if s.net_id == nid], others)
             others.sort(key=lambda p: p.component_ref != own)
         src_pad[nm] = others[0] if others else None
+    # a TIE VIA's site (tie_site: a ball with a pad of its own net under it, tied by a via there once its berth is laid)
+    # is a via of its net's from the start: another run net's berth runs and stands off it by the fanout's rule. The
+    # menus above are built with the run's own copper out (a bare array), and the zynq7020's DDR_CK_P was offered -- and
+    # chosen -- a via in its pad running along its ball row across DDR_CK_N's ball, where the tie via then stood
+    ties = {nm: t for nm in names if (t := tie_site(dst_pad[nm], byname[nm][1])) is not None}
+    if ties:
+        from routing_defaults import HOLE_TO_HOLE_CLEARANCE
+        run_bar = te.VIA_SIZE / 2 + sr.FAN_CLEAR + sr.FAN_TRACK / 2
+        via_bar = max(te.VIA_SIZE + sr.FAN_CLEAR, te.VIA_DRILL + HOLE_TO_HOLE_CLEARANCE)
+
+        def on_tie(m, t):
+            return any(_pairs_m._pt_seg(t, a, b) < run_bar - 1e-6 for a, b, _L in (m.legs or ())) or \
+                (m.site is not None and math.hypot(m.site[0] - t[0], m.site[1] - t[1]) < via_bar - 1e-6)
+        import pairs as _pairs_m
+        for nm in names:
+            sites = [t for o, t in ties.items() if o != nm]
+            if not sites:
+                continue
+            keep = [m for m in dmenu[nm] if not any(on_tie(m, t) for t in sites)]
+            if len(keep) < len(dmenu[nm]):
+                print(f'  {nm}: {len(dmenu[nm]) - len(keep)} of {len(dmenu[nm])} berth moves run or stand on another '
+                      f'net\'s tie via site -- dropped')
+                if keep:
+                    dmenu[nm] = keep
     refs = {}
     for nm in names:
         if src_pad[nm] is not None:
@@ -609,6 +633,7 @@ def joint_berths(st, board, choice, log=print):
     names = [st['byname'][nm][1].name for nm in choice if nm in st['byname']]
     pcb = parse_kicad_pcb(board)
     hands = teeth_hands(pcb, list(choice), st['byname'], st['sref'])
+    pcb.vias.extend(tie_stand_ins(pcb, list(choice), st['byname'], st['dst_pad']))    # (as joint_destination's plan)
     # (two plans: the bus PREFERRING the ends model's berths, and every bus berth HELD there, the other balls planned
     # round them -- the better by the plan's own objective kept, of those that serve every ball (no tier short, none
     # let go or unplanned). The held plan is the preferring one's model with the berths fixed, so it can score no
@@ -621,13 +646,24 @@ def joint_berths(st, board, choice, log=print):
         all(s_ == 'OPTIMAL' for _t, _n, s_ in r_.get('phase1_tiers') or ())
     objective = lambda r_: (r_.get('debug') or {}).get('objective')
     plans = {}
-    for how, h_ in (('preferring', None), ('held', hold)):
-        t_ = time.time()
+    # (the two plans' SOLVES at once, each model built and each plan made on this thread -- joint_escape.plan_array's
+    # `executor`: CP-SAT gives up the GIL as it solves, its answer is its model's whatever runs beside it, and two
+    # workers each make four threads in all)
+    from concurrent.futures import ThreadPoolExecutor
+    ex_ = ThreadPoolExecutor(2)
+    try:
         with contextlib.redirect_stdout(io.StringIO()):
-            _h, plans[how] = je.plan_array(pcb, dref, names, a['others'], spec['layers'], prefer=prefer,
-                                           drops=a['drops'], debug=True, log=lambda *a_: None, hands=hands,
-                                           vias_only=route_layers.escape_vias('dest'), exit_rays=True, hold=h_)
-        plans[how]['_secs'] = time.time() - t_
+            pend = []
+            for how, h_ in (('preferring', None), ('held', hold)):
+                pend.append((how, time.time(), je.plan_array(
+                    pcb, dref, names, a['others'], spec['layers'], prefer=prefer, drops=a['drops'], debug=True,
+                    log=lambda *a_: None, hands=hands, vias_only=route_layers.escape_vias('dest'), exit_rays=True,
+                    hold=h_, executor=ex_)))
+            for how, t_, d_ in pend:
+                _h, plans[how] = d_.result()
+                plans[how]['_secs'] = time.time() - t_
+    finally:
+        ex_.shutdown()
     rank = lambda how: (whole(plans[how]), objective(plans[how]) if objective(plans[how]) is not None else -math.inf)
     how = 'held' if rank('held') > rank('preferring') else 'preferring'
     rep = plans[how]
@@ -1535,10 +1571,22 @@ def main():
     # chain lays them and the array's other balls planned round them after (joint_others) -- the joint plan of the
     # whole array chose berths for every ball's sake, and the zynq DDR's ends crossed 260 times to the chain's 202
     joint_dest = bool(awx_settings.get('FANOUT_JOINT')) and len(route_layers.layers()) > 2
-    if joint_dest:
-        rc = joint_destination(out_path, names, choice, dref, byname, board, banned)
-    else:
-        rc = fanout_destination(out_path, names, choice, dst_pad, dref, byname, board, realized, banned)
+    spec_ = None
+    try:
+        if joint_dest:
+            spec_ = speculate_others(board, {dref})
+            rc = joint_destination(out_path, names, choice, dref, byname, board, banned)
+        else:
+            rc = fanout_destination(out_path, names, choice, dst_pad, dref, byname, board, realized, banned)
+        return _after_destination(out_path, names, dref, rc, joint_dest)
+    finally:
+        if spec_ is not None:
+            spec_.wait()            # (the speculative plan's solve ended before the fanout returns, on any path:
+            #                         never left solving beside the stage after it; its failure only an answer not kept)
+
+
+def _after_destination(out_path, names, dref, rc, joint_dest):
+    """the fanout's last steps after the destination's: the audit, then the arrays' other balls (joint_others)"""
     # THE FANOUT AUDIT on the board handed back: a fanout NEVER hands back one the whole route would refuse -- a pair
     # split the destination's re-plans could not clear (a tooth's, or a berth's with nothing left to ban), or anything
     # else its frame stops on. Such a board is set aside, named, and no board goes to the stage after
@@ -1577,9 +1625,11 @@ def joint_destination(out_path, names, choice, dref, byname, board, banned, log=
         f'{len(banned)} banned move(s))')
     pcb = parse_kicad_pcb(board)
     hands = teeth_hands(pcb, list(names), byname, sref) if sref in pcb.footprints else {}
+    st = plan_state(parse_kicad_pcb(board), names, banned)
+    stand_in = tie_stand_ins(pcb, names, byname, st['dst_pad'])
     rung, reps = je.fan_array(board, out_path, dref, list(names), a['others'], spec['layers'], prefer=prefer,
                               drops=a['drops'], log=log, debug=True, hands=hands,
-                              vias_only=route_layers.escape_vias('dest'), exit_rays=True)
+                              vias_only=route_layers.escape_vias('dest'), exit_rays=True, stand_in=stand_in)
     kept = next(r for r in reps if (r['track'], r['via'], r['drill']) == (rung.fan_track, rung.via_size,
                                                                           rung.via_drill))
     bus_s = {je.short_name(nm) for nm in names}
@@ -1612,7 +1662,6 @@ def joint_destination(out_path, names, choice, dref, byname, board, banned, log=
     # copper stands (braid_plan_of's `achieved`, as fanout_destination measures it), never the planned exit: the engine's
     # stub ends past it (zynq's U5, 25 um), and the relayer, walking from the planned point along a stub it lies in the
     # middle of, found no run to a via at any of the 25 berths it was to move onto the solve's layers
-    st = plan_state(parse_kicad_pcb(board), names, banned)
     ch_laid = {nm: laid[je.short_name(nm)] for nm in choice if je.short_name(nm) in laid}
     with contextlib.redirect_stdout(io.StringIO()):
         pcb_out = parse_kicad_pcb(out_path)
@@ -1643,6 +1692,46 @@ def joint_destination(out_path, names, choice, dref, byname, board, banned, log=
     return 1 if bare_bus else 0
 
 
+def _joint_held():
+    """(the previous round's board, the arrays' sizes it kept -- None in a first round): what an INCREMENTAL round's
+    joint_others holds its arrays to"""
+    prev = awx_settings.get('INCREMENTAL') if PLAN_JUDGE == 'ends' else None
+    prev_stem = prev[:-len('.plan.json')] if prev and prev.endswith('.plan.json') else None
+    prev_board, prev_side = (f'{prev_stem}.kicad_pcb', f'{prev_stem}.joint.json') if prev_stem else (None, None)
+    held = json.load(open(prev_side)) if prev_side and os.path.isfile(prev_side) and os.path.isfile(prev_board) \
+        else None
+    return prev_board, held
+
+
+def speculate_others(board, skip):
+    """joint_others' first plan -- the source's other balls and plane balls, at the chain's own sizes -- asked BESIDE the
+    destination's joint plan: its model built now, on the board as it stands before the destination's copper is laid,
+    its solve run on another thread (a joint_escape._Deferred, whose wait() ends with the solve; None where
+    joint_others plans nothing so). joint_escape keeps each model's answer: joint_others' own call finds it where that
+    copper left the source's model as it was, and solves its own where it did not -- the same plan either way
+    (joint_escape._SOLVED)"""
+    path = awx_settings.get('FANOUT_JOINT')
+    if not path:
+        return None
+    spec = json.load(open(path))
+    _pb, held = _joint_held()
+    a = next((a for a in spec['arrays'] if a['ref'] not in skip and not (held and a['ref'] in held)), None)
+    if a is None:
+        return None
+    import joint_escape as je
+    from concurrent.futures import ThreadPoolExecutor
+    ex = ThreadPoolExecutor(1)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            pcb = parse_kicad_pcb(board)
+            # (the model built here, its solve on the executor's thread -- joint_escape.plan_array's `executor`: a
+            # second thread building a plan swaps sys.stdout under this one's output and leaves it on a buffer)
+            return je.plan_array(pcb, a['ref'], [], a['others'], spec['layers'], far=None, prefer=None,
+                                 drops=a['drops'], log=lambda *a_: None, only=None, executor=ex)
+    finally:
+        ex.shutdown(wait=False)
+
+
 def joint_others(out_path, log=print, skip=()):
     """FANOUT_JOINT (route_bus --joint-fanout): a JSON file naming the arrays whose OTHER nets and plane balls are
     fanned with the bus's -- {"layers": [the others' layers], "arrays": [{"ref", "others", "drops"}, ...]}. The bus
@@ -1661,11 +1750,7 @@ def joint_others(out_path, log=print, skip=()):
     import joint_escape as je
     spec = json.load(open(path))
     stem = out_path[:-len('.kicad_pcb')] if out_path.endswith('.kicad_pcb') else out_path
-    prev = awx_settings.get('INCREMENTAL') if PLAN_JUDGE == 'ends' else None
-    prev_stem = prev[:-len('.plan.json')] if prev and prev.endswith('.plan.json') else None
-    prev_board, prev_side = (f'{prev_stem}.kicad_pcb', f'{prev_stem}.joint.json') if prev_stem else (None, None)
-    held = json.load(open(prev_side)) if prev_side and os.path.isfile(prev_side) and os.path.isfile(prev_board) \
-        else None
+    prev_board, held = _joint_held()
     kept = {}
     cur = out_path
     for a in spec['arrays']:
@@ -1835,6 +1920,41 @@ def pair_exit_clear(pcb, nid, other, m, reach=None, free=(), layer=None):
     return True
 
 
+def tie_stand_ins(pcb, names, byname, dst_pad):
+    """the TIE VIAS' sites (tie_vias_under: a ball with a pad of its own net under it is tied by a via at the ball once
+    its berth is laid) as stand-in vias, each its net's, for a joint plan of the destination (joint_berths,
+    joint_destination: joint_escape.fan_array's `stand_in`) -- the other nets' escapes go round each as round any via.
+    Unknown to the plans, the zynq7020's DDR_CK_P escaped by a via in its pad and a run along its ball row across
+    DDR_CK_N's ball, the tie via was laid on that run, and the bus handed on a short"""
+    from kicad_parser import Via
+    with contextlib.redirect_stdout(io.StringIO()):
+        sites = tie_vias_under(pcb, list(names), byname, dst_pad, [], log=lambda *a_: None)
+    return [Via(x=t['x'], y=t['y'], size=t['size'], drill=t['drill'], layers=['F.Cu', 'B.Cu'], net_id=t['net_id'],
+                locked=True) for t in sites]
+
+
+def tie_site(ball, net):
+    """(x, y): where the TIE VIA of destination ball `ball` stands (tie_vias_under) -- at the ball, nudged toward the
+    first pad of its `net` under it within the ball's own slack, so the barrel's far annulus lies in the pad's copper;
+    None where no pad of its net lies under it"""
+    import pairs as _pairs
+    if ball is None:
+        return None
+    under = [q for q in net.pads if _pairs.under_pad(ball, q, te.VIA_SIZE)]
+    if not under:
+        return None
+    q = under[0]
+    r_ball = min(ball.size_x, ball.size_y) / 2
+    bx, by = ball.global_x, ball.global_y
+    slack = max(r_ball - te.VIA_SIZE / 2, 0.0)
+    dx, dy = q.global_x - bx, q.global_y - by
+    d = math.hypot(dx, dy)
+    if d <= 1e-9:
+        return bx, by
+    m = min(slack, d)
+    return bx + dx / d * m, by + dy / d * m
+
+
 def tie_vias_under(pcb, nms, byname, dst_pad, vias_add, log=print):
     """A TIE VIA for every destination ball with a pad of its OWN net under
     it on the other layer (a back-side termination under a DDR clock ball,
@@ -1863,13 +1983,7 @@ def tie_vias_under(pcb, nms, byname, dst_pad, vias_add, log=print):
                 or any(v.net_id == nid and math.hypot(v.x - bx, v.y - by) <= r_ball for v in pcb.vias):
             continue
         q = under[0]
-        slack = max(r_ball - te.VIA_SIZE / 2, 0.0)
-        dx, dy = q.global_x - bx, q.global_y - by
-        d = math.hypot(dx, dy)
-        x, y = bx, by
-        if d > 1e-9:
-            m = min(slack, d)
-            x, y = bx + dx / d * m, by + dy / d * m
+        x, y = tie_site(ball, net)
         need = te.VIA_SIZE / 2 + sr.FAN_CLEAR
         bad = None
         for fp in pcb.footprints.values():
@@ -1889,6 +2003,15 @@ def tie_vias_under(pcb, nms, byname, dst_pad, vias_add, log=print):
                     break
             if bad:
                 break
+        if not bad:
+            # (a track of another net, on any layer: the via is a barrel on every one -- unchecked, the zynq7020's
+            # DDR_CK_N tie was laid on DDR_CK_P's escape run along its ball row, a short the bus handed on)
+            for sg in pcb.segments:
+                if sg.net_id != nid and getattr(sg, 'graphic', False) is False and \
+                        _pairs._pt_seg((x, y), (sg.start_x, sg.start_y), (sg.end_x, sg.end_y)) \
+                        < need + sg.width / 2 - 1e-6:
+                    bad = f'a track of {pcb.nets[sg.net_id].name if sg.net_id in pcb.nets else sg.net_id}'
+                    break
         if not bad:
             for v in list(pcb.vias) + list(vias_add or []):
                 vx, vy = (v.x, v.y) if hasattr(v, 'x') else (v['x'], v['y'])

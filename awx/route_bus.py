@@ -428,7 +428,7 @@ def _route(board, out, src, dest, k, rounds, inproc, log, run_rules, json_out=No
         # (only the passives beneath the bus's own two arrays: another array's are another step's -- joint_escape.
         # passives_beyond, locked)
         import joint_escape as je
-        lock_ = je.passives_beyond(fanned, [src, dest])
+        lock_ = je.passives_beyond(fanned, [src, dest], names)
         rcn = wr.run([os.path.join('..', 'py_router', 'place_fanout_clearance.py'), fanned, fanned,
                       '--clearance', str(te.SPEC_CLEARANCE), '--beneath-only'] + (['--lock'] + lock_ if lock_ else []),
                      dict(os.environ), log_path=os.path.join(work, 'caps.log'), own_process=True)[0]
@@ -466,7 +466,7 @@ def _route(board, out, src, dest, k, rounds, inproc, log, run_rules, json_out=No
                 dga.dogbone_file(base_e, fanned_e, [src, dest], log=elog.append)
                 fix_project_for_output(fanned_e, clearance=te.SPEC_CLEARANCE, track_width=sr.FAN_TRACK,
                                        via_diameter=te.VIA_SIZE, via_drill=te.VIA_DRILL, verbose=False)
-            lock_e = je.passives_beyond(fanned_e, [src, dest])
+            lock_e = je.passives_beyond(fanned_e, [src, dest], names)
             wr.run([os.path.join('..', 'py_router', 'place_fanout_clearance.py'), fanned_e, fanned_e,
                     '--clearance', str(te.SPEC_CLEARANCE), '--beneath-only'] + (['--lock'] + lock_e if lock_e else []),
                    dict(os.environ), log_path=os.path.join(work, 'caps_ends.log'), own_process=True)
@@ -758,11 +758,16 @@ def plane_grade(pcb, board, routed, log=print):
 
 def array_others(pcb, ref, names):
     """the nets of `ref`'s pads the joint fanout lays beside the bus: every net with a pad on the array that is not
-    one of the bus's (`names`) and owns no zone -- a plane net's balls get the engine's plane drops instead"""
+    one of the bus's (`names`) and owns no zone -- a plane net's balls get the engine's plane drops instead. A ball
+    whose net has no other pad on the board (a no-connect, KiCad's 'unconnected-(...)') has nothing to reach and is
+    left out, as bga_fanout fans none (#122): planned, it took an escape's room from the nets that have somewhere to
+    go, the engine laid it nothing, and the ball read bare -- the whole array planned again a rung down the fab
+    ladder for it (zynq7020_som: U2's unused FPGA pins)"""
     zone_ids = {z.net_id for z in (pcb.zones or []) if z.net_id}
     bus = {short_name(n) for n in names}
     return sorted({p.net_name for p in pcb.footprints[ref].pads
-                   if p.net_id and p.net_name and p.net_id not in zone_ids and short_name(p.net_name) not in bus})
+                   if p.net_id and p.net_name and p.net_id not in zone_ids and short_name(p.net_name) not in bus
+                   and len(pcb.pads_by_net.get(p.net_id, ())) >= 2})
 
 
 def others_left_out(spec, pcb, names, run):

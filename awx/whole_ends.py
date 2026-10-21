@@ -64,6 +64,7 @@ sys.path.insert(0, os.path.join(HERE, '..', 'py_router'))
 import pairs as _pairs  # noqa: E402
 import braid as _bd  # noqa: E402
 import select_moves as _sm  # noqa: E402
+import ends_kernel as _ek  # noqa: E402
 _LANE_PITCH = _bd.LANE_MIN                   # a crossing's length along a lane holding its line
 _CHG_ROOM = 2 * 1.1 * _bd.VIA_NEED           # a layer change's room along its lane (whole_solve: VR_STAY x a via's room)
 
@@ -685,10 +686,25 @@ class Ends:
         key = (tuple(state[l_] for l_, _lg in self.lanes), exact, self.wcut, self.unpriced)
         v = self._memo.get(key)
         if v is None:
-            v, p = self._score(state, exact)
+            kh = None if exact else self._kernel()
+            if kh is not None and _ek.MODE != 'check':
+                v = kh.objective(self, state)
+            else:
+                v, p = self._score(state, exact)
+                self._keep_parts(key, p)
+                if kh is not None:
+                    _ek.check(self, state, v, p)
             self._memo[key] = v
-            self._keep_parts(key, p)
         return v
+
+    def _kernel(self):
+        """the estimate's Rust kernel of this model (ends_kernel), built on its first question and shared by its copies
+        (cut_phase's); None where it does not reach"""
+        kh = self.__dict__.get('_kh', False)
+        if kh is False:
+            kh = _ek.build(self) if _ek.reaches(self) else None
+            self._kh = kh
+        return kh
 
     def _keep_parts(self, key, p):
         self._parts[key] = p
@@ -1667,8 +1683,17 @@ class Ends:
         missing = [l_ for l_ in state if state[l_][0] is None or state[l_][1] is None]
         if missing:
             raise SystemExit(f'whole_ends: no tooth or berth option for {missing}')
-        best, parts = self.score(state)
         tabu = getattr(self, 'tabu', None) or set()     # (lane, end, option) a ban kick forbids (ban_kicks)
+        kh = self._kernel()
+        if kh is not None and _ek.MODE == '1' and log is not print and not self.unpriced:
+            # (the same loop in the kernel, ends_kernel: each sweep's line said with its state's parts)
+            state, best, sweeps_ = kh.search(self, state, sweeps, tabu)
+            for sw, (b_, s_) in enumerate(sweeps_):
+                log(f'  whole ends: sweep {sw}: objective {b_:.2f} {self.score(s_)[1]}')
+            self.pool[tuple(sorted(state.items()))] = best
+            self.pool_all.add(tuple(sorted(state.items())))
+            return state
+        best, parts = self.score(state)
         set_ = lambda s_, l_, e_, i_: {**s_, l_: ((s_[l_][0], i_) if e_ else (i_, s_[l_][1]))}
         for sw in range(sweeps):
             improved = False
@@ -2781,7 +2806,7 @@ def plane_ways(st, lanes, T, B, cur):
             continue
         grid = em.grid_of(foot)
         sz = je._sizes(pcb0, foot)
-        skip = je.movable_refs(pcb0, ref)
+        skip = je.movable_refs(pcb0, ref, run)
         cache = {}
 
         def obs(nid, layer, via=False, _c=cache, _sz=sz, _skip=skip):

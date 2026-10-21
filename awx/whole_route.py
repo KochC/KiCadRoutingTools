@@ -1499,7 +1499,8 @@ def chain(K, o, R=3, base=None, dest=None, settings=None):
             # step's, locked -- joint_escape.passives_beyond. Unscoped, the zynq's DDR step moved two parts beneath the
             # LVDS bus's U5)
             import joint_escape as je_
-            lock_ = je_.passives_beyond(bench, [a_['ref'] for a_ in json.load(open(env['FANOUT_JOINT']))['arrays']])
+            lock_ = je_.passives_beyond(bench, [a_['ref'] for a_ in json.load(open(env['FANOUT_JOINT']))['arrays']],
+                                        [n_ for n_ in NETS.split(',') if n_])
             rcn = run([os.path.join('..', 'py_router', 'place_fanout_clearance.py'), bench, bench,
                        '--clearance', str(_rules.active().clearance), '--beneath-only']
                       + (['--lock'] + lock_ if lock_ else []), env,
