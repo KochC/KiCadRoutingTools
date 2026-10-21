@@ -25,8 +25,15 @@ import sys, json, math, collections, functools, time
 import awx_settings
 import numpy as np
 from scipy.optimize import linprog
-from scipy.sparse import coo_matrix, csr_matrix, hstack
+from scipy.sparse import coo_matrix, csr_matrix, hstack, vstack
 from types import SimpleNamespace
+try:
+    import scipy.optimize._highspy._core as _hs      # (scipy's own HiGHS, as linprog runs it, with its basis: lp_by_dual)
+    if not all(hasattr(_hs, a) for a in ('_Highs', 'HighsLp', 'HighsBasis', 'HighsBasisStatus', 'HighsModelStatus',
+                                         'MatrixFormat')):
+        _hs = None                                    # (a scipy whose binding lacks them: linprog, as before)
+except Exception:
+    _hs = None
 import detmath
 import whole_ctx
 import whole_frame
@@ -982,7 +989,11 @@ def lp_lazy(c, A, b, bnd, lz, nv, xo):
     (the first nv columns), each extra column at the least its tangents there ask -- then again with every row its
     answer breaks (and those near binding beside them), until it breaks none: then it is the whole LP's optimum, its
     tie-break making that one point. The two-end USB and Ethernet bus's second pass, 228 000 rows: two solves on
-    130 000 of them, 40 s to 16 s, the same geometry. (res, solves, rows taken)"""
+    130 000 of them, 40 s to 16 s, the same geometry. Each solve after the first starts from the one before's basis
+    (lp_by_dual's `warm`): the rows it adds are columns of the dual, so the answer before stays feasible there, and the
+    primal simplex goes on from it; the last rows are then solved once more from cold, for the answer as it was --
+    sdi_mipi_conv's DDR3 bus's second pass, four solves on 179 000 of its 317 000 rows, 80 s to 38 s, the same
+    geometry. (res, solves, rows taken)"""
     A = A.tocsr()
     tol = LAZY_TOL * (1.0 + np.abs(b))
     s_ = A[:, :nv] @ xo - b
@@ -992,24 +1003,87 @@ def lp_lazy(c, A, b, bnd, lz, nv, xo):
     np.maximum.at(ex, Ae.col[m], s_[Ae.row[m]] / -Ae.data[m])
     near = lambda x_: (A @ x_ - b) > -LAZY_NEAR - tol
     active = ~lz | near(np.concatenate([xo, ex]))
-    n_ = 0
+    n_, warm = 0, None
     while True:
         n_ += 1
-        res = lp_by_dual(c, A[active], b[active], bnd)
+        took = np.flatnonzero(active)
+        res = lp_by_dual(c, A[active], b[active], bnd, warm=warm)
         if res.status != 0:
             return res, n_, int(active.sum())
         new = ((A @ res.x - b) > tol) & ~active
         if not new.any():
+            if warm is not None:
+                # ...the rows that hold, solved once more from cold: the interior point's answer, bit for bit. The
+                # simplex lands on the same optimum within the solver's tolerances, a quantum of lp_round off in a few
+                # columns, and the geometry after it decides by exact ties (two pieces merged where their cross
+                # product is under 1e-9): zynq_ad9364's LVDS bus, its loop's second geometry so taken, went another
+                # way from there
+                res = lp_by_dual(c, A[active], b[active], bnd)
             return res, n_, int(active.sum())
         active |= near(res.x) & ~active
+        warm = _widened(res.basis, took, np.flatnonzero(active)) if res.basis is not None else None
 
 
-def lp_by_dual(c, A, b, bnd):
+def _widened(basis, was, now):
+    """lp_by_dual's basis of an LP on the rows `was`, for the same LP on the rows `now` (a superset): the dual's columns
+    are the rows taken, in their order, then the bounds' multipliers -- a row taken before keeps its column's status, a
+    new one's starts nonbasic at zero; the dual's rows (the LP's columns) keep theirs"""
+    cs, rs = basis
+    at = np.full(int(now[-1]) + 1, -1)
+    at[was] = np.arange(len(was))
+    q_ = at[now]
+    return np.concatenate([np.where(q_ >= 0, cs[np.maximum(q_, 0)], int(_hs.HighsBasisStatus.kLower)), cs[len(was):]]), rs
+
+
+def _highs_dual(cd, Aub, bub, Aeq, beq, warm=None):
+    """(the row duals of Aub's rows, of Aeq's, the basis (column, row statuses)) of min cd'y, Aub y <= bub, Aeq y = beq,
+    y >= 0 -- by HiGHS's interior point and crossover with linprog's own settings for 'highs-ipm' (the same answer bit
+    for bit), or, from the basis `warm` of the same model, by its primal simplex; None where it does not end optimal"""
+    A = vstack([Aub, Aeq]).tocsc()
+    lp = _hs.HighsLp()
+    lp.num_col_, lp.num_row_ = A.shape[1], A.shape[0]
+    lp.col_cost_ = np.asarray(cd, float)
+    lp.col_lower_, lp.col_upper_ = np.zeros(A.shape[1]), np.full(A.shape[1], np.inf)
+    lp.row_lower_ = np.concatenate([np.full(Aub.shape[0], -np.inf), beq])
+    lp.row_upper_ = np.concatenate([bub, beq])
+    am = lp.a_matrix_
+    am.format_ = _hs.MatrixFormat.kColwise
+    am.num_col_, am.num_row_ = A.shape[1], A.shape[0]
+    am.start_, am.index_, am.value_ = A.indptr.astype(np.int32), A.indices.astype(np.int32), A.data.astype(float)
+    h = _hs._Highs()
+    h.setOptionValue('output_flag', False)
+    if warm is None:
+        h.setOptionValue('solver', 'ipm')
+        h.setOptionValue('ipm_iteration_limit', IPM_ITERS)
+        h.setOptionValue('simplex_iteration_limit', IPM_ITERS)
+    else:
+        h.setOptionValue('solver', 'simplex')
+        h.setOptionValue('simplex_strategy', 4)          # (primal: the warm basis is feasible, not yet optimal)
+    h.passModel(lp)
+    if warm is not None:
+        st_ = {int(s): s for s in (_hs.HighsBasisStatus.kLower, _hs.HighsBasisStatus.kBasic, _hs.HighsBasisStatus.kUpper,
+                                    _hs.HighsBasisStatus.kZero, _hs.HighsBasisStatus.kNonbasic)}
+        b_ = _hs.HighsBasis()
+        b_.col_status = [st_[v] for v in warm[0].tolist()]
+        b_.row_status = [st_[v] for v in warm[1].tolist()]
+        b_.valid = True
+        h.setBasis(b_)
+    h.run()
+    if h.getModelStatus() != _hs.HighsModelStatus.kOptimal:
+        return None
+    y = np.asarray(h.getSolution().row_dual)
+    b_ = h.getBasis()
+    return (y[:Aub.shape[0]], y[Aub.shape[0]:],
+            (np.array([int(s) for s in b_.col_status]), np.array([int(s) for s in b_.row_status])))
+
+
+def lp_by_dual(c, A, b, bnd, warm=None):
     """min c'x subject to A x <= b and the column bounds bnd, solved as its DUAL by the same solver (scipy's HiGHS
     interior point) and x read back from the dual's multipliers: the same optimum. This LP has more rows than columns
     and an elastic slack on most rows; its dual has a row per column, and every slack's is a plain inequality --
     HiGHS's interior point takes it six times faster (K51 pass 2: 31 s, not 188). The LP has many optima; the dual
-    lands on one of them, as the primal does."""
+    lands on one of them, as the primal does. `warm`: the basis of an earlier solve (_widened), started from by the
+    simplex; the answer carries `basis`, its own (None off scipy's HiGHS)"""
     lo = np.array([-np.inf if l_ is None else l_ for l_, _h in bnd], float)
     hi = np.array([np.inf if h_ is None else h_ for _l, h_ in bnd], float)
     A = A.tocsc()
@@ -1025,18 +1099,27 @@ def lp_by_dual(c, A, b, bnd):
     args = (np.concatenate([b, -lo[fl], hi[fh]]),)
     kw = dict(A_ub=hstack([AT[plain], csr_matrix((int(plain.sum()), len(fl) + len(fh)))]).tocsr(), b_ub=c[plain],
               A_eq=hstack([AT[bj], U, W]).tocsr(), b_eq=c[bj], bounds=(0, None))
-    res = linprog(*args, **kw, method='highs-ipm', options={'maxiter': IPM_ITERS})
-    if res.status != 0:
+    x = np.zeros(n)
+    r = None
+    if _hs is not None and warm is not None:
+        r = _highs_dual(args[0], kw['A_ub'], kw['b_ub'], kw['A_eq'], kw['b_eq'], warm)
+    if _hs is not None and r is None:
+        r = _highs_dual(args[0], kw['A_ub'], kw['b_ub'], kw['A_eq'], kw['b_eq'])
+    if r is not None:
+        x[plain], x[bj] = -r[0], -r[1]
+        x = detmath.lp_round(x)
+        return SimpleNamespace(status=0, message='', x=x, fun=math.fsum(c * x), basis=r[2])
+    res = linprog(*args, **kw, method='highs-ipm', options={'maxiter': IPM_ITERS}) if _hs is None else None
+    if res is None or res.status != 0:
         # ...an interior point that does not end -- zynq K18's pass 2 ran 2329 iterations in a minute and on for half an
         # hour, residuals at 1e-15 and never declared optimal -- by the dual simplex: the same LP, one optimum
         # (detmath.lp_tie_break), the same point after lp_round
         res = linprog(*args, **kw, method='highs-ds')
-    x = np.zeros(n)
     if res.status == 0:
         x[plain] = -res.ineqlin.marginals
         x[bj] = -res.eqlin.marginals
     x = detmath.lp_round(x)
-    return SimpleNamespace(status=res.status, message=res.message, x=x, fun=math.fsum(c * x))
+    return SimpleNamespace(status=res.status, message=res.message, x=x, fun=math.fsum(c * x), basis=None)
 
 
 ROOMLESS = {}
