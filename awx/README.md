@@ -60,7 +60,7 @@ H3 to DDR3 (`fb_t2q_pairs`):
 
 | | K15 | K28 | K35 | K41 | K51 |
 |---|---|---|---|---|---|
-| **the whole route** | **12 v, 194 mm** | **32 v, 543 mm** | **42 v, 759 mm** | **54 v, 967 mm** | **80 v, 1254 mm** |
+| **the whole route** | **12 v, 194 mm** | **32 v, 543 mm** | **42 v, 759 mm** | **54 v, 967 mm** | **80 v, 1262 mm** |
 | human | 22 v, 232 mm | 48 v, 678 mm | 60 v, 889 mm | 70 v, 1081 mm | 88 v, 1337 mm |
 
 Zynq to DDR3 (the article's first build, 44 lanes in the ladder; see
