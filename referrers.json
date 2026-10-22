@@ -1662,5 +1662,57 @@
    "referrer": "search.brave.com",
    "uniques": 8
   }
+ ],
+ "2026-10-22": [
+  {
+   "count": 307,
+   "referrer": "Google",
+   "uniques": 195
+  },
+  {
+   "count": 115,
+   "referrer": "github.com",
+   "uniques": 68
+  },
+  {
+   "count": 112,
+   "referrer": "forum.kicad.info",
+   "uniques": 92
+  },
+  {
+   "count": 35,
+   "referrer": "DuckDuckGo",
+   "uniques": 25
+  },
+  {
+   "count": 26,
+   "referrer": "linkedin.com",
+   "uniques": 11
+  },
+  {
+   "count": 16,
+   "referrer": "news.ycombinator.com",
+   "uniques": 16
+  },
+  {
+   "count": 16,
+   "referrer": "youtube.com",
+   "uniques": 13
+  },
+  {
+   "count": 15,
+   "referrer": "Bing",
+   "uniques": 14
+  },
+  {
+   "count": 12,
+   "referrer": "github-com.btglss.net",
+   "uniques": 11
+  },
+  {
+   "count": 9,
+   "referrer": "hackaday.io",
+   "uniques": 4
+  }
  ]
 }
