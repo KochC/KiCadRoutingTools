@@ -2873,7 +2873,9 @@ def plane_ways(st, lanes, T, B, cur):
             dw[key] = []
             for d in je._drops(pcb0, grid, p, obs, sz, foot, (), regions):
                 dw[key].append(len(ways))
-                ways.append(dict(end=end, site=tuple(d.site), r=d.r, dr=d.dr, stub=d.stub, layer=d.layer))
+                # (its ring: joint_escape's own measure of a drop near a lane's way out, exit_ray_conflicts')
+                ways.append(dict(end=end, site=tuple(d.site), r=d.r, dr=d.dr, stub=d.stub, layer=d.layer,
+                                 ring=je._ring(tuple(d.site), d.r)))
         sw = collections.defaultdict(list)
         for key, ss in je._straps(pcb0, grid, items, obs).items():
             for s in ss:
@@ -2935,7 +2937,7 @@ def plane_ways(st, lanes, T, B, cur):
                 dd = math.hypot(c[0] - s[0], c[1] - s[1])
                 if dd < r + rv + cl - 1e-9 or dd < w['dr'] + dv + h2h - 1e-9:
                     return True
-            if ray is not None and _seg_d(s, s, ray[0], ray[1]) - r < bar - 1e-9:
+            if ray is not None and _seg_d(s, s, ray[0], ray[1]) - w['ring'] < bar - 1e-9:
                 return True
         if w.get('stub'):
             a0, b0 = w['stub']

@@ -365,6 +365,13 @@ A plane ball goes down to its plane as the human's do, sharing vias:
   face stood between RX_FRAME's two berths, and two flanked EN_AGC's, each
   2.5 um short of the bar; the snap found no way out for either. On the LVDS
   bus's first 32 nets the best round went from 3 nets open to 1.
+- **A drop's via measured as the router stamps it:** by its ring about the
+  grid point it rounds to (`pairs.svia_reach`), as the whole route's audit
+  measures it, in the joint escape's lane tests and the ends model's ways
+  down (`joint_escape._ring`). At its own radius, h616's GND drop on U1's
+  south face left SDQ6's and SDQM1's lanes 0.175 mm each for a bar of 0.166;
+  the audit read 0.130 from the ring, and the bus loop stopped at those ends
+  two rounds running. Measured by its ring, the bus passes.
 - **A finer via where the rung's does not fit:** a gap or a site off the edge
   the rung's via does not fit takes the largest of the fab ladder's vias
   that does, laid at that size and disclosed as a narrowing, as a pad too

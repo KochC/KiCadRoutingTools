@@ -372,9 +372,10 @@ def lane_rays(pcb, grid, foot, nets, reach=LANE_REACH):
 def _lanes_clear(site, r, rays):
     """a via of radius `r` at `site` leaves every lane of `rays` its bar: half the route's track, its clearance (the
     hug), and half a grid step for a line off the grid -- the bar the whole route's static audit holds a lane's end to
-    (plan_audit.check_static)"""
+    (plan_audit.check_static), from the via's ring (_ring), as the audit measures it"""
     import braid as te
     bar = te.TRACK / 2 + te.CLEAR + te.GRID / 2
+    r = _ring(site, r)
     for a, b in rays:
         dx, dy = b[0] - a[0], b[1] - a[1]
         t = max(0.0, min(1.0, ((site[0] - a[0]) * dx + (site[1] - a[1]) * dy) / (dx * dx + dy * dy or 1.0)))
@@ -383,15 +384,26 @@ def _lanes_clear(site, r, rays):
     return True
 
 
+def _ring(site, r):
+    """how far a via of radius `r` at `site` reaches for a lane: the router keeps a track's grid cells off its ring
+    about the grid point it rounds to (pairs.svia_reach), as the whole route's audit measures it. Measured at its own
+    radius, h616's GND drop on U1's south face, between SDQ6's and SDQM1's stub ends, left each 0.175 for a bar of
+    0.166; the audit read 0.130 from the ring, and the loop stopped at those ends two rounds running"""
+    import braid as te
+    import pairs as _pairs
+    cfg = types.SimpleNamespace(grid_step=te.GRID, track_width=te.TRACK, clearance=te.CLEAR, via_size=te.VIA_SIZE)
+    return max(r, _pairs.svia_reach(cfg, site[0], site[1], 2 * r))
+
+
 def exit_ray_conflicts(opts, net_of, bus, vr):
     """[(key, i, key2, j)]: a plane ball's DROP option whose via stands in the way out of a BUS escape option -- its
-    lane goes on from the exit, straight out past the face (lane_rays' reach), and the via leaves it less than its
-    bar (_lanes_clear's), so the two are not both laid. `opts` {ball key: [(kind, option, piece)]}, `net_of` {ball
-    key: its net's short name}, `bus` the bus's short names, `vr` the largest via radius a drop takes. The drops are
-    planned with the berths (plan_array), before any lane stands to keep them off (_drops' rays: the lanes laid
-    already): on the zynq LVDS bus's U5, RFGND's G12 was dropped 0.14 mm past the west face between RX_FRAME's two
-    berths, 0.400 mm from each lane for 0.4025, and two RFGND vias 0.4 mm either side of EN_AGC's berth on the south
-    face -- the snap found no end connector for the pair and no way out for the single"""
+    lane goes on from the exit, straight out past the face (lane_rays' reach), and the via's ring (_ring) leaves it
+    less than its bar (_lanes_clear's), so the two are not both laid. `opts` {ball key: [(kind, option, piece)]},
+    `net_of` {ball key: its net's short name}, `bus` the bus's short names, `vr` the largest via radius a drop takes.
+    The drops are planned with the berths (plan_array), before any lane stands to keep them off (_drops' rays: the
+    lanes laid already): on the zynq LVDS bus's U5, RFGND's G12 was dropped 0.14 mm past the west face between
+    RX_FRAME's two berths, 0.400 mm from each lane for 0.4025, and two RFGND vias 0.4 mm either side of EN_AGC's berth
+    on the south face -- the snap found no end connector for the pair and no way out for the single"""
     import braid as te
     from escape_moves import DIRS
     bar = te.TRACK / 2 + te.CLEAR + te.GRID / 2
@@ -405,7 +417,7 @@ def exit_ray_conflicts(opts, net_of, bus, vr):
             u = DIRS[o.direction]
             a = tuple(o.exit_pt)
             b = (a[0] + u[0] * LANE_REACH, a[1] + u[1] * LANE_REACH)
-            g = vr + bar
+            g = _ring((te.GRID / 2, te.GRID / 2), vr) + bar     # (the widest ring a drop's via has: half a step off)
             for cx in range(int(math.floor(min(a[0], b[0]) - g)), int(math.floor(max(a[0], b[0]) + g)) + 1):
                 for cy in range(int(math.floor(min(a[1], b[1]) - g)), int(math.floor(max(a[1], b[1]) + g)) + 1):
                     cells[(cx, cy)].append((k, j, a, b))
@@ -415,8 +427,9 @@ def exit_ray_conflicts(opts, net_of, bus, vr):
             if kind != 'drop':
                 continue
             seen = set()
+            r = _ring(o.site, o.r)
             for (k2, j, a, b) in cells.get((int(math.floor(o.site[0])), int(math.floor(o.site[1]))), ()):
-                if (k2, j) not in seen and _pt_seg(o.site, a, b) - o.r < bar - 1e-9:
+                if (k2, j) not in seen and _pt_seg(o.site, a, b) - r < bar - 1e-9:
                     seen.add((k2, j))
                     out.append((k, i, k2, j))
     return out
