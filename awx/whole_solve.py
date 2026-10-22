@@ -43,7 +43,6 @@ VR_STAY = 1.1                          # a change's room from a stayer's crossin
 KMAX = 3                               # layer changes per lane at most (every proved plan K15-K51 has 2 at most: a
                                        # fourth only widened the model -- K51 proved in 37 s at 3 with SUBSOLVERS)
 G = PITCH / 5                          # the solve's time grid: a fifth of the lane pitch
-TVIA_REACH = 2.0                       # (probe SOLVE_TVIA_SITE) how far along its escape a tooth via's site is sought
 MARG = CLR                             # a crossing starts a clearance past both lanes' terminals (a lane leaving its tooth may cross at once)
 # a crossing's room along each lane: a STAYER's crossings a pitch apart, a MOVER's (a sweep crossing a bundle nearly
 # across the spine, its slope up to K_SWEEP) PITCH / sqrt(1 + K^2) apart along s; the geometry keeps the real pitch
@@ -539,12 +538,6 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     # the lanes leave the source's surface escapes for whichever layer the plan gives them where the gap between the
     # arrays has no room for their changes (the zynq's U1 to U5)
     # (not a far-face lane: its route starts at the end of its lead-in round the source's corner, not at its tooth)
-    TVIA = {n for n in M if not via_end(n, 0) and n not in FAR} if NL > 2 else set()   # (the bench's own: VIA_ENDS holds no tooth)
-    VIN0_ROOM = dict(VIN0)
-    for n in TVIA:
-        if n not in prs:
-            VIN0[n] = 0.0
-
     def site_clear(n, k_, pt_=None):
         """a through via at single lane n's stub end k_ (0 its tooth, 1 its berth) -- or at pt_ -- clear of every other
         net's copper on every layer by a via's room -- measured, as the ends model measures a blocked front's"""
@@ -560,34 +553,21 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
         return not any(p_.net_id != nid and point_to_pad_rect_dist(pt_[0], pt_[1], p_) < r_
                        for fp_ in ctx.pcb.footprints.values() for p_ in fp_.pads
                        if abs(p_.global_x - pt_[0]) < 3 and abs(p_.global_y - pt_[1]) < 3)
+    # A single's tooth via only where a via at its stub's end is measured clear, as a berth via's is: the source's fanout
+    # ends two to five nets' stubs at one point of a channel's exit, each on its own layer, and a via there stood on the
+    # others' copper -- a lane changing layer 0.22 mm from where its neighbour's inner-layer stub ends with its own left
+    # the neighbour, laid after it, not one step to take; on four DDR buses, 12 to 18 of 14 to 25 surface teeth
+    # were so. Such a tooth's change keeps its end room and its stagger, as any lane's
+    TVIA = {n for n in M if not via_end(n, 0) and n not in FAR and (n in prs or site_clear(n, 0))} if NL > 2 else set()
+    for n in TVIA:
+        if n not in prs:
+            VIN0[n] = 0.0
     # ...and BERTH VIAS, the same at the destination: a single lane whose berth is a surface escape may change layer
     # right at it, where a via at its stub's end is measured clear -- no end room, and in its window no stagger and no
     # built-in via cut (a surface berth kept its whole end room, and its lane's last change stood that far back)
     BVIA = {n for n in M if n not in prs and not via_end(n, 1) and site_clear(n, 1)} if NL > 2 else set()
     for n in BVIA:
         VIN1[n] = 0.0
-    # (probe SOLVE_TVIA_SITE: a single tooth via's site MEASURED, as a berth via's is -- the first clear of every other
-    # net's copper on every layer, stepping along its escape from the stub's end, within DIVE_REACH; its window starts
-    # there. None in reach: no tooth via, the lane's end room and the face band as any lane's. Unmeasured, the window
-    # stood at the stub's end, where the source's fanout stacks another net's stub on an inner layer in the same
-    # channel: the zynq LVDS's six surface teeth on U1 all were, SPI_ENB's via laid on RX_D4_P's In2.Cu stub, and the
-    # snap could not stand it anywhere in its band)
-    if (awx_settings.get('SOLVE_TVIA_SITE') or '0') == '1':
-        for n in sorted(TVIA - set(prs)):
-            esc_ = ctx.tooth_dir.get(n)
-            if esc_ is None:
-                continue
-            p_ = tuple(map(float, ctx.ends[n][0]))
-            hit_ = next((q_ for q_ in ((p_[0] + G * i * esc_[0], p_[1] + G * i * esc_[1])
-                                       for i in range(int(TVIA_REACH / G) + 1)) if site_clear(n, 0, q_)), None)
-            if hit_ is None:
-                TVIA.discard(n)
-                VIN0[n] = VIN0_ROOM[n]
-                print(f'   tooth via {n}: no clear site within {TVIA_REACH} mm of its stub -- no tooth via')
-            else:
-                VIN0[n] = max(0.0, float(spine.project_pt(hit_)[0]) - entry[n])
-                print(f'   tooth via {n}: its first clear site {math.hypot(hit_[0] - p_[0], hit_[1] - p_[1]):.2f} mm '
-                      f'along its escape, {VIN0[n]:.2f} of route')
     # (probe SOLVE_DIVE_PROJ: a pair's dive room at its tooth is PATH LENGTH along its escape, and the window reads it
     # as route u -- an escape across the spine gains little u per mm: the zynq LVDS's S-face pairs, the spine ~22 deg
     # off their face's normal, 0.37 u per mm, VIN0 1.55 = their dives past U1's SE corner among the E face's. The dive

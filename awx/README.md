@@ -1188,6 +1188,12 @@ once, proved optimal in its vias.
 - A single's change is a change's room from both its ends, and far enough
   along the route from a neighbouring lane's that the two vias clear the
   via-to-via rule.
+- A single leaving or arriving on a surface layer may change layer right at
+  its stub's end -- no end room, no stagger -- only where a via there is
+  measured clear of every other net's copper on every layer. The fanout ends
+  two to five nets' stubs at one point of a channel's exit, each on its own
+  layer, and a via at such a point stands on the others' stubs: the lane laid
+  after it had no first step to take.
 - An opposite-hands pair makes at least one change where its tooth and berth
   share a layer.
 - A single's end with a planned change (the ends model's, above): the lane
@@ -2319,12 +2325,10 @@ channels first, and the other escapes leave round it.
   it has turned the corner, among the other parts there; the human dives
   such pairs a millimetre or two straight off the face. To try: the dive's
   window in the band where both legs' via sites are measured clear.
-- **A tooth via's site measured.** A lane leaving on the surface may change
-  layer right at its tooth, and nothing measures that via's site; the fanout
-  stacks another net's stub under a surface escape in the same channel, so
-  the site can stand on that stub. To try: the site measured along the escape,
-  as a berth via's is, and the window starting where the stacked neighbour
-  has room to move aside.
+- **A change near a shared stub end.** Where stubs end together, a lane's
+  change of layer keeps its end room, but its neighbours' lanes leave the
+  same point the same way. To try: the window starting where the stacked
+  neighbours have fanned aside.
 - **Exits packed as the human packs them.** The human's escapes leave a face
   about a third of a ball pitch apart on each layer; ours leave a ball pitch
   apart, one to a ball line, so each face holds two to three times fewer
@@ -2505,8 +2509,7 @@ channels first, and the other escapes leave round it.
     nearer end of its window, so dives stand at the ends, with
     `SOLVE_PHASE2=N`: the terms below a via searched again for N batches from
     the proved plan; `SOLVE_DIVE_PROJ=1` (`2`: the berth's too): a pair's dive
-    room read along the spine, not along its escape; `SOLVE_TVIA_SITE=1`: a
-    single tooth via's window opened at its first clear site along its escape;
+    room read along the spine, not along its escape;
     `SOLVE_RING_STACK_REF=1`: a ring lane's reference at its place in the
     ring's stack, for the passive regions; `SOLVE_ROOM_TIE=1`: after the
     search, each change moved to where its column has the most room, nothing
