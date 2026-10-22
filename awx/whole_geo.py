@@ -1321,6 +1321,28 @@ def static_sides(sol):
     # lower island or its highest above the upper one -- whichever moves its lane less from its first-pass offset, never
     # against a lane's own fixed end nor to a side with no room -- and never back across an island it was moved across,
     # so a lane pushed out of a gap goes on outward until a gap or a side holds it
+    def board_shape(ii):
+        """STATIC[ii]'s copper on the board, for a gap's measure: an island's pad boxes, or another net's via in the
+        field (whole_geo's 'svia' row: a disc, the router's ring about it). Two such vias were no gap at all:
+        sdi_mipi_conv's SDI_D0 and SDI_D1 were sent between the DDR3 bus's CK_P and A13 vias below U11, 1.151 mm
+        apart -- 0.647 inside their rings, where two lanes need 0.667 -- and every polish left both short there"""
+        st_ = STATIC[ii]
+        if st_[5].startswith('svia '):
+            return [((st_[0] + st_[2]) / 2, (st_[1] + st_[3]) / 2, (st_[2] - st_[0]) / 2)]
+        return ISL.get((st_[5], frozenset(st_[4])))
+
+    def shape_gap(pa, pb):
+        """the least board distance between two board_shapes' copper: boxes (x0, y0, x1, y1) and discs (x, y, r)"""
+        def d(p, q):
+            if len(p) == 3 and len(q) == 3:
+                return math.hypot(p[0] - q[0], p[1] - q[1]) - p[2] - q[2]
+            if len(p) == 3:
+                p, q = q, p
+            if len(q) == 3:
+                return math.hypot(max(0.0, p[0] - q[0], q[0] - p[2]), max(0.0, p[1] - q[1], q[1] - p[3])) - q[2]
+            return math.hypot(max(0.0, q[0] - p[2], p[0] - q[2]), max(0.0, q[1] - p[3], p[1] - q[3]))
+        return max(0.0, min(d(p, q) for p in pa for q in pb))
+
     def gap_used(ls):
         used, prev_ = 0.0, None
         for n in ls:
@@ -1343,13 +1365,10 @@ def static_sides(sol):
                     # two PARTS' gap, measured on the board between their pads: the frame's boxes are the pads' boxes
                     # taken along its own slanted axes, larger than the copper (K41's C4 / R4+R5: 0.292 in the frame,
                     # 0.400 on the board -- one lane's room, refused)
-                    pa_b = ISL.get((bl[a][5], frozenset(bl[a][4])))
-                    pb_b = ISL.get((bl[b][5], frozenset(bl[b][4])))
+                    pa_b, pb_b = board_shape(a), board_shape(b)
                     if not pa_b or not pb_b:
                         continue
-                    gap = min(math.hypot(max(0.0, q[0] - p[2], p[0] - q[2]), max(0.0, q[1] - p[3], p[1] - q[3]))
-                              for p in pa_b for q in pb_b)
-                    gaps.append((a, b, gap))
+                    gaps.append((a, b, shape_gap(pa_b, pb_b)))
             pushed = set()
             for _it in range(50):                        # (each lane crosses each island once at most)
                 moved = False

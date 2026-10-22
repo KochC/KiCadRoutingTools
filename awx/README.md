@@ -1348,7 +1348,11 @@ solve as **cuts**.
   boxes are: a bus an earlier step routed drops its lanes there
   (sdi_mipi_conv's DDR3 bus south of U11, where the SDI lanes pass on the plane
   layers: one lane 0.007 short of such a via round after round, a finding no
-  cut answers).
+  cut answers). The gap between two of them, or between one and a part, holds
+  only the lanes that fit it as the board measures it: disc to disc, at their
+  rings. Unmeasured, two vias were no gap at all, and two SDI lanes were sent
+  between the DDR3 bus's CK_P and A13 vias, 0.647 mm inside their rings where
+  two lanes need 0.667: every polish left both short there.
 - **Islands:** one split per island and layer, in the lane order, pinned by
   the lanes' own ends. An island is a part, or parts no lane can surely pass
   between (`whole_ctx.part_islands`). A two-pad part whose pads stand a lane
