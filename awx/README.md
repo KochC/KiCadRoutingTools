@@ -1778,6 +1778,18 @@ via.
   it on every layer. Held off the one layer, a lane moved a round found the
   next one blocked: sdi_mipi_conv's DDR3 bus runs along U11's south face on
   four of its eight layers, and the loop had stopped there, ENDS CROWDED.
+  The cut is FIRM, as a keep-out's: a lane planned across another net's track
+  on its layer is a lane not laid. Soft, SDI_D6, already over two vias, broke
+  its cut under `~{DDR3_CS}` three rounds running, the same plan each round,
+  and the loop stopped NOT CONVERGING with the lane open.
+- **A track's cut holds for every lane through its place**
+  (`whole_route.place_cuts`): each other lane whose laid path passes within
+  the audit's bar of that copper, on a layer the cut holds, is held off those
+  layers there too. Held for the one lane found, the next round sent another
+  lane through the same crossing: on sdi_mipi_conv the same four SDI lanes
+  crossed the DDR3 fan below U11 every round, a different one on B.Cu each
+  time, for six rounds. The bus's own stubs are no such place, and a lane
+  that ends in the place is not held there: its end is the fanout's to move.
 - **Keep-out rule areas.** The audit measures each lane against the board's
   keep-out areas whose tracks are not allowed on its layer
   (`plan_audit.keepout_areas`, resolved as the router resolves them), and a

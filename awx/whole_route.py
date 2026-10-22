@@ -365,10 +365,56 @@ def audit_layer_cuts(audit, geo, bench=None):
                         blk.add(Lk)
             c = {'lane': lane, 'island': pad, 'layer': 0, 'box': [x - r, y - r, x + r, y + r], 'blocked': sorted(blk)} \
                 if len(blk) < nl else None
+            if c and kind == 'copper':
+                c['firm'] = True       # (a track the lane crosses is no island it might be sent round: whole_solve)
         else:
             c = None
         if c and c not in out:
             out.append(c)
+    return out
+
+
+def place_cuts(cuts, plan, bench, own=()):
+    """(more routing layers than two) a cut against a TRACK an earlier step laid (audit_layer_cuts' copper cut, of a net
+    not among the bus's own, `own`) held for every lane through its place: each other lane whose laid path (`plan`'s)
+    passes the cut's box within its bar of that copper on a layer the cut holds -- the audit's bar, track/2 + clearance
+    + half a grid step -- is held off those of them there too. The lane found, held off alone, sent the next round's
+    plan through the same crossing on another lane (sdi_mipi_conv's SDI lanes across the DDR3 bus's B.Cu and In2.Cu fan
+    below U11: the same four lanes through it every round, a different one on B each round, until the loop stopped on
+    ENDS CROWDED after six). The bus's own copper -- its stubs, where its lanes end, which the plan orders itself -- is
+    no such place, and a lane that ENDS in the place is not held, its end being the fanout's to move: the zynq's ETH
+    stubs at U1's teeth would hold ETH_TXCTL off its own stub's layer, and the lanes beside it"""
+    import route_layers
+    import rules as _rules
+    if len(route_layers.layers()) <= 2 or not bench:
+        return []
+    R = _rules.active()
+    bar = R.track / 2 + R.clearance + R.grid / 2
+    tracks = _tracks_of(bench)[0]
+    lanes = plan.get('lanes') or {}
+    out = []
+    for c in cuts:
+        if not c.get('firm') or c['island'] in own:
+            continue
+        x0, y0, x1, y1 = c['box'][:4]
+        inb = lambda p, g: x0 - g <= p[0] <= x1 + g and y0 - g <= p[1] <= y1 + g
+        # (the copper on each held layer whose box comes within its bar of the cut's)
+        near = {L: [s_ for s_ in tracks.get(L, []) if s_[5] not in own
+                    and min(s_[0], s_[2]) <= x1 + bar + s_[4] and max(s_[0], s_[2]) >= x0 - bar - s_[4]
+                    and min(s_[1], s_[3]) <= y1 + bar + s_[4] and max(s_[1], s_[3]) >= y0 - bar - s_[4]]
+                for L in c['blocked']}
+        for n, v in lanes.items():
+            if n == c['lane'] or not v.get('xy'):
+                continue
+            if inb(v['xy'][0], bar) or inb(v['xy'][-1], bar):
+                continue        # (a lane ENDING there: its end is the fanout's to move, not a layer's to leave)
+            pts = [p for p in _dense([list(q) for q in v['xy']], R.grid / 2) if inb(p, bar)]
+            blk = sorted(L for L, ss in near.items()
+                         if any(nm != n and _seg_pt(p, (a, b), (e, f)) < hw + bar
+                                for p in pts for a, b, e, f, hw, nm in ss))
+            k = dict(c, lane=n, blocked=blk)
+            if pts and blk and k not in cuts and k not in out:
+                out.append(k)
     return out
 
 
@@ -678,6 +724,7 @@ def loop(solve, out, rounds, env, log):
             nl_ = len(route_layers.layers())
             lcuts = [c for c in audit_layer_cuts(O(f'p{i}.audit'), gj, env.get('BENCH'))
                      if nl_ > 2 or (c['lane'], c['island']) not in new]
+            lcuts += place_cuts(lcuts, pj, env.get('BENCH'), set(env.get('NETS', '').split(',')))
             lcuts += [c for c in gj.get('lcuts', []) + pj.get('lcuts', []) if c not in lcuts]
             if lcuts:
                 log(f"  layer cuts: {', '.join(c_['lane'] + ' under ' + c_['island'] for c_ in lcuts)}")

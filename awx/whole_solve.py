@@ -427,6 +427,7 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
     # across the island's box on the trunk, a track's clearance either side, its changes a via's clearance off it
     CHAN_CUTS, CHAN_T0 = set(), set()
     CHAN_BLK = {}             # (lane, 'chan ISLAND') -> the island's layers (more than two: the run held off each)
+    CHAN_FIRM = set()         # (lane, 'chan ISLAND'): a cut held FIRM, as a keep-out's (its cut file's 'firm')
     # (each cut once: one the cut files carry twice -- a hard round's in CUTS and again in SOFT_CUTS -- read a second
     # time after the first had waived its lane's end room, found no window, and the two sorted None against a number)
     _seen_lc = set()
@@ -482,6 +483,8 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
                                round(hi_c, 4), w0_, w1_))
                 if blk_ is not None:
                     CHAN_BLK[(n_, 'chan ' + c_['island'])] = blk_
+                if c_.get('firm'):
+                    CHAN_FIRM.add((n_, 'chan ' + c_['island']))
     CHAN_CUTS = sorted(CHAN_CUTS)
     XO = {n for n in prs if n in M and _pairs.opposite_hands(ctx, n)}
     for n in XO:
@@ -1205,8 +1208,11 @@ def solve(ctx, dest, cuts=(), hist=(), hint=None, soft_cuts=(), crowd=False, rel
             # (a KEEP-OUT area's cut FIRM: the router stamps the area exactly, so a lane planned through it is a lane not
             # laid, dearer than any vias -- soft, sdi_mipi_conv's SDI_D1 on four layers was planned through the area
             # round U15 every round, its changes off In2.Cu and back dearer than the break, and never laid; firm, the
-            # cut held and the lane was laid)
-            (firm_broken if str(k_).startswith('chan keepout') else soft_broken)[
+            # cut held and the lane was laid. Another net's TRACK the same, a cut its file marks firm (whole_route's
+            # audit_layer_cuts): a lane planned across it on its layer is not laid either -- soft, sdi_mipi_conv's
+            # SDI_D6, already over two vias, broke its cut under ~{DDR3_CS} three rounds running, the same plan and
+            # the same crossing each, and the loop stopped NOT CONVERGING with the lane open)
+            (firm_broken if str(k_).startswith('chan keepout') or (n_, k_) in CHAN_FIRM else soft_broken)[
                 ('layer', n_, str(k_), round(lo_u, 3))] = br_     # (k_ a front's end, or an island's name)
             continue
         par = m.NewBoolVar('')
