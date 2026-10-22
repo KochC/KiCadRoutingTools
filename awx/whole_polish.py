@@ -328,6 +328,35 @@ for k_, (kind, Ls, net, d, lab) in enumerate(STATIC):
             SGRID[(cx, cy)].append(k_)
 
 
+# each island's pads on each layer (the geometry's islands, 'REF.N' -> its island; a pad of none its own): a lane found
+# inside one is pushed out of them all (gather's static rows)
+_GI = geo.get('islands') or {}
+ISL_PADS = collections.defaultdict(list)          # (island, layer) -> [(cx, cy, hx, hy, cr)]
+for kind_, Ls_, _net, d_, lab_ in STATIC:
+    if kind_ == 'rect' and lab_.startswith('pad '):
+        for L_ in Ls_:
+            ISL_PADS[(_GI.get(lab_[4:], lab_), L_)].append(d_)
+
+
+def way_out(P, nv, L, lab, need):
+    """how far P moves along the unit vector nv to stand `need` off every pad of pad `lab`'s island on layer L (their
+    boxes grown by it): past one pad's, on to the next it then stands in"""
+    pads = ISL_PADS.get((_GI.get(lab[4:], lab), L)) or []
+    t = 0.0
+    for _ in range(len(pads) + 1):
+        Q = P + nv * t
+        for cx, cy, hx, hy, _cr in pads:
+            x0, x1, y0, y1 = cx - hx - need, cx + hx + need, cy - hy - need, cy + hy + need
+            if x0 < Q[0] < x1 and y0 < Q[1] < y1:
+                tx = (x1 - Q[0]) / nv[0] if nv[0] > 1e-12 else (x0 - Q[0]) / nv[0] if nv[0] < -1e-12 else math.inf
+                ty = (y1 - Q[1]) / nv[1] if nv[1] > 1e-12 else (y0 - Q[1]) / nv[1] if nv[1] < -1e-12 else math.inf
+                t += min(tx, ty) + 1e-6
+                break
+        else:
+            return t
+    return t
+
+
 def pad_dist(P, d, pair):
     """(distance from P to a pad's copper, less -- a single's (not `pair`) -- the router's corner buffer where P stands
     in its corner zone (pairs.pad_corner_buffer), the pad's nearest point -- None inside), for a pad d = (cx, cy, hx, hy,
@@ -695,7 +724,17 @@ def gather():
                     if dd >= need + MARGIN:
                         continue
                     if q is None:
-                        rows.append(([], 1.0, 'via-static', f'{n} inside {lab}', dd - need)); continue
+                        # (inside a pad: out of its island the shortest way, along the lane or across it, as a lane
+                        # is -- a row with no way out moved nothing)
+                        if lab.startswith('pad ') and 0 < i < len(X) - 1:
+                            u = X[i + 1] - X[i - 1]
+                            u = u / max(float(np.linalg.norm(u)), 1e-12)
+                            t_, nv = min((way_out(B, w_, L, lab, need), tuple(w_)) for w_ in
+                                         (u, -u, np.array([-u[1], u[0]]), np.array([u[1], -u[0]])))
+                            rows.append(([(n, i, np.array(nv))], t_ + EPS, 'via-static', f'{n} inside {lab}', -t_))
+                        else:
+                            rows.append(([], 1.0, 'via-static', f'{n} inside {lab}', dd - need))
+                        continue
                     nv = (B - q) / np.linalg.norm(B - q)
                     rows.append(([(n, i, nv)], need + EPS - dd, 'via-static', f'{n}~{lab}', dd - need))
         if n in prs:
@@ -768,6 +807,7 @@ def gather():
         # END CONNECTOR, no copper -- its legs converge there from the tips, either side of what stands between them,
         # and the audit measures them. Measured as a line with a rounded end on the midpoint, every pair's end read
         # 0.113 short of the ball between its tips (SDQS0 and DU1.F1, its legs 0.27 clear), a row no move could meet)
+        inside_ = []                     # (segment, its parameter, the point, layer, pad, bar): a sample inside a pad
         cu = None
         if n in prs and n not in HELD and not geo['lanes'][n].get('ends'):
             s_ = arclen(X)
@@ -791,10 +831,37 @@ def gather():
                     continue
                 P = X[i] + (X[i + 1] - X[i]) * s
                 if q is None or np.linalg.norm(P - q) < 1e-9:
-                    rows.append(([], 1.0, 'static', f'{n} inside {lab}', dd - need)); continue
+                    if lab.startswith('pad '):
+                        inside_.append((i, s, P, Ls[i], lab, need))
+                    else:
+                        rows.append(([], 1.0, 'static', f'{n} inside {lab}', dd - need))
+                    continue
                 nv = (P - q) / np.linalg.norm(P - q)
                 rows.append(([(n, i, nv * (1 - s)), (n, i + 1, nv * s)], need + EPS - dd, 'static',
                              f'{n}~{lab}', dd - need))
+        # a lane INSIDE a pad has no nearest edge to be pushed off: it is pushed out of the pad's whole island (the
+        # geometry's: its part, or parts no lane passes between) across its own line, on ONE side of it for every
+        # sample in the island -- the side with less of the way out -- so its samples are not pushed apart; the lanes
+        # beside it there go outward ahead of it, by their pitch rows. With no way out a row had nothing to move, and
+        # the lane stood in the pad every round: the zynq's U4+U3 bus, OTG_DATA5 through R29.1 and C119.2 on B.Cu,
+        # 1.18 mm in, round after round
+        by_isl = collections.defaultdict(list)
+        for h_ in inside_:
+            by_isl[_GI.get(h_[4][4:], h_[4])].append(h_)
+        for hs in by_isl.values():
+            best = None
+            for sg in (1.0, -1.0):
+                outs = []
+                for (i, s, P, L, lab, need) in hs:
+                    u = X[i + 1] - X[i]
+                    u = u / max(float(np.linalg.norm(u)), 1e-12)
+                    nv = sg * np.array([-u[1], u[0]])
+                    outs.append((i, s, nv, way_out(P, nv, L, lab, need), lab))
+                tot = sum(o_[3] for o_ in outs)
+                if best is None or tot < best[0] - 1e-9:
+                    best = (tot, outs)
+            for (i, s, nv, t_, lab) in best[1]:
+                rows.append(([(n, i, nv * (1 - s)), (n, i + 1, nv * s)], t_ + EPS, 'static', f'{n} inside {lab}', -t_))
     return rows
 
 

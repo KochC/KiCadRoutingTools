@@ -1457,6 +1457,12 @@ runs again with the flip before anything is snapped.
   came back the round after, and the rounds wandered.
 - **The best state is kept:** the state written is the one with the fewest
   short rules and shape faults any round reached, not the last round's.
+- **Out of a pad:** a lane inside a pad has no nearest edge to be pushed off,
+  so it is pushed out of the pad's whole island across its own line, on the one
+  side with less of the way out, and the lanes beside it go outward ahead of it
+  by their pitch rows. A via inside a pad goes out along its lane or across it,
+  whichever is shortest. With no direction the row moved nothing: on the zynq's
+  U4+U3 bus, OTG_DATA5 stood 1.18 mm inside R29 and C119 round after round.
 
 </details>
 
