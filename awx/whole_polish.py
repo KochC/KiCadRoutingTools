@@ -69,7 +69,11 @@ RING, RING_PAIR = _pairs.via_ring(cfg), _pairs.via_ring(cfg, HALF)      # a via'
 NEED_VV = min_via_center_distance(cfg.via_size, CL, cfg.via_drill, h2h) + 2 * g2
 NEED_ST = TW / 2 + CL + g2
 NEED_VST = VR + CL + g2
-MARGIN = cfg.grid_step           # constraints within this of their bar are kept in the LP (so a move breaks none)
+# constraints within this of their bar are kept in the LP, so a move breaks none: twice TRUST, as two vertices each
+# moving TRUST close a gap by that much (at one grid step the rules a round broke unseen came back the round after, and
+# the rounds wandered -- sdi_mipi_conv's DDR3 bus 27 26 23 20 11 8 13 20 18 19 short, round by round)
+MARGIN = 2 * TRUST
+SAND_M = cfg.grid_step           # (sand: a single between two pairs within the bars' reach and this)
 EPS = 1e-4                       # met with this much to spare (the audit compares at 1e-6)
 # the snap (whole_snap) lays a pair's centreline on the grid with 45-degree corners, where its legs stand HALF_SNAP
 # from it, and its legs off the grid: a pair's bars here carry both, so every gap the snap splits keeps a grid row
@@ -599,7 +603,7 @@ def gather():
         if (n, i) not in sand_memo:
             X_, L_ = LANES[n]['X'], LANES[n]['L'][i]
             P0, d0 = X_[i], X_[i + 1] - X_[i]
-            reach = BLOCK + 2 * (HALF_SNAP + g2) + STAIR_MAX + MARGIN
+            reach = BLOCK + 2 * (HALF_SNAP + g2) + STAIR_MAX + SAND_M
             sides = set()
             for (m, j) in near_segs((X_[i] + X_[i + 1]) / 2, np.linalg.norm(d0) / 2 + reach):
                 if m not in prs or LANES[m]['L'][j] != L_:
@@ -833,6 +837,7 @@ def solve_round(rows, trust):
             a = newv(1.0)                                   # |d| >= +-d
             rowsA.append(({2 * k + ax: 1.0, a: -1.0}, 0.0)); rowsA.append(({2 * k + ax: -1.0, a: -1.0}, 0.0))
     W_SM = 2.0
+    W_FOLD = 1e3                # a fold left unopened, per mm^2 of d1.d2 (a rule's slack: 1e4 per mm)
     for (n, i), k in idx.items():
         kp, kn = idx.get((n, i - 1)), idx.get((n, i + 1))
         for ax in (0, 1):
@@ -873,7 +878,12 @@ def solve_round(rows, trust):
                 coef[2 * kp + ax] -= d2[ax]
             if kn is not None:
                 coef[2 * kn + ax] += d1[ax]
-        rowsA.append(({c: -v for c, v in coef.items()}, float(d1 @ d2)))
+        # (a turn already past 90 degrees -- a fold drop_faults could not straighten, at a held vertex, a via or an end
+        # -- is opened as far as the round's trust lets it, the rest paid: asked to open at once, a round that could
+        # not had no answer at all and moved nothing -- sdi_mipi_conv's DDR3 bus's first polish, 452 short before and
+        # after, and 5 of 23 recorded polishes stopped so. A turn under 90 degrees stays under, unpaid)
+        dd_ = float(d1 @ d2)
+        rowsA.append(({**{c: -v for c, v in coef.items()}, **({newv(W_FOLD): -1.0} if dd_ < 0 else {})}, dd_))
     from scipy.sparse import coo_matrix
     ri, ci, vv = [], [], []
     for r_, (terms, rhs) in enumerate(rowsA):
@@ -1087,12 +1097,32 @@ def join_arc(u):
 
 
 JOIN_WAYS = {n: [join_arc(u) for u in stub_ways(n, router=False)] for n in LANES if n not in prs}
+
+
+def snapshot():
+    return {n: (ln['X'].copy(), list(ln['L']), ln['H'].copy()) for n, ln in LANES.items()}
+
+
+def restore(s_):
+    for n, (X, Ls, H) in s_.items():
+        LANES[n]['X'], LANES[n]['L'], LANES[n]['H'] = X.copy(), list(Ls), H.copy()
+
+
+def standing(bad):
+    """(the audit's count of a state: its short rules and its lanes' shape faults, how far its rules are short)"""
+    return (len(bad) + sum(len(shape_faults(n)) for n in LANES), sum(-r[4] if r[0] else 1.0 for r in bad))
+
+
 # the rounds, then the audit's shape measures again: a round that bends a lane past them is straightened and the
-# rounds run again (SA6 overshot its berth and doubled back 114 degrees; the scale measure alone read 82)
+# rounds run again (SA6 overshot its berth and doubled back 114 degrees; the scale measure alone read 82). The best
+# state any round reached is the one written: the last round's is not always it
+BEST = None
 for cycle in range(1, CYCLES + 1):
     rows = gather()
     cnt, bad = measure(rows)
     log(f'round 0: {sum(cnt.values())} short ({dict(cnt)})')
+    if BEST is None or standing(bad) < BEST[0]:
+        BEST = (standing(bad), snapshot())
     for rd in range(1, ROUNDS + 1):
         before_ = {n: ln['X'].copy() for n, ln in LANES.items()}
         out = solve_round(rows, TRUST)
@@ -1103,6 +1133,8 @@ for cycle in range(1, CYCLES + 1):
         cnt, bad = measure(rows)
         log(f'round {rd}: moved {nv} vertices against {na} rules; {sum(cnt.values())} short ({dict(cnt)})'
             + (f'; the LP paid {len(paid)} (max {max(p[0] for p in paid):.3f})' if paid else ''))
+        if standing(bad) < BEST[0]:
+            BEST = (standing(bad), snapshot())
         if not bad:
             break
         if all(LANES[n]['X'].shape == X0.shape and float(np.max(np.abs(LANES[n]['X'] - X0), initial=0.0)) <= STILL
@@ -1116,6 +1148,11 @@ for cycle in range(1, CYCLES + 1):
     if cycle == CYCLES:
         rows = gather()
         cnt, bad = measure(rows)
+if BEST is not None and BEST[0] < standing(bad):
+    log(f'the best state the rounds reached kept: {BEST[0][0]} finding(s) against the last one\'s {standing(bad)[0]}')
+    restore(BEST[1])
+    rows = gather()
+    cnt, bad = measure(rows)
 for r in sorted(bad, key=lambda r: r[4])[:25]:
     log(f'  SHORT {r[2]:10s} {r[3]:32s} {r[4]:+.4f}')
 

@@ -1434,6 +1434,18 @@ runs again with the flip before anything is snapped.
   a change it cannot give its room.
 - **Held pairs:** their barrels kept off the other lanes by the router's ring
   round each; pairs not yet laid held off static copper from their poses on.
+- **Every round has an answer:** a turn already past 90 degrees that the
+  shape pass could not straighten (at a held vertex, a via or an end) is
+  opened as far as the round's trust lets it and the rest paid (`W_FOLD`).
+  Asked to open at once, a round that could not had no answer and moved
+  nothing: sdi_mipi_conv's DDR3 bus's first polish stood at 452 short before
+  and after.
+- **No rule broken unseen:** a rule is in the LP while it stands within twice
+  the trust (`MARGIN`) of its bar, as two vertices each moving the trust close
+  a gap by that much. At one grid step the rules a round broke out of sight
+  came back the round after, and the rounds wandered.
+- **The best state is kept:** the state written is the one with the fewest
+  short rules and shape faults any round reached, not the last round's.
 
 </details>
 
