@@ -700,10 +700,17 @@ class DifferentialTab(wx.Panel):
 
     def _is_short_pair(self, p_net_id, n_net_id):
         """Whether this pair would be deferred to single-ended as electrically
-        short, given the current Pair Width / Gap / Centerline Setback. Cached
-        per (params, pair)."""
+        short, given the current Pair Width / Gap / Centerline Setback and the
+        board's copper (a pair's own fanout escapes count, #1362). Cached per
+        (params, pair) and dropped when the copper changes: a sync replaces
+        the copper lists and routing in place appends to them."""
         from diff_pair_multipoint import diff_pair_is_short
         width, gap, setback = self._short_params()
+        segs, vias = self.pcb_data.segments, self.pcb_data.vias
+        copper = (id(segs), len(segs), id(vias), len(vias))
+        if copper != getattr(self, '_short_cache_copper', None):
+            self._short_cache.clear()
+            self._short_cache_copper = copper
         key = ((round(width, 6), round(gap, 6),
                 None if setback is None else round(setback, 6)),
                p_net_id, n_net_id)
@@ -1247,6 +1254,31 @@ class DifferentialTab(wx.Panel):
         if skipped_bad_fanout:
             msg += (f"Skipped: {len(skipped_bad_fanout)} "
                     f"(fanout stubs self-overlap - fix the fanout first)\n")
+        # #1303: routed, but the copper placed on the board is not coupled
+        # (the engine measured it; the CLI prints the same "Not coupled" line).
+        uncoupled_pairs = results_data.get('uncoupled_diff_pairs', [])
+        if uncoupled_pairs:
+            # #1361: protected all the same while its members still run
+            # alongside (the engine's pair_reports[].protected).
+            _kept = sorted(r['pair'] for r in results_data.get('pair_reports') or []
+                           if r.get('outcome') == 'uncoupled' and r.get('protected'))
+            msg += (f"Not coupled: {len(uncoupled_pairs)} "
+                    f"(routed, but no coupled run on the board - not counted "
+                    f"as routed): {', '.join(uncoupled_pairs)}\n")
+            if _kept:
+                msg += (f"  still alongside, so protected: {', '.join(_kept)}\n")
+        # Companion GND return vias with no legal site (the CLI prints the
+        # same "GND vias not placed" line; each one is named in the log).
+        gnd_not_placed = results_data.get('gnd_vias_not_placed') or []
+        if gnd_not_placed:
+            msg += (f"GND vias not placed: {len(gnd_not_placed)} companion return "
+                    f"via(s) with no legal site, on "
+                    f"{', '.join(sorted({d['pair'] for d in gnd_not_placed}))}\n")
+        _intra_bad = [r['pair'] for r in results_data.get('intra_pair_matching', [])
+                      if r.get('status') not in ('matched', 'within-tolerance', 'skipped')]
+        if _intra_bad:
+            msg += (f"Intra-pair skew NOT matched on the board: "
+                    f"{', '.join(_intra_bad)}\n")
         msg += f"Time: {total_time:.1f}s\n\n"
         msg += f"Added to board:\n"
         msg += f"  {tracks_added} segments\n"
@@ -1266,12 +1298,6 @@ class DifferentialTab(wx.Panel):
             except Exception as e:
                 print(f"Warning: failed to build diff pair suggestions: {e}")
         msg += "\nUse Edit -> Undo to revert changes."
-
-        # Routing movie (#506): snapshot the board this step just produced,
-        # BEFORE the completion popup blocks on the user. No-op unless the
-        # Advanced tab's "Make routing movie" box is ticked.
-        from .movie_recorder import record_movie_step
-        record_movie_step(self, 'route_diff')
 
         if getattr(getattr(self, 'GetTopLevelParent', lambda: self)(), '_suppress_completion_popups', False):
             print(msg)  # unattended plan run: no per-step OK dialog

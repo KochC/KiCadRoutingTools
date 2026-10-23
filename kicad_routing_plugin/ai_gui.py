@@ -12,8 +12,9 @@ Building blocks:
   and returns the machine-readable RESULT=<value> last line
 - run_skill_dialog(): the one-call helper the other tabs use (CLI-missing
   guard + prompt phrasing + modal run)
-- AITab: the AI tab in the routing dialog (backend/model/effort
-  selection, planning, plan execution, review, diagnosis)
+- AITab: the "Routing" page of the routing dialog's "AI Drive" tab
+  (backend/model/effort selection, planning, plan execution, review,
+  diagnosis); the "Placement" page beside it is placement_gui.PlacementTab
 """
 
 import os
@@ -383,7 +384,8 @@ def run_skill_dialog(parent, title, skill, skill_args, instructions, intro,
 
 
 class AITab(wx.Panel):
-    """AI tab: run AI skills headless and bring results into the GUI."""
+    """AI Drive's Routing page: run AI skills headless and bring results
+    into the GUI."""
 
     def __init__(self, parent, board_filename, log_callback=None, routing_dialog=None):
         super().__init__(parent)
@@ -1022,11 +1024,6 @@ class AITab(wx.Panel):
         self.run_all_plan_btn.Disable()
         self.plan_btn.Disable()
         self.stop_plan_btn.Enable()
-        # Routing movie (#506): a plan run is ONE movie covering every step it
-        # runs, not one per step -- bracket it (no-op unless recording is on).
-        recorder = self._movie_recorder()
-        if recorder is not None:
-            recorder.begin_group()
         self._plan_executor = PlanExecutor(
             self.routing_dialog, self._plan_steps, indices,
             on_status=self._on_plan_step_status,
@@ -1088,23 +1085,8 @@ class AITab(wx.Panel):
             # Stopped/failed steps stay checked so a re-run picks them up.
             self.plan_list.Check(index, False)
 
-    def _movie_recorder(self):
-        """The dialog's routing-movie recorder, or None (tab used standalone)."""
-        dialog = self.routing_dialog
-        if dialog is None and hasattr(self, 'GetTopLevelParent'):
-            dialog = self.GetTopLevelParent()
-        return getattr(dialog, 'movie_recorder', None)
-
     def _on_plan_finished(self, completed, aborted_reason):
         self._plan_executor = None
-        # Close the movie group: renders one movie for the steps that ran (a
-        # stopped/failed plan still gets the movie of what it did do).
-        recorder = self._movie_recorder()
-        if recorder is not None:
-            try:
-                recorder.end_group()
-            except Exception as e:
-                self._log(f"Routing movie: not rendered ({e})")
         if self:
             try:
                 self.elapsed_label.SetLabel("")

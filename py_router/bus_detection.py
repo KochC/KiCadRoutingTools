@@ -343,7 +343,7 @@ def filter_bus_groups_geometric(pcb_data, bus_groups, config,
                                 max_len_ratio: float = 1.5):
     """Strict geometric bus definition (default on; KICAD_BUS_STRICT=0
     reverts to raw clique detection): a group is a bus only if its members
-    genuinely TRAVEL TOGETHER. Five rules, no names, no component identity:
+    genuinely TRAVEL TOGETHER. Four rules, no names, no component identity:
 
       1. >=3 members (pairs belong to the diff router or aren't worth
          bundling),
@@ -354,9 +354,11 @@ def filter_bus_groups_geometric(pcb_data, bus_groups, config,
          destinations, subsuming any shared-component test),
       3. run length >= 5mm (local hops gain nothing; also retires the
          decoupling-cap clusters without a passive-component carve-out),
-      4. no power nets (config.power_net_widths),
-      5. no diff-pair members (config-independent: *_P/*_N by pair map is
-         the caller's concern; here power/width classes only).
+      4. no power nets (config.power_net_widths).
+
+    A member with fewer than 2 pads has no run and is dropped too. Diff-pair
+    members are NOT filtered here: the *_P/*_N pair map is the caller's
+    concern.
 
     Raw clique detection on ottercast declared 31 groups/118 members and
     planned corridors for decoupling clusters and power rails; these rules
@@ -397,29 +399,6 @@ def filter_bus_groups_geometric(pcb_data, bus_groups, config,
             bus.net_ids = kept
         out.append(bus)
     return out
-
-
-def bus_stick_config(config, attraction_path):
-    """Off-lane surcharge (the STICK, KICAD_BUS_OFFLANE_MULT, default 1.0
-    = off): a bus member with a planned corridor routes with every layer's
-    step cost scaled by the multiplier; the corridor attraction discount
-    then makes the LANE the only normal-priced place on the board. Without
-    this the attraction is carrot-only -- a member whose direct area is
-    congested hops outside the attraction radius, where the corridor
-    exerts zero pull, and defects to a lone detour for free (WL_SDIO_D1's
-    8mm northern flight while its lane ran direct at y~94). Forbidden
-    layers (cost -1) stay forbidden; the member's config is otherwise
-    untouched (via cost, clearances, caches all nominal)."""
-    import env_knobs
-    m = env_knobs.BUS_OFFLANE_MULT
-    if m == 1.0 or not attraction_path:
-        return config
-    from dataclasses import replace as _replace
-    base = list(config.layer_costs or []) or [1.0] * len(config.layers)
-    while len(base) < len(config.layers):
-        base.append(1.0)
-    scaled = [c if c < 0 else c * m for c in base]
-    return _replace(config, layer_costs=scaled)
 
 
 def bus_attraction_context(

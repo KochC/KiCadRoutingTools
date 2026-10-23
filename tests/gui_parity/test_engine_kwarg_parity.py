@@ -85,14 +85,16 @@ PAIRS = [
 # Keep this list SHORT and justified -- every entry is a place the two fronts
 # genuinely differ, not a place we gave up.
 CLI_ONLY_OK = {
-    # The CLI streams a route trace to build the stress movie (#482). The GUI has
-    # its own recorder (movie_recorder.py) driven from the dialog, so it does not
-    # hand the engine a callback.
-    "vis_callback": "GUI uses movie_recorder.py instead of an engine callback (#482/#506)",
     # --json-out writes the merged JSON_SUMMARY to a FILE for the stress
     # harness to scrape. The GUI consumes results in-memory (return_results=
     # True) and has no summary-file output, so there is nothing to point at.
     "json_out": "CLI writes a JSON summary file; the GUI consumes results in-memory",
+    # route.py / route_diff.py --quick LEVEL: the placement skill's review
+    # routes a first round without the recovery tail to see what a placement
+    # leaves open (1), and the seed judge also skips the shipping polish (2).
+    # Both run the CLIs (also from the GUI's Place + Route); the GUI's own
+    # routing always routes to ship.
+    "quick": "a placement review / seed judge via the CLI; the GUI routes to ship",
     # (net_name_patterns was exempted here as "the GUI has no raw globs".
     # REVERSED: ai_plan resolving a plan's globs to exact names BEFORE the
     # call is not the reason the exemption is safe, it is the reason it was

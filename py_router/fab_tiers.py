@@ -5,15 +5,17 @@ step may go (#857 / #842, docs/design-rules-proposal.md).
 A *fab tier* is the manufacturing floor the router may shrink tracks/vias/
 clearances DOWN toward when a route needs it and the policy allows it:
 
-  - ``standard``  (default, no extra fab cost): a HARD floor. Nothing on the
-                  board goes below it.
+  - ``standard``  (no extra fab cost): a HARD floor. Nothing on the board
+                  goes below it. Opt-in.
   - ``advanced``  (JLC "more costly" tier): the tight floor (0.25/0.15 via,
-                  0.09 mm track/clearance, ...). A hard floor too.
-  - ``auto``      the old default: the standard floor first, escalating to
-                  ``advanced`` (with a warning, counted in the run summary)
-                  when a fine-pitch fan-out or a last-resort via genuinely
-                  cannot fit at the standard floor. Opt-in since #857: the
-                  default used to escalate silently, 149 times on one board.
+                  0.09 mm track/clearance, ...). A hard floor too. Opt-in.
+  - ``auto``      (default, ``routing_defaults.FAB_TIER``): the standard floor
+                  first, escalating to ``advanced`` (with a warning, counted
+                  in the run summary) when a fine-pitch fan-out, a plane tap
+                  or a last-resort via genuinely cannot fit at the standard
+                  floor. Completion first (#857/#530): every escalation is
+                  disclosed -- it used to happen silently, 149 times on one
+                  board.
 
 An optional ``--fab-overrides FILE`` (a plain ``key = value`` text file) overlays
 the selected tier, replacing **only** the floor values listed in the file (the rest
@@ -467,11 +469,10 @@ def fab_floor_bucket(copper_layer_count):
     module docstring's source line) and this module does not invent the rest.
 
     A consumer that COMPARES two layer counts cannot otherwise tell "the floor
-    genuinely does not move" from "this table cannot see the difference", and
-    `placement.options.add_layers` -- the only such consumer -- printed the
-    first while meaning the second on every board above 2 copper layers. On a
-    6-layer board 121 escape lanes short it said "more layers buy NO extra
-    lanes on a face" (issue #700).
+    genuinely does not move" from "this table cannot see the difference"; one
+    such consumer printed the first while meaning the second on every board
+    above 2 copper layers. On a 6-layer board 121 escape lanes short it said
+    "more layers buy NO extra lanes on a face" (issue #700).
 
     A SEPARATE FUNCTION, not a key on the floor dict: the floor dicts contain
     exactly ``FLOOR_KEYS`` and are written out as-is --
@@ -690,9 +691,7 @@ def count_copper_layers_in_file(pcb_path):
     # `None` is the in-memory case, and it is the one this counter exists to
     # hand over to `count_copper_layers_in_data` -- a live GUI board has
     # `source_path is None`, not `''`. Without this it raised TypeError out of
-    # `open`, which `placement.options.capacity_options` reports as INTERNAL
-    # ERROR, a channel reserved for genuine crashes. Worse than the skip it
-    # replaced.
+    # `open`, which a caller reports as an internal error.
     if not pcb_path:
         return 0
     try:
@@ -707,9 +706,8 @@ def count_copper_layers_in_data(pcb_data):
     ``count_copper_layers_in_file``.
 
     The file twin returns 0 for a live GUI board whose ``board_info.copper_layers``
-    is perfectly good, which is why ``placement.options.add_layers`` skipped
-    entirely on one ("could not count this board's copper layers") and why
-    ``fanout_clearance.resolve_drill_floors`` says so in its own docstring.
+    is perfectly good, which is why ``fanout_clearance.resolve_drill_floors``
+    says so in its own docstring.
 
     Returns 0 when the list is missing or empty -- the SAME "I could not look"
     value its file twin returns, and deliberately NOT a 2-or-4 guess. The
@@ -775,11 +773,13 @@ def min_via_center_distance(via_diameter, clearance, via_drill,
 
 
 def enforce_fab_floors(copper_layer_count, tier=None, overrides=None, **params):
-    """CLI guard: pin any routing parameter that is below the floor UP to the
-    floor, warn, and keep running (issue #237). The fab physically can't make
-    sub-floor geometry (and under ``--escalation board`` the board's own
-    minimum is a floor too), so rather than abort the run we clamp each
-    out-of-range value to the floor and print a warning.
+    """CLI guard: pin any routing parameter that is below the PHYSICAL fab
+    floor (``fab_floor_for_param`` -> ``physical_fab_floor``: the advanced rung,
+    or the ``--fab-overrides`` file) UP to that floor, warn, and keep running
+    (issue #237). The fab physically can't make sub-floor geometry, so rather
+    than abort the run we clamp each out-of-range value to the floor and print
+    a warning. Neither the selected tier nor a board minimum pins an explicit
+    request: those bound automatic descents only.
 
     Each CLI passes the params it accepts (track_width, clearance, via_size,
     via_drill, hole_to_hole_clearance); None values skip. Returns a
@@ -788,9 +788,9 @@ def enforce_fab_floors(copper_layer_count, tier=None, overrides=None, **params):
     viols = check_param_floors(copper_layer_count, tier, overrides, **params)
     pinned = {}
     for name, val, floor in viols:
-        print(f"  WARNING: --{name.replace('_', '-')} {val} is below the floor {floor} "
-              f"(the selected --fab-tier, or the board's own minimum under "
-              f"--escalation board); pinning up to {floor}. Pass --fab-overrides "
+        print(f"  WARNING: --{name.replace('_', '-')} {val} is below the physical fab "
+              f"floor {floor} (the advanced rung, or your --fab-overrides); "
+              f"pinning up to {floor}. Pass --fab-overrides "
               f"to declare a smaller fab capability, or raise the value to silence this.")
         pinned[name] = floor
     return pinned

@@ -76,9 +76,8 @@ from startup_checks import (                                   # noqa: E402
 # only installer there is -- but a machine that lacks one gets the plugin, with
 # the feature that needs it turned off.
 #
-# Pillow is the RASTER path and nothing else (#943): the "Make routing movie"
-# checkbox (movie_recorder.py) and the placement tab's preview image
-# (placement_gui.py), both of which already disable themselves on ImportError.
+# Pillow is the RASTER path and nothing else (#943): the placement tab's
+# preview image (placement_gui.py), which already disables itself on ImportError.
 # Routing needs none of it -- `startup_checks.check_render_dependencies` is a
 # separate gate for exactly this reason, and gating the GUI on Pillow here
 # re-made, one layer up, the mistake that function was written to record.
@@ -86,7 +85,7 @@ from startup_checks import (                                   # noqa: E402
 # ortools is the BUS STEP's (#1355): awx/route_bus.py and the whole route plan
 # with CP-SAT, which nothing the plugin runs imports.
 OPTIONAL_PACKAGES = {
-    "Pillow": "board renders, the placement preview and the routing movie",
+    "Pillow": "board renders and the placement preview",
     "ortools": "the bus step and the whole route (awx/route_bus.py, awx/whole_route.py)",
 }
 

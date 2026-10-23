@@ -62,9 +62,10 @@ CLAUDE_ALLOWED_TOOLS = "Read,Glob,Grep,Bash,Agent,Task,WebSearch,WebFetch"
 #: sentence every run is told about it (stated once, as ANALYSIS_CONSTRAINT is).
 DATASHEET_DIR_ENV = "KRT_DATASHEET_DIR"
 DATASHEET_SENTENCE = (
-    "Read datasheets with WebSearch and WebFetch; if you must save a "
-    "downloaded file, save it only under $KRT_DATASHEET_DIR, which is deleted "
-    "when this run ends."
+    "Read datasheets with WebSearch and WebFetch; a PDF datasheet reads "
+    "better downloaded (curl) and opened with the Read tool, a few `pages` at "
+    "a time, figures included. If you must save a downloaded file, save it "
+    "only under $KRT_DATASHEET_DIR, which is deleted when this run ends."
 )
 
 
@@ -97,7 +98,7 @@ def datasheet_scratch():
 # agents themselves, and it applies to Claude Code only, while this sentence
 # has to reach opencode too. What ships here is the repo's EXISTING convention
 # for bounding a child -- a subagent brief quoted verbatim (see
-# .claude/skills/pcb-free-agent/references/verifier.md) -- stated once instead of eight
+# .claude/skills/plan-pcb-placement/references/verifier.md) -- stated once instead of eight
 # times. Treat the enforced version as owed, not done.
 #
 # VERDICT= rather than RESULT= for the child's answer, because
