@@ -1358,7 +1358,12 @@ solve as **cuts**.
   only the lanes that fit it as the board measures it: disc to disc, at their
   rings. Unmeasured, two vias were no gap at all, and two SDI lanes were sent
   between the DDR3 bus's CK_P and A13 vias, 0.647 mm inside their rings where
-  two lanes need 0.667: every polish left both short there.
+  two lanes need 0.667: every polish left both short there. Two islands are
+  told apart across the lanes by their middles, never by their boxes along the
+  frame: two discs slanted to it have boxes that overlap there where the
+  copper leaves a gap, and two vias 0.67 mm apart, no lane's room, overlapped
+  by 0.004 and were never measured -- a lane on each of two layers was sent
+  between them, the loop did not converge, and both stayed open.
 - **Islands:** one split per island and layer, in the lane order, pinned by
   the lanes' own ends. An island is a part, or parts no lane can surely pass
   between (`whole_ctx.part_islands`). A two-pad part whose pads stand a lane

@@ -1357,7 +1357,11 @@ def static_sides(sol):
                 for b in idx:
                     lo_s, hi_s = max(bl[a][0], bl[b][0]), min(bl[a][1], bl[b][1])
                     gap = bl[b][2] - bl[a][3]
-                    if a == b or hi_s <= lo_s or gap < 0 or gap >= WIN:
+                    # (b above a by their middles: two discs side by side across the lanes, slanted to the frame, have
+                    # boxes that overlap along its offset where the copper leaves a gap -- the board measures it below.
+                    # Read by the boxes alone, two vias 0.67 mm apart, no lane's room, overlapped by 0.004 and were
+                    # never measured, and a lane on each of two layers was sent between them)
+                    if a == b or hi_s <= lo_s or (bl[b][2] + bl[b][3]) <= (bl[a][2] + bl[a][3]) or gap >= WIN:
                         continue
                     if any(c not in (a, b) and bl[c][0] < hi_s and bl[c][1] > lo_s and bl[c][2] >= bl[a][3] - 1e-9
                            and bl[c][3] <= bl[b][2] + 1e-9 for c in idx):
