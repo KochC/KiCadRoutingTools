@@ -13,11 +13,15 @@ board, so each is ported there and graded here:
             (`kipy_sense_groups`) and the resolved branches with their holds
   C. #1164  zones: teardrop areas flagged, holes, arc outline vertices
             (fe367f3f), the closing repeat merged (37fb1b93), mask zones and
-            rule areas NOT modelled as pours (da63ad5c), footprint zones
+            rule areas NOT modelled as pours (da63ad5c), footprint zones;
+            #1329 each zone's pad connection and thermal spokes
   D. #967   pads: the PadStackShape name (every kipy pad used to read 'rect'),
             the pad kind, the layer SET (4f3e4e6e), the size over the copper
-            layers the pad is on (62aace71); #1248 die length / delay
-  E. #1211  footprint sheet name / file; #481 the Reference label; net ties
+            layers the pad is on (62aace71); #1248 die length / delay; the
+            zone_connect override, the pad's own else its footprint's (a pad
+            with NONE is not served by the pour, 0ef3ebd6)
+  E. #1211  footprint sheet name / file; #481 the Reference label; net ties;
+            the footprint's zone_connect, and compare_pcb_data diffs it
   F. #304   Edge.Cuts as main's pcbnew scan reads it -- lines (the old kipy
             reader matched none), a gr_poly with an arc and a repeated closing
             point (6febcfad), a footprint-drawn window -- classified into
@@ -25,6 +29,9 @@ board, so each is ported there and graded here:
   G. #337 / #908  copper graphics: board shapes, a pad-bearing footprint's
             copper, a pad-less logo's copper left out, a polygon's arc vertex
             (6925b417), an unfilled zero-width shape at pcbnew's 0.1 mm
+  J.        a custom pad's copper drawn to one side of its anchor carries
+            Pad.copper_box, read off the rendered polygon; one drawn about
+            its anchor carries none
 
 WHY A HAND-BUILT kipy BOARD. The builder reaches a RUNNING KiCad over a
 socket, and `fake_ipc_board` serves reads by re-parsing the file, which would
@@ -96,9 +103,10 @@ BOARD = f'''(kicad_pcb (version 20260206) (generator "pcbnew")
     (property "Reference" "U1" (at 0 -2 90) (layer "F.SilkS")
       (effects (font (size 1 1.2) (thickness 0.15)) (justify left)))
     (sheetname "/CH2/") (sheetfile "ch.kicad_sch")
+    (zone_connect 2)
     (net_tie_pad_groups "1, 2")
     (pad "1" smd circle (at 0 0 90) (size 1 1) (layers "F.Cu" "F.Mask" "F.Paste")
-      (net 2 "SIG") (die_length 1.5) (die_delay 0.012345))
+      (net 2 "SIG") (die_length 1.5) (die_delay 0.012345) (zone_connect 0))
     (pad "2" thru_hole circle (at 2 0 90) (size 1.6 1.6) (drill 0.8)
       (layers "*.Cu" "*.Mask") (net 1 "GND"))
     (pad "" np_thru_hole circle (at 4 0 90) (size 2 2) (drill 2) (layers "*.Cu" "*.Mask"))
@@ -106,7 +114,7 @@ BOARD = f'''(kicad_pcb (version 20260206) (generator "pcbnew")
       (padstack (mode front_inner_back)
         (layer "Inner" (shape rect) (size 2 2))
         (layer "B.Cu" (shape rect) (size 1.5 0.8)))
-      (net 2 "SIG"))
+      (net 2 "SIG") (zone_connect 3))
     (fp_line (start -1 3) (end 1 3) (stroke (width 0.2) (type solid)) (layer "F.Cu"))
     (fp_rect (start 5 -1) (end 7 1) (stroke (width 0.1) (type solid)) (fill none)
       (layer "Edge.Cuts"))
@@ -145,7 +153,8 @@ BOARD = f'''(kicad_pcb (version 20260206) (generator "pcbnew")
   (via (at 24 10) (size 0.6) (drill 0.3) (layers "In1.Cu" "In2.Cu") (net 2) (uuid "{U_V5}"))
   (zone (net 1) (net_name "GND") (layers "F.Cu" "B.Cu") (uuid "{U_Z1}") (priority 2)
     (connect_pads (clearance 0.3)) (min_thickness 0.2)
-    (fill yes (island_removal_mode 2) (island_area_min 10))
+    (fill yes (thermal_gap 0.5) (thermal_bridge_width 0.4) (island_removal_mode 2)
+      (island_area_min 10))
     (polygon (pts (xy 1 1) (xy 30 1) (xy 30 30) (arc (start 30 30) (mid 15 35) (end 1 30))
       (xy 1 1)))
     (polygon (pts (xy 5 5) (xy 8 5) (xy 8 8))))
@@ -339,6 +348,11 @@ def build_kipy_board():
     z.island_mode = bt.IRM_AREA
     z.min_island_area = 10 * 10**12
     z.clearance, z.min_thickness = nm(0.3), nm(0.2)
+    # #1329: the text's (connect_pads (clearance X)) is a thermal joint, its
+    # (fill (thermal_gap) (thermal_bridge_width)) the spokes.
+    z.proto.copper_settings.connection.zone_connection = bt.ZCS_THERMAL
+    z.proto.copper_settings.connection.thermal_spokes.gap.value_nm = nm(0.5)
+    z.proto.copper_settings.connection.thermal_spokes.width.value_nm = nm(0.4)
     z.proto.id.value = U_Z1
     b.zones.append(z)
     td = Zone()
@@ -348,6 +362,7 @@ def build_kipy_board():
     td.island_mode = bt.IRM_ALWAYS
     td.clearance, td.min_thickness = 0, nm(0.1)
     td.proto.copper_settings.teardrop.type = bt.TDT_VIA_PAD
+    td.proto.copper_settings.connection.zone_connection = bt.ZCS_FULL  # connect_pads yes
     td.proto.id.value = U_Z2
     b.zones.append(td)
     mz = Zone()
@@ -385,6 +400,7 @@ def build_kipy_board():
     fp.proto.id.value = U_FP
     fp.proto.symbol_sheet_name = '/CH2/'
     fp.proto.symbol_sheet_filename = 'ch.kicad_sch'
+    fp.proto.overrides.zone_connection = bt.ZCS_FULL     # (zone_connect 2)
     rf = fp.reference_field
     rf.text.value = 'U1'
     rf.layer = bt.BL_F_SilkS
@@ -405,6 +421,7 @@ def build_kipy_board():
                   [bt.BL_F_Cu, bt.BL_F_Mask, bt.BL_F_Paste], bt.PSS_CIRCLE, (1, 1))
     p1.pad_to_die_length = nm(1.5)
     p1.proto.pad_to_die_delay.value_as = 12345      # attoseconds: 0.012345 ps
+    p1.padstack.proto.zone_settings.zone_connection = bt.ZCS_NONE   # (zone_connect 0)
     d.add_item(p1)
     d.add_item(make_pad('2', g(fx, fy, fr, 2, 0), bt.PT_PTH, 'GND',
                         [bt.BL_F_Cu] + [getattr(bt, f'BL_In{i}_Cu') for i in range(1, 31)]
@@ -418,6 +435,9 @@ def build_kipy_board():
                   bt.PSS_RECTANGLE, (1, 1),
                   extra_layers=[(bt.BL_In1_Cu, (2, 2)), (bt.BL_B_Cu, (1.5, 0.8))])
     p3.padstack.type = bt.PST_FRONT_INNER_BACK
+    # (zone_connect 3) on the primary copper layer only, the padstack-level
+    # copy left unset: kipy_pad_zone_connection's fallback.
+    p3.padstack.proto.copper_layers[0].zone_settings.zone_connection = bt.ZCS_PTH_THERMAL
     d.add_item(p3)
     for p in d.items:
         if isinstance(p, Pad):
@@ -432,6 +452,7 @@ def build_kipy_board():
     fz.outline = pwh([(31, 21), (33, 21), (33, 23)])
     fz.island_mode = bt.IRM_ALWAYS
     fz.clearance, fz.min_thickness = nm(0.2), nm(0.25)
+    fz.proto.copper_settings.connection.zone_connection = bt.ZCS_THERMAL
     fz.proto.id.value = U_FPZ
     d.add_item(fz)
     d._pack()
@@ -524,7 +545,11 @@ def run_checks(txt, ipc):
                 r6(z.island_area_min) if z.island_removal_mode == 2 else -1.0,
                 -1.0 if z.clearance is None else r6(z.clearance),
                 -1.0 if z.min_thickness is None else r6(z.min_thickness),
-                z.in_footprint, z.uuid)
+                z.in_footprint, z.uuid,
+                # #1329: the pad connection and spoke geometry
+                z.pad_connection or '',
+                -1.0 if z.thermal_gap is None else r6(z.thermal_gap),
+                -1.0 if z.thermal_bridge_width is None else r6(z.thermal_bridge_width))
     tz = sorted(zkey(z, tname) for z in txt.zones)
     iz = sorted(zkey(z, iname) for z in ipc.zones)
     check(tz == iz, f"zones agree ({len(iz)} kipy, {len(tz)} text)")
@@ -537,8 +562,14 @@ def run_checks(txt, ipc):
     check(any(len(z.polygon) > 10 for z in ipc.zones),
           "the outline's arc vertex is linearized, not a (0, 0) point (fe367f3f)")
     check(all((0.0, 0.0) not in z.polygon for z in ipc.zones), "no phantom origin vertex")
+    pour = [z for z in ipc.zones if z.uuid == U_Z1]
+    check(pour and all((z.pad_connection, z.thermal_gap, z.thermal_bridge_width)
+                       == ('thermal', 0.5, 0.4) for z in pour)
+          and [z.pad_connection for z in ipc.zones if z.teardrop] == ['solid'],
+          "zone pad connection and spokes read (#1329): the pour thermal with "
+          "its 0.5 gap / 0.4 spokes, the connect_pads-yes teardrop solid")
 
-    print("D. pads (#967 shape/size/layers, #1248 die)")
+    print("D. pads (#967 shape/size/layers, #1248 die, zone connection)")
     tp = {p.pad_number: p for p in txt.footprints['U1'].pads}
     ip = {p.pad_number: p for p in ipc.footprints['U1'].pads}
     check(set(tp) == set(ip), f"pad numbers agree {sorted(ip)}")
@@ -553,6 +584,13 @@ def run_checks(txt, ipc):
               f"pad {n!r} size {b.size_x:g}x{b.size_y:g} == {a.size_x:g}x{a.size_y:g}")
         check((r6(a.die_length), r6(a.die_delay)) == (r6(b.die_length), r6(b.die_delay)),
               f"pad {n!r} die {b.die_length:g}mm/{b.die_delay:g}ps")
+        check(a.zone_connection == b.zone_connection,
+              f"pad {n!r} zone connection {b.zone_connection} == {a.zone_connection}")
+    check((ip['1'].zone_connection, ip['2'].zone_connection, ip['3'].zone_connection)
+          == ('none', 'solid', 'thru_hole_only'),
+          "a pad's own zone_connect wins (pad 1 NONE, read off the padstack; pad 3 "
+          "thermal-for-PTH, off its primary copper layer), a pad without one takes "
+          "its footprint's (pad 2 solid)")
     check(ip['1'].die_length == 1.5 and abs(ip['1'].die_delay - 0.012345) < 1e-12,
           "pad 1 carries its pad-to-die length and delay")
     check(ip['3'].size_x * ip['3'].size_y < 2.0,
@@ -578,6 +616,20 @@ def run_checks(txt, ipc):
           f"a sheet name changed on one side is reported: {bent}")
     check(sorted(map(sorted, ta.net_tie_groups)) == sorted(map(sorted, ia.net_tie_groups)) == [['1', '2']],
           f"net-tie groups {ia.net_tie_groups}")
+    check((ta.zone_connection, ia.zone_connection) == ('solid', 'solid')
+          and txt.footprints['R1'].zone_connection is None
+          and ipc.footprints['R1'].zone_connection is None,
+          "the footprint zone_connect override reads (U1 solid, R1 none set)")
+    zc_diffs = [d for d in kp.compare_pcb_data(ipc, txt) if 'zone_connection' in d]
+    check(not zc_diffs, f"compare_pcb_data reports no zone_connection difference {zc_diffs[:2]}")
+    pad1 = next(p for p in ia.pads if p.pad_number == '1')
+    pad1.zone_connection = None
+    try:
+        bent = [d for d in kp.compare_pcb_data(ipc, txt) if 'zone_connection' in d]
+    finally:
+        pad1.zone_connection = 'none'
+    check(len(bent) == 1 and 'U1:1' in bent[0],
+          f"a pad's zone connection dropped on one side is reported: {bent}")
     tl, il = ta.ref_label, ia.ref_label
     check(il is not None, "the Reference label is read (it never was on IPC)")
     if tl is not None and il is not None:
@@ -680,6 +732,60 @@ def test_dialog_resync(b, dialog):
           "and a group drawn again counts at the next re-sync")
 
 
+CUSTOM_BOARD = '''(kicad_pcb (version 20260206) (generator "pcbnew")
+  (general (thickness 1.6))
+  (layers (0 "F.Cu" signal) (2 "B.Cu" signal) (1 "F.Mask" user) (25 "Edge.Cuts" user))
+  (net 0 "") (net 1 "D")
+  (footprint "lib:Q" (layer "F.Cu") (at 10 10)
+    (property "Reference" "Q1" (at 0 0) (layer "F.SilkS"))
+    (pad "1" smd custom (at 0 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "D")
+      (options (clearance outline) (anchor rect))
+      (primitives (gr_poly (pts (xy 0 -0.5) (xy 4 -0.5) (xy 4 0.5) (xy 0 0.5))
+        (width 0) (fill yes))))
+    (pad "2" smd custom (at 6 0) (size 1 1) (layers "F.Cu" "F.Mask") (net 1 "D")
+      (options (clearance outline) (anchor rect))
+      (primitives (gr_poly (pts (xy -2 -0.5) (xy 2 -0.5) (xy 2 0.5) (xy -2 0.5))
+        (width 0) (fill yes)))))
+)
+'''
+
+
+def test_custom_pad_copper_box(tmp):
+    """A custom pad's copper drawn to ONE side of its anchor carries
+    Pad.copper_box (main's pcbnew builder read it off the effective shape's
+    box; the kipy builder reads the rendered polygon, `_size_custom_pad_from_
+    copper`), and a pad drawn about its anchor carries none. The kipy pad's
+    polygon is the union outline KiCad renders for that copper."""
+    import copy
+    path = os.path.join(tmp, 'custom.kicad_pcb')
+    with open(path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(CUSTOM_BOARD)
+    txt = {p.pad_number: p for p in kp.parse_kicad_pcb(path).footprints['Q1'].pads}
+    rendered = {'1': [(9.5, 9.5), (14, 9.5), (14, 10.5), (9.5, 10.5)],
+                '2': [(14, 9.5), (18, 9.5), (18, 10.5), (14, 10.5)]}
+    prim = {'1': [(0, -0.5), (4, -0.5), (4, 0.5), (0, 0.5)],
+            '2': [(-2, -0.5), (2, -0.5), (2, 0.5), (-2, 0.5)]}
+    for n in ('1', '2'):
+        kpad = Pad()
+        cl = kpad.padstack.proto.copper_layers[0]     # a fresh Pad has one
+        cl.layer, cl.shape = bt.BL_F_Cu, bt.PSS_CUSTOM
+        cl.size.x_nm = cl.size.y_nm = nm(1)
+        cl.custom_shapes.add().CopyFrom(poly_shape(prim[n], bt.BL_F_Cu, 0, True).proto)
+        got = copy.copy(txt[n])
+        got.copper_box, got.size_x, got.size_y = None, 1.0, 1.0
+        got.anchor_size = (1.0, 1.0)
+        got.polygons = [rendered[n]]
+        kp._size_custom_pad_from_copper(got, kpad)
+        want = txt[n].copper_box
+        check((None if want is None else tuple(map(r6, want)))
+              == (None if got.copper_box is None else tuple(map(r6, got.copper_box))),
+              f"custom pad {n}: copper_box {got.copper_box} == text {want}")
+        check((r6(got.size_x), r6(got.size_y)) == (r6(txt[n].size_x), r6(txt[n].size_y)),
+              f"custom pad {n}: size {got.size_x:g}x{got.size_y:g} == text")
+    check(txt['1'].copper_box is not None and txt['2'].copper_box is None,
+          "the fixture is the case: pad 1 offset, pad 2 drawn about its anchor")
+
+
 def test_negative_controls(b):
     """The old readers' failures, reproduced, so a passing check above is the
     port and not the fixture."""
@@ -715,13 +821,16 @@ def main():
         test_negative_controls(b)
         print("I. the dialog re-sync's sense groups (kipy_resolve_sense_branches)")
         test_dialog_resync(b, ipc)
+        print("J. a custom pad's copper box (Pad.copper_box)")
+        test_custom_pad_copper_box(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if FAILS:
         print(f"\n{len(FAILS)} check(s) FAILED")
         return 1
     print("\nPASS  kipy builder parity with the text parser (#1268 #1279 #1164 "
-          "#967 #1248 #1211 #481 #304 #829 #337 #908)")
+          "#967 #1248 #1211 #481 #304 #829 #337 #908 #1329, zone_connect, "
+          "copper_box)")
     return 0
 
 

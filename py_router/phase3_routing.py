@@ -514,7 +514,7 @@ def _phase3_tap_relocation_retry(net_id, completed_result, pcb_data, config,
 
 
 def _phase3_stub_switch_retry(net_id, completed_result, pcb_data, config,
-                              state, obstacles, global_tap_offset,
+                              state, build_obstacles, global_tap_offset,
                               total_tap_edges, global_tap_failed):
     """Stub layer switch for terminally-failed tap pads: a ball-field pad
     whose escape stub is walled in on its own layer cannot be tapped by any
@@ -523,7 +523,16 @@ def _phase3_stub_switch_retry(net_id, completed_result, pcb_data, config,
     so it drops even inside a dense field) and re-run the tap pass. Kept on
     improvement (fewer failed pads), reverted exactly otherwise. The
     multipoint twin of the initial-loop _stub_swap_rescue rung, which
-    multipoint nets never reach (their failures land here)."""
+    multipoint nets never reach (their failures land here).
+
+    build_obstacles() returns the net's obstacle map for the board AS IT
+    STANDS NOW. It is called here, never handed in pre-built: this retry
+    runs after the rip ladder and tap relocation, which rip, re-route and
+    move OTHER nets' copper, so a map built before them is a snapshot of a
+    board that no longer exists. Measured (fusb302_pd_dev): the tap ladder
+    ripped GPIO3 and re-routed it elsewhere, and this retry, on the map
+    built before the rip, laid GPIO2 on top of GPIO3's new track -- 78
+    clearance violations, 55 of them in contact."""
     failed_pads = completed_result.get('failed_pads_info') or []
     if not failed_pads:
         return None
@@ -550,7 +559,7 @@ def _phase3_stub_switch_retry(net_id, completed_result, pcb_data, config,
         return None
 
     retry = route_multipoint_taps(
-        pcb_data, net_id, config, obstacles, dict(completed_result),
+        pcb_data, net_id, config, build_obstacles(), dict(completed_result),
         global_offset=global_tap_offset, global_total=total_tap_edges,
         global_failed=global_tap_failed)
     after = len((retry or {}).get('failed_pads_info') or []) \
@@ -677,23 +686,28 @@ def run_phase3_tap_routing(
         length_matching_active = lm_segments is not main_result['new_segments']
 
         # Build obstacles - use incremental approach if no length matching and working map available
-        if not length_matching_active and state.working_obstacles is not None and state.net_obstacles_cache:
-            obstacles, _ = build_incremental_obstacles(
-                state.working_obstacles, pcb_data, config, net_id,
-                all_unrouted_net_ids, routed_net_ids, track_proximity_cache, layer_map,
-                state.net_obstacles_cache,
-                state.ripped_route_layer_costs, state.ripped_route_via_positions
-            )
-        else:
-            # Full rebuild needed when length matching modified segments
-            phase3_routed_ids = [rid for rid in routed_net_ids if rid != net_id]
-            obstacles, _ = build_single_ended_obstacles(
-                base_obstacles, pcb_data, config, phase3_routed_ids, remaining_net_ids,
-                all_unrouted_net_ids, net_id, gnd_net_id, track_proximity_cache, layer_map,
-                net_obstacles_cache=state.net_obstacles_cache,
-                ripped_route_layer_costs=state.ripped_route_layer_costs,
-                ripped_route_via_positions=state.ripped_route_via_positions
-            )
+        def _build_obstacles(net_id=net_id,
+                             length_matching_active=length_matching_active):
+            if not length_matching_active and state.working_obstacles is not None and state.net_obstacles_cache:
+                obstacles, _ = build_incremental_obstacles(
+                    state.working_obstacles, pcb_data, config, net_id,
+                    all_unrouted_net_ids, routed_net_ids, track_proximity_cache, layer_map,
+                    state.net_obstacles_cache,
+                    state.ripped_route_layer_costs, state.ripped_route_via_positions
+                )
+            else:
+                # Full rebuild needed when length matching modified segments
+                phase3_routed_ids = [rid for rid in routed_net_ids if rid != net_id]
+                obstacles, _ = build_single_ended_obstacles(
+                    base_obstacles, pcb_data, config, phase3_routed_ids, remaining_net_ids,
+                    all_unrouted_net_ids, net_id, gnd_net_id, track_proximity_cache, layer_map,
+                    net_obstacles_cache=state.net_obstacles_cache,
+                    ripped_route_layer_costs=state.ripped_route_layer_costs,
+                    ripped_route_via_positions=state.ripped_route_via_positions
+                )
+            return obstacles
+
+        obstacles = _build_obstacles()
 
         # Build input - use LENGTH-MATCHED segments (so taps connect to actual final route)
         # The segment filtering in route_multipoint_taps will avoid meander regions
@@ -752,7 +766,7 @@ def run_phase3_tap_routing(
             if completed_result.get('failed_pads_info'):
                 _sw = _phase3_stub_switch_retry(
                     net_id, completed_result, pcb_data, config, state,
-                    obstacles, global_tap_offset, total_tap_edges,
+                    _build_obstacles, global_tap_offset, total_tap_edges,
                     global_tap_failed)
                 if _sw is not None:
                     completed_result = _sw
@@ -1495,7 +1509,8 @@ def _retry_victim_main_with_ripup(
                 _c652 = _ch652(_h652)
                 if _c652:
                     print(f"    {_c652}")
-                record_net_event(state, victim_id, "fanout_dropped", _v652)
+                if (_v652 or {}).get('verdict') == 'fanout_dropped':
+                    record_net_event(state, victim_id, "fanout_dropped", _v652)
         except Exception:
             pass
         return None, []
@@ -1972,7 +1987,7 @@ def seam_reask_one_net(net_id, pcb_data, config, state, base_obstacles,
     (default 1.3) times the straight-line MST bound over their pads.
     Returns True when the tree was replaced."""
     import math
-    if not env_knobs.SEAM_REASK:
+    if getattr(config, 'quick', 0) >= 2:
         return False
     r_old = routed_results.get(net_id)
     if (not r_old or r_old.get('failed') or r_old.get('failed_pads_info')
@@ -2078,7 +2093,7 @@ def se_seam_reask(state, pcb_data, config, base_obstacles, gnd_net_id,
                   all_unrouted_net_ids, routed_net_ids, remaining_net_ids,
                   routed_net_paths, routed_results, diff_pair_by_net_id,
                   results, track_proximity_cache, layer_map):
-    """#444 SE seam dissolution (KICAD_SEAM_REASK=0 disables).
+    """#444 SE seam dissolution.
 
     After Phase 3, a fully-connected multipoint net is a COMPOSITION: a main
     edge routed early in the loop plus taps welded on across the run, each
@@ -2092,7 +2107,7 @@ def se_seam_reask(state, pcb_data, config, base_obstacles, gnd_net_id,
     lower bound over their pads, worst first, capped at KICAD_SEAM_SE_MAX
     (default 16)."""
     import math
-    if not env_knobs.SEAM_REASK:
+    if getattr(config, 'quick', 0) >= 2:
         return 0
     from dataclasses import replace as _dc_replace
     try:

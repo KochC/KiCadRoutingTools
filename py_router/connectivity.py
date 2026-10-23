@@ -654,6 +654,23 @@ def get_terminal_component_info(
     for si, seg in enumerate(net_segments):
         endpoint_points.append((seg.start_x, seg.start_y, seg.layer, 2 * si))
         endpoint_points.append((seg.end_x, seg.end_y, seg.layer, 2 * si + 1))
+    # #545 F4 puts a group's representative stub terminal AT one of its vias
+    # (get_multipoint_net_pads, which takes a via within 0.05 of a segment
+    # end), and a via that far from the end misses the 0.01 endpoint match
+    # below. Such a terminal resolves through the via's own graph membership
+    # (#1294: kit-dev-coldfire's +3.3V via sat 30 um off the grid point its
+    # B.Cu and F.Cu tracks end on, so each layer's group became a terminal
+    # at the via centre in a singleton component apart from the island that
+    # holds the via, and the router planned a zero-length edge between them
+    # -- a one-cell path welded from the via centre to its grid point and
+    # back, on the plane layer, 29 times per run).
+    via_points = []  # (x, y, point_id)
+    for _vidx, _vpid in (graph.get('via_index_repr') or {}).items():
+        try:
+            _gv = net_vias[_vidx]
+        except (IndexError, TypeError):
+            continue
+        via_points.append((_gv.x, _gv.y, _vpid))
 
     components: Dict[int, int] = {}
     next_unique = -1
@@ -677,6 +694,10 @@ def get_terminal_component_info(
                     best = (d, pid)
             if best is not None:
                 rep = best[1]
+            else:
+                rep = next((pid for vx, vy, pid in via_points
+                            if abs(vx - tx) <= 1e-6 and abs(vy - ty) <= 1e-6),
+                           None)
         if rep is None:
             components[i] = next_unique
             next_unique -= 1
@@ -686,6 +707,12 @@ def get_terminal_component_info(
     copper_count: Dict[int, int] = {}
     segs_by_component: Dict[int, List[Segment]] = {}
     for si, seg in enumerate(net_segments):
+        if getattr(seg, 'graphic', False):
+            # Board art conducts, so it joins the terminals it touches into
+            # one component above, but it is immovable copper the router did
+            # not lay (#337): never a launch surface, nor what makes an island
+            # the copper-richest.
+            continue
         root = uf.find(2 * si)
         copper_count[root] = copper_count.get(root, 0) + 1
         segs_by_component.setdefault(root, []).append(seg)
@@ -958,7 +985,7 @@ def get_stub_segments(pcb_data: PCBData, net_id: int, stub_x: float, stub_y: flo
     Returns:
         List of segments forming the stub, ordered from free end to pad
     """
-    # Copper GRAPHICS are excluded: they never conduct (#513) and are written
+    # Copper GRAPHICS are excluded: they are immovable art (#337), written
     # back from the original file with their original layer, so a stub walk
     # that picks one up hands immovable board copper to the layer-swap
     # machinery -- which then relayers it in pcb_data only, blinding the
@@ -1934,31 +1961,36 @@ def compute_mst_edges(points: List[Tuple[float, float]], use_manhattan: bool = F
     nearest = np.zeros(n, dtype=np.intp)
     edges = []
 
-    def _dist_from(idx):
-        dx = xs - xs[idx]
-        dy = ys - ys[idx]
-        if use_manhattan:
-            return np.abs(dx) + np.abs(dy)
-        return np.sqrt(dx * dx + dy * dy)
+    # Every row of the distance matrix at once, by the same arithmetic the
+    # per-node form used (`xs - xs[idx]` and so on, element by element), so
+    # each distance is the same float; it is computed once per tree instead
+    # of once per node added.
+    dx = xs[None, :] - xs[:, None]
+    dy = ys[None, :] - ys[:, None]
+    if use_manhattan:
+        dist = np.abs(dx) + np.abs(dy)
+    else:
+        dist = np.sqrt(dx * dx + dy * dy)
 
-    # Start with node 0.
+    # Start with node 0. `min_dist` holds +inf for every node in the tree,
+    # so its argmin is the argmin over the nodes outside it.
     in_tree[0] = True
-    min_dist = _dist_from(0)
+    min_dist = dist[0].copy()
     min_dist[0] = np.inf  # node 0 is in the tree
 
     for _ in range(n - 1):
-        # Find the non-tree node closest to the tree (in-tree nodes masked out).
-        masked = np.where(in_tree, np.inf, min_dist)
-        best_j = int(np.argmin(masked))
-        best_dist = float(masked[best_j])
+        # Find the non-tree node closest to the tree.
+        best_j = int(np.argmin(min_dist))
+        best_dist = float(min_dist[best_j])
         if not np.isfinite(best_dist):
             break
 
         in_tree[best_j] = True
+        min_dist[best_j] = np.inf
         edges.append((int(nearest[best_j]), best_j, best_dist))
 
         # Pull every remaining node toward the freshly added node where closer.
-        d = _dist_from(best_j)
+        d = dist[best_j]
         update = (~in_tree) & (d < min_dist)
         min_dist[update] = d[update]
         nearest[update] = best_j

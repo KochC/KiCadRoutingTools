@@ -11,7 +11,7 @@ cannot reach. Run route.py over all nets (plane nets included) after this
 and grade THAT board, not the bare pour.
 
 Usage:
-    python py_router/route_planes.py input.kicad_pcb output.kicad_pcb --nets GND --plane-layers B.Cu
+    python3 py_router/route_planes.py input.kicad_pcb output.kicad_pcb --nets GND --plane-layers B.Cu
 """
 from __future__ import annotations
 
@@ -52,7 +52,9 @@ from connectivity import compute_mst_segments
 from plane_io import (
     ZoneInfo,
     extract_zones,
+    zone_infos,
     check_existing_zones,
+    replaced_pours,
     shared_layer_zone_priority,
     resolve_net_id,
     write_plane_output
@@ -3082,6 +3084,55 @@ def consume_sense_branches() -> list:
     return out
 
 
+#: JSON_SUMMARY.zone_replacements of the last create_plane() in this process
+#: (#1329): one entry per existing pour the run replaced -- its net, the
+#: layers it is replaced on, and every setting that changes with why. Taken
+#: by main() like the pad tally.
+_LAST_ZONE_REPLACEMENTS: list = []
+
+
+def consume_zone_replacements() -> list:
+    """Take (and clear) the last pour's zone-replacement entries."""
+    global _LAST_ZONE_REPLACEMENTS
+    out, _LAST_ZONE_REPLACEMENTS = list(_LAST_ZONE_REPLACEMENTS), []
+    return out
+
+
+def _note_zone_replacements(replaced_pours_by_target, zone_data, layer_nets,
+                            board_edge_clearance) -> None:
+    """Print, and record for JSON_SUMMARY, what replacing each existing pour
+    changes (#1329). Replacing used to report only "with new parameters", so a
+    designer's thermal-relief pour came back solid, at another clearance,
+    width and outline, with no word about which. One entry per replaced pour:
+    a multi-layer pour replaced on several layers is listed once, with them."""
+    from plane_io import zone_replacement_changes, format_zone_replacement
+    _LAST_ZONE_REPLACEMENTS.clear()
+    entries: Dict[object, Dict] = {}
+    for (net_name, layer), olds in replaced_pours_by_target.items():
+        new = [zd for zd in zone_data if not zd.get('keepout')
+               and zd.get('net_name') == net_name and zd.get('layer') == layer]
+        if not new:
+            continue        # no new pour was built (a cancelled run)
+        shared = layer_nets and len(layer_nets.get(layer, [])) > 1
+        why = (f"this layer's share of its split between "
+               f"{', '.join(layer_nets.get(layer, []))}" if shared else
+               f"the board's bounding box inset {board_edge_clearance:g} mm "
+               f"(--board-edge-clearance)")
+        for old in olds:
+            rows = zone_replacement_changes(old.zone, new, outline_why=why)
+            key = (net_name, old.uuid or id(old.zone),
+                   tuple(tuple(sorted(r.items())) for r in rows))
+            entry = entries.setdefault(key, {'net': net_name, 'layers': [],
+                                             'replaced_uuid': old.uuid or None,
+                                             'changes': rows})
+            entry['layers'].append(layer)
+    for entry in entries.values():
+        for line in format_zone_replacement(entry['net'], entry['layers'],
+                                            entry['changes']):
+            print(line)
+        _LAST_ZONE_REPLACEMENTS.append(entry)
+
+
 def _sense_branches_poured_over(pcb_data, zone_data) -> Dict[str, List[str]]:
     """{branch name: [layer, ...]} for every protected sense branch (#1279)
     that a pour of this run (`zone_data`, create_plane's zone dicts) covers,
@@ -3257,6 +3308,7 @@ def create_plane(
     # #1279: the board's `sense:<REF>.<PAD>` groups -- protected, or why not
     # (engine-side, so the Planes tab's log shows it too).
     _LAST_SENSE_BRANCHES.clear()
+    _LAST_ZONE_REPLACEMENTS.clear()   # #1329: filled once the new pours exist
     from sense_branch import report as _sense_report
     _sense_report(pcb_data)
 
@@ -3271,9 +3323,8 @@ def create_plane(
     # were spent on boards nobody could open.
     #
     # Engine-side, not in main(): main() never parses the board so it cannot
-    # validate, and this way the CLI, the GUI planes tab and
-    # route_disconnected_planes all inherit the guard (same reasoning as the
-    # copper-to-edge rule below).
+    # validate, and this way the CLI and the GUI planes tab both inherit the
+    # guard (same reasoning as the copper-to-edge rule below).
     _copper = list(getattr(pcb_data.board_info, 'copper_layers', None) or ())
     if _copper:
         _bad = [l for l in plane_layers if l not in _copper]
@@ -3284,12 +3335,6 @@ def create_plane(
                   f"(e.g. --nets GND GNDA --plane-layers B.Cu B.Cu), "
                   f"not net:layer pairs.")
             return _empty_plane_results(return_results)
-
-    # Route trace (#482): plane creation builds its tap tracks/vias as dicts in
-    # all_new_segments/all_new_vias (never touching pcb_data.segments), so record
-    # them from those dicts at the end. Local trace, baseline = the input copper.
-    from route_trace import start_plane_trace as _start_plane_trace
-    _ptrace = _start_plane_trace(pcb_data, output_file)
 
     # Zone clearance defaults to the step's ROUTED clearance, and escalates
     # DOWN toward the fab floor when even that cannot thread the densest BGA
@@ -3333,22 +3378,11 @@ def create_plane(
     from kicad_parser import pour_zones
     if _live_pcb_data:
         # POURS only (#1164), as plane_io.extract_zones reads the file -- and
-        # with each pour's layer SPAN recovered from its uuid the same way, so
-        # check_existing_zones can tell a multi-layer pour (kept, never
-        # replaced) from one that covers only the target layer. Without it a
-        # live `(layers "F.Cu" "B.Cu")` pour read as single-layer.
-        _live = list(pour_zones(getattr(pcb_data, 'zones', None)))
-        _span_by_uuid: Dict[str, List[str]] = {}
-        for z in _live:
-            if getattr(z, 'uuid', ''):
-                _span_by_uuid.setdefault(z.uuid, []).append(z.layer)
-        for z in _live:
-            _zu = getattr(z, 'uuid', '') or ''
-            existing_zones.append(ZoneInfo(net_id=z.net_id, net_name=z.net_name, layer=z.layer,
-                                           in_footprint=getattr(z, 'in_footprint', False),
-                                           priority=int(getattr(z, 'priority', 0) or 0),
-                                           uuid=_zu,
-                                           span=tuple(_span_by_uuid.get(_zu, [z.layer]))))
+        # through the same reader (zone_infos), which recovers each pour's
+        # layer SPAN from its uuid, so check_existing_zones can tell a
+        # multi-layer pour from one that covers only the target layer.
+        # Without it a live `(layers "F.Cu" "B.Cu")` pour read as single-layer.
+        existing_zones = zone_infos(pour_zones(getattr(pcb_data, 'zones', None)))
     else:
         try:
             existing_zones = list(extract_zones(input_file))
@@ -3361,7 +3395,8 @@ def create_plane(
                 continue
             existing_zones.append(ZoneInfo(net_id=z.net_id, net_name=z.net_name, layer=z.layer,
                                           in_footprint=getattr(z, 'in_footprint', False),
-                                          priority=int(getattr(z, 'priority', 0) or 0)))
+                                          priority=int(getattr(z, 'priority', 0) or 0),
+                                          zone=z))
             seen_keys.add(key)
 
     should_create_zones = []  # Per-net flag for whether to create zone
@@ -3369,6 +3404,9 @@ def create_plane(
     # The same decision keyed by the REQUESTED (net name, layer), which is how
     # the returned zone dicts name their pour (see `replace_existing` below).
     replaced_targets: Set[Tuple[str, str]] = set()
+    # #1329: the existing pours each replaced target removes, so the run can
+    # say what the replacement changes once the new pour is built.
+    replaced_pours_by_target: Dict[Tuple[str, str], List[ZoneInfo]] = {}
     # Fill priority per net for a plane that has to SHARE its layer with another
     # net's existing pour: ABOVE the incumbent, so the newly requested plane wins
     # the overlap deterministically (see plane_io.shared_layer_zone_priority --
@@ -3405,9 +3443,13 @@ def create_plane(
         # CLI path. A foreign-net pour on the layer no longer aborts the run: the
         # plane is created alongside it, at a higher fill priority so the overlap
         # resolves deterministically (see check_existing_zones /
-        # shared_layer_zone_priority).
+        # shared_layer_zone_priority). A same-net pour is replaced when this
+        # call pours the net on every layer it covers (#1299), so the check is
+        # given all of this net's layers, not just this one.
+        _call_layers = [l for n, l in zip(net_names, plane_layers) if n == net_name]
         should_create, should_continue, zone_to_replace, foreign_zones = check_existing_zones(
-            existing_zones, plane_layer, net_name, net_id, verbose
+            existing_zones, plane_layer, net_name, net_id, verbose,
+            call_layers=_call_layers
         )
         if not should_continue:
             print(f"Error: Zone conflict for net '{net_name}' on layer {plane_layer}")
@@ -3418,6 +3460,8 @@ def create_plane(
         if zone_to_replace:
             zones_to_replace.append((zone_to_replace.net_id, zone_to_replace.layer))
             replaced_targets.add((net_name, plane_layer))
+            replaced_pours_by_target[(net_name, plane_layer)] = replaced_pours(
+                existing_zones, plane_layer, net_name, net_id, _call_layers)
             # #487: a REPLACED user pour keeps (at least) its own fill priority.
             # Writing only the shared-layer computed value silently reset e.g.
             # a priority-2 pour to 0, flipping which overlapping zone pulls back.
@@ -3535,16 +3579,18 @@ def create_plane(
         except Exception as _e:
             print(f"  Warning: could not auto-read netclass clearances ({_e}).")
             net_clearances = None
-        # #439: --clearance was the CEILING -> cap every class at min(class,
-        # ceiling). When not clamping (--clearance omitted), honor the classes
+        # #439/#530: --clearance-ceiling GIVEN -> cap every class at min(class,
+        # ceiling). When not clamping (no ceiling), honor the classes
         # in full. Only the auto-read map is capped: a map the caller passes
         # (the --net-clearances file, or the GUI's own class map, already
         # capped there) is used as given, as batch_route does.
         if net_clearances and clamp_netclasses and clearance_ceiling is not None:
             net_clearances = {nid: min(c, clearance_ceiling)
                               for nid, c in net_clearances.items()}
+    # The plane nets of this call set the floor foreign obstacles are priced
+    # from, as in repair_planes and batch_route (#1290).
     if net_clearances:
-        config.net_clearances = dict(net_clearances)
+        config.set_net_clearances(net_clearances, net_ids)
     # Publish the SAME map to the fill model (#483 item 5): KiCad refills a
     # zone at max(zone clearance, pairwise netclass), so on honor-classes
     # chains a looser foreign class carves copper the model would otherwise
@@ -3960,6 +4006,12 @@ def create_plane(
                 all_debug_lines.extend(debug_line_sexprs)
                 all_zone_data.extend(zone_data)
 
+    # #1329: say what each replaced pour's replacement changes, setting by
+    # setting, now that every new pour exists. In the engine, so the Planes
+    # tab's log carries it too; main() folds the records into JSON_SUMMARY.
+    _note_zone_replacements(replaced_pours_by_target, all_zone_data, layer_nets,
+                            board_edge_clearance)
+
     # Area via stitching + edge fence (#485): AFTER every pour's geometry and
     # this run's tap copper exist, BEFORE the finalize/write split so the CLI
     # file write and the GUI results path emit identical stitch vias. The
@@ -4063,21 +4115,6 @@ def create_plane(
     _asim962(_stamps962)
     _pvpr962(_via_in_pad962, "plane stitching vias")
     create_plane.last_via_in_pad = _via_in_pad962
-
-    # Route trace (#482): emit the finalized plane-tap tracks/vias, grouped by
-    # net so each plane's taps land as one animation event, then write
-    # <output>_routetrace.json. finalize=False: the tap copper is in these dicts,
-    # not pcb_data, so the whole-run animator trues up to the step board instead.
-    if _ptrace is not None:
-        _by_net: Dict[int, list] = {}
-        for _s in all_new_segments:
-            _by_net.setdefault(_s.get('net_id'), [[], []])[0].append(_s)
-        for _v in all_new_vias:
-            _by_net.setdefault(_v.get('net_id'), [[], []])[1].append(_v)
-        for _nid, (_segs, _vias) in _by_net.items():
-            _nm = pcb_data.nets[_nid].name if _nid in pcb_data.nets else ''
-            _ptrace.record_dicts(_segs, _vias, 'plane-tap', _nid, _nm)
-        _ptrace.dump(output_file, pcb_data, finalize=False)
 
     # NPTH slot edge keepouts (#448): KiCad's DRC grades copper proximity to a
     # milled NPTH SLOT as copper_edge_clearance, but its zone filler pulls fill
@@ -4277,10 +4314,10 @@ def main():
         epilog="""
 Examples:
     # Single net:
-    python py_router/route_planes.py input.kicad_pcb output.kicad_pcb --nets GND --plane-layers B.Cu
+    python3 py_router/route_planes.py input.kicad_pcb output.kicad_pcb --nets GND --plane-layers B.Cu
 
     # Multiple nets (each net paired with corresponding plane layer):
-    python py_router/route_planes.py input.kicad_pcb output.kicad_pcb --nets GND +3.3V --plane-layers In1.Cu In2.Cu
+    python3 py_router/route_planes.py input.kicad_pcb output.kicad_pcb --nets GND +3.3V --plane-layers In1.Cu In2.Cu
 
 """
     )
@@ -4289,7 +4326,7 @@ Examples:
     parser.add_argument("--ripup-blocker-select",
                         choices=list(defaults.RIPUP_BLOCKER_SELECT_CHOICES),
                         default=defaults.RIPUP_BLOCKER_SELECT,
-                        help="""Blocker SELECTION algorithm for the rip-up ladder (see route.py --help / docs/rip-up-reroute.md)""")
+                        help="""Accepted for compatibility with route.py; no effect on the pour (#562: the pour rips nothing). See route.py --help / docs/rip-up-reroute.md""")
     # #381 D9: accept --output FILE like route.py / route_diff.py (flag form of the
     # positional output). Additive: default None, positional still works.
     parser.add_argument("--output", metavar="FILE",
@@ -4307,9 +4344,9 @@ Examples:
                              "is refused against the board's own copper layers.")
 
     # Via and track geometry
-    parser.add_argument("--via-size", type=float, default=None, help="Via outer diameter in mm (default: the board Default net-class via, else 0.5). NOT a hard floor: a tap into a fine-pitch pad field can escalate to the --fab-tier via and print a per-via warning, because a 0.5mm via does not fit a 0.5mm-pitch TQFP. Pass --fab-overrides to forbid the escalation -- at the cost of the taps that then cannot be made")
+    parser.add_argument("--via-size", type=float, default=None, help="Via outer diameter in mm (default: the board Default net-class via, else 0.5) for the vias this step places: thermal arrays, --stitch-vias, the edge fence and --add-gnd-vias. The pour places no pad taps (#562); the route step's finalize does, at its own --via-size")
     parser.add_argument("--via-drill", type=float, default=None, help="Via drill size in mm (default: the board Default net-class via drill, else 0.3)")
-    parser.add_argument("--track-width", type=float, default=None, help="Track width for via-to-pad connections in mm (default: the board Default net-class width, else 0.3)")
+    parser.add_argument("--track-width", type=float, default=None, help="Track width in mm (default: the board Default net-class width, else 0.3). The pour draws no via-to-pad traces (#562); the width sizes the spines a shared plane layer is split around, any soft-joint bridge, and the output project's min_track_width floor")
     parser.add_argument("--clearance", type=float, default=None, help="Copper clearance of the DEFAULT net class for this run, in mm; other classes are honoured at their own clearance (pairwise max). When OMITTED, the board's Default class, else 0.25. --clearance-ceiling caps every class (the old #439 behaviour) and the writeback clamps.")
     parser.add_argument("--net-clearances", metavar="JSON", default=None,
                         help="JSON file mapping net NAME -> clearance mm (the file route.py and "
@@ -4344,13 +4381,14 @@ Examples:
     # #381 D9: accept the plural --no-bga-zones spelling too (route.py uses the
     # plural). Same store_true dest -- additive, old spelling kept.
     parser.add_argument("--no-bga-zone", "--no-bga-zones", action="store_true",
-                        help="Disable BGA auto-exclusion zones when re-routing ripped nets "
-                             "(issue #88.2). Use when the original signal routing used "
-                             "--no-bga-zones, so the reroute uses compatible parameters.")
+                        help="Accepted for compatibility; no effect on the pour (#562: it "
+                             "re-routes no ripped nets, so there is no reroute for the "
+                             "BGA exclusion zones to apply to).")
     parser.add_argument("--power-nets", nargs="+", default=None,
-                        help="Glob patterns for power nets to route with wider tracks (e.g., '*GND*' '*VCC*')")
+                        help="Accepted for compatibility with route.py; no effect on the pour (#562: "
+                             "it routes no tracks). Pass it to the route step instead")
     parser.add_argument("--power-nets-widths", nargs="+", type=float, default=None,
-                        help="Track widths in mm for each power-net pattern (must match --power-nets length)")
+                        help="Accepted with --power-nets for compatibility; no effect on the pour (#562)")
 
     # Shared plane layer (the spine split) options
     parser.add_argument("--voronoi-seed-interval", type=float,
@@ -4433,10 +4471,11 @@ Examples:
                            enforce_fab_floors, count_copper_layers_in_file)
     add_fab_tier_args(parser)
     args = __import__("cli_nets").pin_dash_digit_values(parser).parse_args()
-    # #439: identical net-class/clearance model to route.py. --clearance is the
-    # clamp switch: GIVEN -> ceiling, every class capped at min(class, ceiling),
-    # writeback clamps (_clamp_netclasses True). OMITTED -> each net routes at its
-    # own class (base = board Default class), classes preserved. Geometry flags
+    # #530: identical net-class/clearance model to route.py. --clearance sets the
+    # Default class for the run; other classes route at their own. --clearance-
+    # ceiling GIVEN -> every class capped at min(class, ceiling), writeback clamps
+    # (_clamp_netclasses True). OMITTED -> each net routes at its own class (base =
+    # --clearance, else the board Default class), classes preserved. Geometry flags
     # omitted -> default from the board (track/clearance/via from Default net-class,
     # hole/edge from board constraints, else a routing_defaults constant). Planes
     # keep their larger PLANE_EDGE_CLEARANCE fallback when the board declares none.
@@ -4788,7 +4827,22 @@ Examples:
                       f"(below nominal {args.clearance:.4g}; fine-pitch taps) - "
                       f"grading at this floor")
             from fix_kicad_drc_settings import (fix_project_for_output, drc_fix_kwargs,
-                                                read_project_edge_clearance)
+                                                read_project_edge_clearance,
+                                                drawn_copper, plane_fix_kwargs)
+            # #1319: only the floors of copper this step drew -- the Planes
+            # tab makes the same decision from the copper it applied. Counted
+            # off the files, so the GND return vias above are included.
+            _n_tracks, _n_vias = drawn_copper(args.input_file, args.output_file)
+            if _n_tracks is None:
+                _n_tracks = _n_vias = 1     # unreadable: write as before
+            _plane_kw = plane_fix_kwargs(
+                _n_tracks, _n_vias, clearance=eff_clearance,
+                hole_to_hole=args.hole_to_hole_clearance,
+                track_width=args.track_width, via_size=args.via_size,
+                via_drill=args.via_drill)
+            if not (_n_tracks or _n_vias):
+                print("  Bare pour (no track or via drawn): writing the copper "
+                      "clearance only -- no size or copper-to-hole floor (#1319)")
             # #338: record the PROJECT's copper-to-edge rule, never this
             # tool's --board-edge-clearance -- that is the plane-zone INSET
             # (default 0.5), not an enforced DRC floor; writing it into a
@@ -4796,10 +4850,13 @@ Examples:
             # rule (openstint: design 0.3, recorded 0.5).
             fix_project_for_output(
                 args.output_file, input_pcb=args.input_file,
-                clearance=eff_clearance, hole_to_hole=args.hole_to_hole_clearance,
+                hole_to_hole=_plane_kw['hole_to_hole'],
+                clearance=_plane_kw['clearance'],
                 edge_clearance=read_project_edge_clearance(args.input_file),
-                track_width=args.track_width,
-                via_diameter=args.via_size, via_drill=args.via_drill,
+                track_width=_plane_kw['track_width'],
+                via_diameter=_plane_kw['via_diameter'],
+                via_drill=_plane_kw['via_drill'],
+                copper_holes=_plane_kw['copper_holes'],
                 **drc_fix_kwargs(args))
         except Exception as e:
             print(f"  (skipped DRC-settings fix: {e})")
@@ -4886,6 +4943,13 @@ Examples:
     _sense = consume_sense_branches()
     if _sense:
         _summary['sense_branches'] = _sense
+
+    # #1329: every existing pour the run replaced, and what that changed
+    # (setting, old, new, why), so a chain can see a designer's thermal
+    # relief turned solid without reading the log.
+    _zr = consume_zone_replacements()
+    if _zr:
+        _summary['zone_replacements'] = _zr
 
     # The run either finished or raised; there is no partial shape to report
     # (the CLI has no cancel source). `complete`/`status` are kept because

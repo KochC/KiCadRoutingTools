@@ -250,7 +250,9 @@ def apply_drc_settings_fix(cfg, *, diff_pair=False, fix_kwargs=None):
     elsewhere -- the fanout tab's, from fix_kicad_drc_settings.
     fanout_fix_kwargs, the ONE decision bga_fanout's / qfn_fanout's mains and
     both GUI fronts read. The gate stays `cfg`'s, so every tab's writeback
-    still goes through this one choke point (#693).
+    still goes through this one choke point (#693). The Planes tab's come
+    from fix_kicad_drc_settings.plane_fix_kwargs (#1319), as route_planes'
+    main writes them.
     """
     if not (cfg and cfg.get('fix_drc_settings', True)):
         return None

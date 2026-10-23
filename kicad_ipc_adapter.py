@@ -799,7 +799,7 @@ def _is_pour(zone) -> bool:
     return True
 
 
-def _live_pours(board):
+def _live_pours(board, replaced_keys=()):
     """(pour keys, replaceable, zone names) of the board's zones.
 
     pour keys: {(net_name, layer_name)} of the SINGLE-layer pours -- the
@@ -808,12 +808,17 @@ def _live_pours(board):
     priority and plane_io never deletes it to replace one layer, so counting
     its layers here skipped a pour the CLI makes (main's SWIG guard keys only
     such a zone's first layer, GetLayer(), and diverges there instead).
-    replaceable: the same pours as {(net_name, layer_name): [zone]}, the ones
-    a `replace_existing` zone supersedes. zone names: every zone's name, rule
-    areas included, so a re-run never duplicates #448's keep-outs."""
+    replaceable: {(net_name, layer_name): [zone]}, the pours this run's
+    `replace_existing` zones supersede -- `replaced_keys`, their (net, layer)
+    pairs. A pour goes only when EVERY copper layer it covers is replaced
+    (#1299, plane_io's rule): a multi-layer pour the run pours on all of its
+    layers is listed under each of them, one it pours on some is kept. zone
+    names: every zone's name, rule areas included, so a re-run never
+    duplicates #448's keep-outs."""
     keys: set[tuple[str, str]] = set()
     replaceable: dict = {}
     names: set = set()
+    replaced_keys = set(replaced_keys or ())
     try:
         with ipc_lock():
             zones = list(board.get_zones())
@@ -829,10 +834,15 @@ def _live_pours(board):
         net = getattr(z, "net", None)
         if net is not None:
             net_name = getattr(net, "name", "") or ""
-        span = [layer_name_for(bl) for bl in (getattr(z, "layers", None) or [])]
-        if len(span) == 1 and span[0]:
+        # Copper layers only, as the parsers read a zone's span.
+        span = [n for n in (layer_name_for(bl)
+                            for bl in (getattr(z, "layers", None) or []))
+                if n and n.endswith(".Cu")]
+        if len(span) == 1:
             keys.add((net_name, span[0]))
-            replaceable.setdefault((net_name, span[0]), []).append(z)
+        if span and all((net_name, l) in replaced_keys for l in span):
+            for l in span:
+                replaceable.setdefault((net_name, l), []).append(z)
     return keys, replaceable, names
 
 
@@ -1205,12 +1215,18 @@ def apply_planes_results(board, *, pcb_data,
         net = pcb_data.nets.get(net_id)
         return net.name if net is not None else None
 
-    # Which (net, layer) pairs already POUR, and per pair the single-layer
-    # pours a `replace_existing` zone supersedes -- exactly the zones the CLI
-    # writer drops from the file (plane_io.filter_zones_from_content; a
-    # footprint's zones are not board zones). Teardrops and rule areas are no
+    # Which (net, layer) pairs already POUR, and per pair the pours a
+    # `replace_existing` zone supersedes -- exactly the zones the CLI writer
+    # drops from the file (plane_io.filter_zones_from_content; a footprint's
+    # zones are not board zones): a pour goes only when this run replaces
+    # every copper layer it covers (#1299). Teardrops and rule areas are no
     # pour (#1164): they neither block a pour as a duplicate nor get replaced.
-    existing, replaceable, zone_names = _live_pours(board)
+    replaced_keys = {(zd.get('net_name') or name_for(zd.get('net_id')) or "",
+                      zd.get('layer', 'F.Cu'))
+                     for zd in (new_zones or [])
+                     if zd.get('replace_existing') and not zd.get('keepout')}
+    existing, replaceable, zone_names = _live_pours(board, replaced_keys)
+    removed_zone_ids: set = set()
 
     with begin_commit(board, message) as commit:
         # Delete the ripped nets' existing copper before adding the re-routed
@@ -1284,8 +1300,12 @@ def apply_planes_results(board, *, pcb_data,
                 # on the layer, so the old one goes, as the CLI writer drops
                 # it. Once per pair -- a shared layer's split returns several
                 # polygons for one net, and the later ones must not delete the
-                # earlier.
+                # earlier -- and once per pour: a multi-layer pour is listed
+                # under each of its layers.
                 for old in replaceable.pop(key):
+                    if id(old) in removed_zone_ids:
+                        continue
+                    removed_zone_ids.add(id(old))
                     commit.remove(old)
                     counts["zones_replaced"] += 1
                 existing.discard(key)
@@ -1600,7 +1620,8 @@ def write_drc_settings_to_project(board, *, clearance=None, hole_to_hole=None,
                                   via_diameter=None, via_drill=None,
                                   keep_thermal=False, diff_pair_gap=None,
                                   diff_pair_width=None,
-                                  clamp_nondefault_netclasses=False
+                                  clamp_nondefault_netclasses=False,
+                                  copper_holes=True
                                   ) -> Optional[str]:
     """Loosen the open project's `.kicad_pro` DRC floors to the routed values.
 
@@ -1618,6 +1639,9 @@ def write_drc_settings_to_project(board, *, clearance=None, hole_to_hole=None,
     net at its OWN class and the writeback then rewrote the class narrower than
     the run had honoured. The caller decides, off the Min-Clearance override
     (`gui_utils.apply_drc_settings_fix`).
+
+    `copper_holes` False keeps the board's copper-to-hole floor: a bare pour
+    step drew no track or via near a hole (#1319, plane_fix_kwargs).
     """
     from fix_kicad_drc_settings import fix_project_for_output
 
@@ -1633,6 +1657,7 @@ def write_drc_settings_to_project(board, *, clearance=None, hole_to_hole=None,
             diff_pair_gap=diff_pair_gap, diff_pair_width=diff_pair_width,
             keep_thermal=keep_thermal,
             clamp_nondefault_netclasses=clamp_nondefault_netclasses,
+            copper_holes=copper_holes,
             verbose=True)
     except Exception as e:
         print(f"(skipped DRC-settings write-back: {e})")

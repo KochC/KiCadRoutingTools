@@ -17,6 +17,8 @@ is what the adapter would hand KiCad over the socket:
      one; teardrops and rule areas are no pour (#1164); #448's NPTH-slot
      keep-out is a RULE AREA, not the net-less copper zone this loop used to
      build; each pour carries the engine's priority and pad connection
+  C2. #1299: a multi-layer pour the run re-pours on every layer it covers is
+     replaced, once; one re-poured on only some of its layers is kept
   D. the footprint mover resolves a duplicated reference's second block by
      its PCBData key `TP4~2` (#726) and does not move a part that draws the
      board outline (#829)
@@ -26,8 +28,9 @@ is what the adapter would hand KiCad over the socket:
   F. the dialog's re-sync patches footprint and pad poses IN PLACE (#362),
      keeping the Pad objects pads_by_net shares
 
-The SWIG gates for C/E (test_skip_existing_zones_gui,
-test_placement_apply_locks) drive pcbnew boards and cannot run here. What
+The SWIG gates for C/C2/E (test_skip_existing_zones_gui,
+test_1299_multilayer_zone_replace_gui, test_placement_apply_locks) drive
+pcbnew boards and cannot run here. What
 this file does NOT cover is the socket itself: a running KiCad's answer to
 these commits.
 
@@ -276,6 +279,31 @@ def test_planes_apply():
           "(the form kicad_parser's kipy read flags)")
 
 
+def test_planes_multilayer_replace():
+    print("C2. #1299: a multi-layer pour the run re-pours on EVERY layer it "
+          "covers is replaced, once")
+    b = Board(nets=('VCC', 'GND'))
+    vcc_fb = _zone(b, 'VCC', ['F.Cu', 'B.Cu'])
+    gnd_3 = _zone(b, 'GND', ['F.Cu', 'In1.Cu', 'B.Cu'])
+    b.zones = [vcc_fb, gnd_3]
+    sq = [(0, 0), (10, 0), (10, 10), (0, 10)]
+    new = [dict(net_name='VCC', layer='F.Cu', polygon_points=sq, replace_existing=True),
+           dict(net_name='VCC', layer='B.Cu', polygon_points=sq, replace_existing=True),
+           # GND re-poured on two of its three layers: the pour stays
+           dict(net_name='GND', layer='F.Cu', polygon_points=sq, replace_existing=True),
+           dict(net_name='GND', layer='B.Cu', polygon_points=sq, replace_existing=True)]
+    c = A.apply_planes_results(b, pcb_data=SimpleNamespace(nets={}), new_zones=new)
+    check(is_in(vcc_fb, b.removed) and sum(1 for z in b.removed if z is vcc_fb) == 1
+          and c['zones_replaced'] == 1,
+          "the VCC F.Cu+B.Cu pour, re-poured on both, is removed ONCE though it is "
+          "listed under each of its layers", f"{c} removed={len(b.removed)}")
+    check(not is_in(gnd_3, b.removed),
+          "the GND pour re-poured on two of its three layers is kept (plane_io "
+          "drops a pour only when every layer it covers is replaced)")
+    check(c['zones'] == 4 and c['zones_skipped'] == 0,
+          "all four new pours are added", f"{c}")
+
+
 # ---------------------------------------------------------------------------
 def _fp(ref, x, y, locked=False, uid=None):
     fp = FootprintInstance()
@@ -496,7 +524,8 @@ def test_pose_sync():
 
 def main():
     for t in (test_via_types, test_set_item_locked, test_planes_apply,
-              test_footprint_moves, test_placement_apply, test_pose_sync):
+              test_planes_multilayer_replace, test_footprint_moves,
+              test_placement_apply, test_pose_sync):
         t()
     if FAILS:
         print(f"\n{len(FAILS)} check(s) FAILED")

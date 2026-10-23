@@ -6,9 +6,8 @@ mixer's channel strips, one I/O buffer per bank) already carries the
 correspondence between the copies: every footprint's `(path "/<sheet>/
 <symbol>")` ends in the SAME symbol uuid in every instance, and KiCad's own
 "Repeat Layout" maps by it. Nothing in the placement stack used it --
-`place_seed` seeds each sheet on its own, `arrays` (#1051) rows identical
-parts on ONE sheet, `reconstruct` repairs a damaged placement -- so an agent
-that wanted four channels laid out alike wrote its own helper.
+`arrays` (#1051) rows identical parts on ONE sheet -- so an agent that wanted
+four channels laid out alike wrote its own helper.
 
 This module
 
@@ -795,41 +794,3 @@ def measure_declared(pcb, decl: Dict) -> List[Dict]:
     return out
 
 
-def apply_declared(board_path: str, intent, *, clearance=None,
-                   board_edge_clearance=None,
-                   group_sources: Sequence[str] = ()) -> List[Dict]:
-    """`place_seed`'s replicate stage (#1211): each `replicate[]`
-    declaration, in order, applied IN PLACE to `board_path` through
-    `pose_ops.apply_poses` -- the engine, the writer, the lock and plug
-    guards, the intent's zone check and the verdict `place_pose replicate
-    --intent` uses. A copy that verdict refuses (it grades worse than the
-    board it would replace, or would move a locked part) is NOT written: the
-    seed stays as it was and the record says why, naming the members that
-    collide. One record per declaration, `applied` True or False."""
-    from placement import pose_ops
-    out = []
-    for i, decl in enumerate(getattr(intent, 'replicate', ()) or ()):
-        rec = {'index': i, 'from': decl['from'], 'to': list(decl['to'])}
-        try:
-            s = pose_ops.apply_poses(
-                board_path, board_path, [declared_op(decl)],
-                clearance=clearance,
-                board_edge_clearance=board_edge_clearance,
-                intent=intent, group_sources=group_sources)
-        except PoseRefusal as exc:
-            summ = exc.extra.get('summary') or {}
-            rec.update(applied=False, code=exc.code, reason=exc.reason,
-                       new_conflicts={n['ref']: n['new_conflicts']
-                                      for n in summ.get('ops') or ()
-                                      if n.get('new_conflicts')})
-            out.append(rec)
-            continue
-        rep = (s.get('replicate') or [{}])[0]
-        rec.update(applied=True, moved=sorted(
-            (n['ref'] for n in s['moved']), key=natural_key),
-            targets=[{'sheet': t['sheet']['name'] or t['sheet']['path'],
-                      'offset': t['offset'], 'pairs': t['pairs'],
-                      'moved': t['moved'], 'search': t.get('search')}
-                     for t in rep.get('to') or ()])
-        out.append(rec)
-    return out

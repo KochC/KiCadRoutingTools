@@ -1413,11 +1413,6 @@ class PlanesTab(wx.Panel):
                 print(f"Warning: failed to build plane suggestions: {e}")
 
         msg += "\nUse Edit -> Undo to revert changes."
-        # Routing movie (#506): snapshot the board this step just produced,
-        # BEFORE the completion popup blocks on the user. No-op unless the
-        # Advanced tab's "Make routing movie" box is ticked.
-        from .movie_recorder import record_movie_step
-        record_movie_step(self, 'planes')
 
         if getattr(getattr(self, 'GetTopLevelParent', lambda: self)(), '_suppress_completion_popups', False):
             print(msg)  # unattended plan run: no per-step OK dialog
@@ -1544,7 +1539,30 @@ class PlanesTab(wx.Panel):
         # must reload the project. Best-effort.
         if counts['zones'] or counts['vias'] or counts['tracks']:
             from .gui_utils import apply_drc_settings_fix
-            apply_drc_settings_fix(getattr(self, "_plane_drc_config", None))
+            # #1319: only the floors of copper this step drew -- route_planes'
+            # main makes the same decision (plane_fix_kwargs) from its files --
+            # graded at the smallest clearance any step actually routed at
+            # (e.g. fine-pitch taps below nominal), as the CLI does.
+            import clearance_ledger
+            from fix_kicad_drc_settings import plane_fix_kwargs
+            _pcfg = getattr(self, "_plane_drc_config", None) or {}
+            _pclr = _pcfg.get('clearance')
+            _pkw = plane_fix_kwargs(
+                counts['tracks'], counts['vias'],
+                clearance=clearance_ledger.effective(_pclr) if _pclr else _pclr,
+                hole_to_hole=_pcfg.get('hole_to_hole_clearance'),
+                track_width=_pcfg.get('track_width'),
+                via_size=_pcfg.get('via_size'), via_drill=_pcfg.get('via_drill'))
+            if not (counts['tracks'] or counts['vias']):
+                print("  Bare pour (no track or via drawn): writing the copper "
+                      "clearance only -- no size or copper-to-hole floor (#1319)")
+            apply_drc_settings_fix(
+                getattr(self, "_plane_drc_config", None),
+                fix_kwargs=dict(
+                    _pkw, edge_clearance=_pcfg.get('board_edge_clearance'),
+                    keep_thermal=_pcfg.get('keep_thermal', False),
+                    clamp_nondefault_netclasses=bool(
+                        _pcfg.get('clamp_netclasses', False))))
 
         # Plane-copper cleanup (CLI/GUI parity): dead-end trims, stub-gap snaps,
         # micro-shift / soft-joint connectors, applied to the live board via the

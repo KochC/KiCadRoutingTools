@@ -1,15 +1,11 @@
-"""Apply a MODEL-CHOSEN pose, and let the engine grade it (#892).
+"""Apply a model-chosen pose, and let the engine grade it.
 
-The ranking half of "where should this part go" already shipped: `pose_score.
-rank_poses` returns legal (x, y, rot) candidates cheapest-first, `converge.py
-poses` is its CLI, and `grade_pad_legality` / `check_assembly` / `render_
-placement --review-sheet` all grade a pose. What did not exist is the verb that
-APPLIES one: no placement CLI in the tree accepted a pose at all, so a model
-that had decided "U1 belongs here, facing that way" had to write a hand script
-around `placement.writer.write_placed_output` (run 25's `pose_assist.py`;
-run 24 reused `freeze_stamp.py` for the lock half). A hand script is exactly
-what the provenance regime refuses and the cheats watcher flags, so the
-sanctioned tool has to be a registered lever -- see `place_pose.py`.
+`pose_score.rank_poses` lists legal (x, y, rot) candidates nearest first, and
+`grade_pad_legality` / `check_assembly` / `render_placement --review-sheet`
+grade a pose; this module APPLIES one, so a decision such as "U1 belongs
+here, facing that way" reaches the board through a registered tool
+(`place_pose.py`) rather than a hand script around
+`placement.writer.write_placed_output`.
 
 This module is the ENGINE half, so both fronts get the same behaviour: the CLI
 parses argv into `ops` and calls `apply_poses`; anything in-process (the GUI's
@@ -54,8 +50,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 #: raising a footprint's rotation by 90 degrees sends a pad at local (+1, 0)
 #: to global offset (0, -1) -- east to north, since `escape.face_of` calls the
 #: smaller-y side north on a y-grows-down board.
-#: `tests/test_892_place_pose.py` pins this against a real write + re-parse,
-#: because a cycle written the wrong way round is a plausible-looking rotation
+#: A cycle written the wrong way round would be a plausible-looking rotation
 #: that faces the part backwards.
 FACE_CYCLE = ('east', 'north', 'west', 'south')
 
@@ -81,7 +76,9 @@ LEGALITY_KEYS = ('pad_conflicts', 'hole_conflicts', 'oob_pad_count',
                  # #1266: pads against ANOTHER part's graphic copper -- short
                  # of clearance on a net it is not, and touching on any net.
                  'graphic_pad_conflicts', 'graphic_pad_stack_count',
-                 'pad_stack_count')
+                 'pad_stack_count',
+                 # #1306: one footprint's own pads touching on two nets.
+                 'own_pad_short_count')
 
 #: The MAGNITUDES, and they are not a nicety: a count arm alone accepts a
 #: request that keeps the tally and deepens the damage. Measured on the
@@ -100,9 +97,10 @@ LEGALITY_KEYS = ('pad_conflicts', 'hole_conflicts', 'oob_pad_count',
 #: was no pair at all and this verb wrote a board check_assembly calls NOT
 #: BUILDABLE. The pairs are measured by check_assembly's own function.
 #: #1266: a `[pad part, copper owner]` pair against footprint graphic copper.
+#: #1306: a `["U1.1", "U1.2"]` pair of one footprint's pads shorted.
 PAIR_KEYS = ('pad_conflict_pairs', 'hole_conflict_pairs',
              'graphic_pad_conflict_pairs', 'graphic_pad_stack_pairs',
-             'pad_stack_pairs')
+             'pad_stack_pairs', 'own_pad_short_pairs')
 
 MAGNITUDE_KEYS = ('pad_shortfall', 'oob_pad_amount', 'pad_edge_shortfall',
                   'oob_keepout_copper_amount',
@@ -123,7 +121,9 @@ LEGAL_SCOPE = ('pad-pad clearance', 'hole-hole clearance', 'pad copper vs the '
                "of clearance on a net it is not, or touching on any net "
                "(#1266)",
                "two parts' pad copper overlapping on a shared side, ANY net "
-               "-- a pad stack, check_assembly's pad_intersection (#1064)")
+               "-- a pad stack, check_assembly's pad_intersection (#1064)",
+               "one footprint's own pads touching on two different real nets "
+               "(KiCad's shorting_items; #1306)")
 LEGAL_UNMEASURED = ('footprint graphic copper vs the edge-clearance floor '
                     '(disclosed as graphic_edge_shortfall_refs, not gated)',
                     'footprint copper the parser does not model: pad-less '
@@ -139,6 +139,63 @@ LEGAL_UNMEASURED = ('footprint graphic copper vs the edge-clearance floor '
                     "parts sharing an origin whose pads do not intersect "
                     "(check_assembly's coincident_origins)")
 MAGNITUDE_EPS = 1e-6
+
+#: How many entries of each per-pad / per-pair list the stdout JSON_SUMMARY
+#: carries (#1352) -- board_score's cap (#1194). On a 97-part pile
+#: (pico_ice_rev3) the summary line was 291 KB, 245 KB of it the pad-edge
+#: findings and unmeasured rows before and after, and a refusal's one-line
+#: reason was buried in it. `place_pose --json PATH` writes every entry.
+STDOUT_LIST_CAP = 20
+
+#: The summary's per-pad and per-pair lists (`_legality_row`), capped on
+#: stdout. The request's own lists (`ops`, `moved`, `locked`) are not.
+SUMMARY_LISTS = ('pad_clearance_required', 'worst',
+                 'oob_pad_copper_refs_after',
+                 'oob_graphic_copper_refs_after',
+                 'oob_graphic_copper_waived_after',
+                 'oob_graphic_copper_unmeasured_after',
+                 'graphic_edge_shortfall_refs_after',
+                 'keepout_copper_pads_after', 'keepout_copper_tht_refs_after',
+                 'keepout_copper_unmeasured_after', 'pad_stack_pairs_after',
+                 'graphic_pad_conflict_pairs_after',
+                 'graphic_pad_stack_pairs_after', 'graphic_pad_rows_after',
+                 'graphic_pad_unmeasured_after', 'own_pad_short_pairs_after')
+
+#: ...and the lists inside each pad-edge grade (`pad_edge_before/_after`).
+PAD_EDGE_LISTS = ('findings', 'unmeasured', 'rules_unmeasured')
+
+
+def _cap_lists(doc: Dict, keys, cap: int) -> Dict:
+    """`doc` with each list in `keys` longer than `cap` cut to `cap`, and
+    `<key>_count` / `<key>_truncated` beside it; `doc` itself is untouched."""
+    long_ = [k for k in keys if isinstance(doc.get(k), list) and len(doc[k]) > cap]
+    if not long_:
+        return doc
+    out = dict(doc)
+    for k in long_:
+        out[k] = doc[k][:cap]
+        out[k + '_count'] = len(doc[k])
+        out[k + '_truncated'] = len(doc[k]) - cap
+    return out
+
+
+def stdout_summary(summary: Dict, cap: int = STDOUT_LIST_CAP) -> Dict:
+    """The JSON_SUMMARY copy of a place_pose summary (#1352): every list in
+    SUMMARY_LISTS, and each pad-edge grade's PAD_EDGE_LISTS, capped at `cap`
+    entries, `<list>_count` the full length and `<list>_truncated` how many
+    were left out. The counts and magnitudes the verdict reads are scalars
+    and are never cut. `summary` itself -- what `--json` writes -- is not
+    touched. Pure."""
+    out = _cap_lists(summary, SUMMARY_LISTS, cap)
+    for ch in ('pad_edge_before', 'pad_edge_after'):
+        g = out.get(ch)
+        if isinstance(g, dict):
+            capped = _cap_lists(g, PAD_EDGE_LISTS, cap)
+            if capped is not g:
+                if out is summary:
+                    out = dict(summary)
+                out[ch] = capped
+    return out
 
 #: `replicate --search`'s default lattice pitch, mm (#1211). Coarser than
 #: the snap's 0.25: every candidate is a written, re-parsed, re-graded board
@@ -174,11 +231,16 @@ def resolve_knobs(board_path: str, clearance=None, board_edge_clearance=None,
                   track_width=None):
     """(clearance, board_edge_clearance, track_width, knobs) from the BOARD.
 
-    Same resolution `place_seed`, `converge poses` and `board_context` use
+    Same resolution `place_simple` and `board_context` use
     (`list_nets.board_floor_knobs`): explicit value > the board's own Default
     netclass / constraint > the fixed default. A fixed 0.25/0.55 on a board
     routed to 0.15/0.3 vetoes poses the router would happily route, which is
     the run-7 S4 finding this exists to avoid.
+
+    The clearance is read as KiCad GRADES it (#1338): the class floored at
+    Board Setup `min_clearance`. This verb's verdict is a grade, and on
+    multichannel_mixer (class 0.2, min_clearance 0.3) the class alone called
+    `legal` a pose KiCad reports two pad clearance errors on.
     """
     import list_nets
     import routing_defaults as defaults
@@ -476,6 +538,15 @@ def resolve_ops(pcb_data, ops: Sequence[Dict], *, clearance: float,
 
         note['to'] = [round(x, 4), round(y, 4), rot]
         note['moved'] = note['to'] != note['from']
+        if not note['moved']:
+            # #1322: say WHY nothing moved. `rotate R2 180` on a part already
+            # at 180 reads as a turn to anyone who meant one.
+            note['unmoved_why'] = (
+                "already at %g degrees: `rotate` sets an ABSOLUTE angle; "
+                "`rotate %s %g --relative` turns it by %g about its origin"
+                % (rot, ref, float(op['rot']), float(op['rot']))
+                if kind == 'rotate' and not op.get('relative')
+                else 'already at this pose')
         notes.append(note)
         placements.append({'reference': ref, 'new_x': x, 'new_y': y,
                            'new_rotation': rot})
@@ -577,7 +648,8 @@ PAIR_OF = {'pad_conflicts': 'pad_conflict_pairs',
            'hole_conflicts': 'hole_conflict_pairs',
            'graphic_pad_conflicts': 'graphic_pad_conflict_pairs',
            'graphic_pad_stack_count': 'graphic_pad_stack_pairs',
-           'pad_stack_count': 'pad_stack_pairs'}
+           'pad_stack_count': 'pad_stack_pairs',
+           'own_pad_short_count': 'own_pad_short_pairs'}
 
 
 def regrade_refusal(before: Dict, after: Dict, bad: List[str],
@@ -661,6 +733,9 @@ def _legality_row(before: Dict, after: Dict) -> Dict:
                 'graphic_pad_rows', 'graphic_pad_unmeasured'):
         row[key + '_after'] = after.get(key)
     row['graphic_pad_basis'] = after.get('graphic_pad_basis')
+    # #1306: which of one footprint's own pads are shorted together.
+    row['own_pad_short_pairs_after'] = after.get('own_pad_short_pairs')
+    row['own_pad_basis'] = after.get('own_pad_basis')
     return row
 
 
@@ -670,29 +745,22 @@ def _legality_row(before: Dict, after: Dict) -> Dict:
 
 def _ranker_state(pcb, board_path: str, ref: str, at, *, clearance: float,
                   board_edge_clearance: float):
-    """The ranker's state for `ref`, judged from the INPUT board (#1256).
+    """The ranker's state for `ref`, judged from the INPUT board.
 
     `pcb` / `board_path` are the board the caller's re-grade compares
     against, so every part's SEED -- the baseline `LegalityContext.pads_ok`
     and `keepout_ok` refuse a pose relative to -- is its pose there. `at`
     (x, y, rot), when given, is where the caller asked the part to go: it is
     moved there AFTER the state is built, so the sweep centres on the request
-    while the part is still judged against where it started.
-
-    Built from the STAGED board instead (the requested pose already written),
-    the request was its own baseline: it passed at offset 0, and so did every
-    nearby pose carrying the same new conflict at no greater depth, while the
-    re-grade -- against the input -- refused them all. Measured on esp_prog
-    with C1 given a 1.5 mm pad clearance, `set C2 140.06 96.23 --rot 90
-    --snap --radius 2`: 8 ranked poses, the request among them at 0.000 mm,
-    every one refused by the re-grade.
+    while the part is still judged against where it started. A state built
+    from the staged board would take the request as its own baseline and
+    admit nearby poses carrying the same new conflict, which the re-grade,
+    against the input, then refuses.
 
     The INCUMBENT of `candidate_valid`'s off-board escape branch is pinned
-    to the input pose too (`QuenchState.incumbent_at`, #1259), before the
-    move: measured at the request, an off-board request licensed every pose
-    merely less off the board than it. esp_prog `set R3 146.0 101.5 --snap
-    --radius 4` ranked 3 such poses and the re-grade refused all 9 tries
-    (exit 4); judged from the input pose it ranks 9, and the 7th passes.
+    to the input pose too (`QuenchState.incumbent_at`), before the move, so
+    that branch admits only poses less off the board than the INPUT, not
+    than the request.
     """
     import pose_score
     st = pose_score.make_state(pcb, board_path, clearance=clearance,
@@ -721,20 +789,16 @@ def _is_pose(p: Dict, at) -> bool:
 
 def _rank(pcb, board_path: str, ref: str, st, **kw):
     """`pose_score.rank_poses` on the ranker's state `st`: `(on_board,
-    ranked, diagnostics)` (#1277).
+    ranked, diagnostics)`.
 
-    `ranked` and `diagnostics` are the ranking as it always was. When the
-    part's input pose is off the board -- `candidate_valid`'s escape branch
-    is open for it (`QuenchState.escape_board_term`) -- that ranking admits
-    every pose merely LESS off the board than the input, and those can be
-    the cheapest: measured on esp_prog with R3 staged off the board, `set R3
-    143.4 102.0 --rot 180 --snap --radius 4` ranked 24 such poses ahead of
-    any pose on the board, and the snap wrote one its own grade called
-    illegal while a legal pose 0.49 mm nearer the request was never ranked.
-    So `on_board` is the same sweep with that branch CLOSED -- only poses
-    the ordinary gate admits -- for a caller to try FIRST. It is None when
-    the branch is closed anyway (the input is on the board, or overlaps a
-    part), where `ranked` already is that ranking."""
+    `ranked` and `diagnostics` are the plain ranking. When the part's input
+    pose is off the board -- `candidate_valid`'s escape branch is open for it
+    (`QuenchState.escape_board_term`) -- that ranking also admits poses
+    merely LESS off the board than the input, and those can come first. So
+    `on_board` is the same sweep with that branch CLOSED -- only poses the
+    ordinary gate admits -- for a caller to try FIRST. It is None when the
+    branch is closed anyway (the input is on the board, or overlaps a part),
+    where `ranked` already is that ranking."""
     import pose_score
     diag: Dict = {}
     ranked = pose_score.rank_poses(pcb, board_path, ref, state=st,
@@ -807,8 +871,8 @@ def snap_candidates(board_path: str, ref: str, *, rot: float, clearance: float,
     pose on the board (`_ranker_state`), and the requested pose itself is
     never returned (`requested_dropped` in the census).
 
-    Rung 1 is `rank_poses` -- cost-ordered, and worth trying first because it
-    knows about wirelength and crossings, which this verb does not.
+    Rung 1 is `rank_poses` -- the poses the seat gate admits, nearest first,
+    and worth trying first because they already pass the gate.
 
     Rung 2 is the bare lattice around where the part now sits, and it exists
     because rung 1 alone leaves `--snap` DEAD on the boards it is aimed at.
@@ -828,7 +892,7 @@ def snap_candidates(board_path: str, ref: str, *, rot: float, clearance: float,
     From an input pose OFF the board, rung 1 is preceded by `ranked_on_board`
     (#1277, `_rank`): the same ranking with the escape branch closed, so a
     pose on the board is tried before the poses merely less off the board
-    than the input, which rung 1 also admits and can rank cheapest. The
+    than the input, which rung 1 also admits and can rank first. The
     census counts it as `ranked_on_board`, None when the input is on the
     board (rung 1 then already is that ranking).
     """
@@ -899,14 +963,15 @@ def snap_candidates(board_path: str, ref: str, *, rot: float, clearance: float,
             lattice.append({'x': x, 'y': y, 'rot': rot,
                             'dist_mm': round(dist, 4), 'rung': 'lattice'})
         lattice.sort(key=lambda p: (p['dist_mm'], p['x'], p['y']))
-    # Each rung stays in ITS OWN order -- ranked by cost, lattice by distance
-    # -- and `apply_poses` walks them in two phases with a budget each. It
-    # does not concatenate them into one nearest-first list: measured on
-    # esp_prog, the 24 candidates nearest a refused point ALL failed (they sit
-    # beside the thing that refused it) while a cost-ranked pose 4.78 mm away
-    # passed, so a single nearest-first cap turns a snap that worked into a
-    # refusal. The caller's "stay near" is honoured in the second phase, which
-    # only considers lattice poses NEARER than the ranked answer.
+    # Each rung stays in ITS OWN list -- the gate-admitted poses, then the
+    # bare lattice, both nearest first -- and `apply_poses` walks them in two
+    # phases with a budget each. It does not merge them into one nearest-first
+    # list: measured on esp_prog, the 24 lattice candidates nearest a refused
+    # point ALL failed (they sit beside the thing that refused it) while a
+    # ranked pose 4.78 mm away passed, so a single nearest-first cap turns a
+    # snap that worked into a refusal. The caller's "stay near" is honoured in
+    # the second phase, which only considers lattice poses NEARER than the
+    # ranked answer.
     ordered = first + out + lattice
     # The ranker's nearest pose the radius bound dropped (#1209), so a snap
     # that refuses can say "--radius N would reach a pose" -- the honest
@@ -934,8 +999,7 @@ def snap_candidates(board_path: str, ref: str, *, rot: float, clearance: float,
               # {check, blocker} when vetoed there, else None (#1256).
               'input_pose_vetoed': home_veto,
               # #1113: which check vetoed them, and against whom.
-              'dropped_by': diag.get('dropped_by', {}),
-              'stopped_early': bool(diag.get('stopped_early'))}
+              'dropped_by': diag.get('dropped_by', {})}
     return ordered, census
 
 
@@ -1195,8 +1259,8 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
         # #1098: a PCB-edge plug seated at its edge carries the keep-out that
         # keeps parts off its tongue; moving it inland would take the region
         # with it and read as an improvement. Treated as a lock: `unlock`
-        # the ref in the same call if the move is meant. The quench's own
-        # set (`seated_plugs`): a plug named by a declared `mating:` keep-out
+        # the ref in the same call if the move is meant. The placement
+        # state's own set (`seated_plugs`): a plug named by a declared `mating:` keep-out
         # counts too, and a plug that is NOT seated (in the pile, hanging
         # across an edge) is free to move.
         from placement.floorplan import seated_plugs, with_derived_keepouts
@@ -1393,7 +1457,7 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
             # geometry) are different currencies: the ranker can hand back the
             # very pose that was refused. Walking the list until one grades
             # clean is what makes --snap mean "a pose that passes", not "the
-            # cheapest pose the other instrument liked".
+            # first pose the other instrument liked".
             ref = placements[0]['reference']
             want_rot = placements[0]['new_rotation']
             try:
@@ -1445,39 +1509,34 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
                             bucket[pr] = bucket.get(pr, 0) + 1
                 return trial, pcb_c, g, b
 
-            # TWO PHASES, each with its OWN budget, and the reason is the
-            # measured behaviour of the two rungs rather than tidiness:
+            # TWO PHASES, each with its OWN budget:
             #
             # * the RANKED rung is pre-filtered by `candidate_valid`, so its
-            #   candidates usually pass this verb's grade too -- on esp_prog
-            #   the first one did. Cost-ordered, so its first answer can be
-            #   several mm out.
+            #   candidates usually pass this verb's grade too. It is nearest
+            #   first among the poses the gate admits, so when the nearer
+            #   poses are vetoed its first answer can still be several mm out.
             # * the LATTICE rung is unfiltered, and its nearest members sit
             #   right beside a point that was just refused, so they mostly
-            #   fail. Measured: the 24 nearest candidates around C4's pose all
-            #   failed while a ranked pose 4.78 mm away passed.
+            #   fail.
             #
             # So: take the ranked rung's first passing pose, then spend a
             # SECOND budget on lattice poses that are NEARER than it, and
             # prefer one of those if it passes. A single shared cap in either
-            # order loses one of the two -- nearest-first starves the ranked
-            # rung, ranked-first starves the lattice (the reviewer's finding).
+            # order loses one of the two -- lattice-first starves the ranked
+            # rung, ranked-first starves the lattice.
             #
-            # #1277: from an input pose off the board, a THIRD budget comes
-            # first -- the ranking with the escape branch closed
-            # (`ranked_on_board`). It only adds candidates ahead of the
-            # ranked rung, whose own budget and order are unchanged. A pose
-            # already re-graded is not graded twice, nor counted again:
-            # every such pose was refused (the walk stops at the first that
-            # passes), so skipping it cannot lose a later rung's answer.
+            # From an input pose off the board, a THIRD budget comes first --
+            # the ranking with the escape branch closed (`ranked_on_board`).
+            # It only adds candidates ahead of the ranked rung, whose own
+            # budget and order are unchanged. A pose already re-graded is not
+            # graded twice, nor counted again: every such pose was refused
+            # (the walk stops at the first that passes), so skipping it
+            # cannot lose a later rung's answer.
             #
             # And when that rung answers, a nearer lattice pose must grade no
-            # worse than ITS answer too, not only no worse than the input.
-            # From an input off the board, "no worse than the input" admits
-            # pad copper still past the outline: measured on esp_prog with R3
-            # staged off the board, `set R3 145.0 97.5 --rot 180 --snap
-            # --radius 3` re-graded a clean on-board pose 2.92 mm away, then
-            # wrote (145.25, 97.5), 0.25 mm away with a pad past the outline.
+            # worse than ITS answer too, not only no worse than the input:
+            # from an input off the board, "no worse than the input" admits
+            # pad copper still past the outline.
             chosen = None
             graded = set()
 
@@ -1626,7 +1685,9 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
                 for p in after.get(pk) or ():
                     if tuple(p[:2]) in had:
                         continue
-                    for r in p[:2]:
+                    # An own-pad pair names two PADS of one part (#1306).
+                    for r in ({p[0].partition('.')[0]}
+                              if pk == 'own_pad_short_pairs' else p[:2]):
                         fresh.setdefault(r, []).append(
                             '%s %s/%s' % (pk, p[0], p[1]))
             # ...and the per-PART channels, so a member the copy put past the
@@ -1749,8 +1810,7 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
                         'ranked_on_board': _d.get('ranked_on_board'),
                         'dropped_total': _d.get('dropped_total', 0),
                         'dropped_in_place': _d.get('dropped_in_place', []),
-                        'dropped_by': _d.get('dropped_by', {}),   # #1113
-                        'stopped_early': bool(_d.get('stopped_early')),
+                        'dropped_by': _d.get('dropped_by', {}),
                         # The SWEEP's radius, and it is a Chebyshev box half
                         # width, not the Euclidean bound `--radius` applies to
                         # a snap: this list is information about what exists,
@@ -1813,8 +1873,7 @@ def apply_poses(board_path: str, out_path: Optional[str], ops: Sequence[Dict],
                 summary['output'] = None
                 raise PoseRefusal(reason, summary=summary, unlock_failed=still)
 
-        _promote(cand, out_path, summary, input_file=board_path,
-                 placements=placements)
+        _promote(cand, out_path, summary)
         return summary
     finally:
         stage.cleanup()
@@ -1878,30 +1937,15 @@ def zone_check(intent, pcb, board_path, cand_pcb, cand_path, refs, *,
     return doc
 
 
-def _promote(staged: str, out_path: str, summary: Optional[Dict] = None, *,
-             input_file: Optional[str] = None,
-             placements: Sequence[Dict] = ()) -> None:
+def _promote(staged: str, out_path: str, summary: Optional[Dict] = None) -> None:
     """Move a finished staged board and its siblings onto the output path.
 
     Stage all files and back up prior destinations before replacing anything.
     Roll back completed replacements on failure. If restoration itself fails,
     report the affected paths and retain backups instead of claiming atomicity.
     Destination-only requirements cannot join a board graded without them.
-
-    PROVENANCE IS RECORDED HERE, against `out_path` (#960). The candidate was
-    written in a temp dir, and `record_write` finds the regime by walking up
-    from the path it is handed -- so the writer's own call, made for the temp
-    path, found no regime, returned None and refused nothing, and this copy
-    then landed the board in an armed work dir with no row. `input_file` is the
-    board `placements` were resolved against: a row's `refs_moved` is the
-    input diffed against the placements, so recording against the staged
-    candidate would claim nothing at all.
     """
-    if placements and input_file is None:
-        raise TypeError("_promote needs input_file when placements are given: "
-                        "the provenance row diffs the placements against it")
     from copy_board import SIBLING_EXTS
-    from placement import provenance
     src_base = os.path.splitext(staged)[0]
     dst_base = os.path.splitext(out_path)[0]
     pairs = [(staged, out_path)]
@@ -1919,12 +1963,6 @@ def _promote(staged: str, out_path: str, summary: Optional[Dict] = None, *,
     for ext in SIBLING_EXTS:
         if os.path.isfile(src_base + ext):
             pairs.append((src_base + ext, dst_base + ext))
-    # BEFORE the first copy, so an armed work dir with no declared lever
-    # refuses with the destination untouched. And before the replace for a
-    # second reason: on an in-place write `input_file` IS `out_path`, and the
-    # diff is only meaningful while that file still holds the incumbent board.
-    provenance.record_write(input_file or staged, out_path, list(placements),
-                            pending=True)
     staged_tmps = []
     backups = {}
     replaced = []
@@ -1953,9 +1991,6 @@ def _promote(staged: str, out_path: str, summary: Optional[Dict] = None, *,
             os.replace(entry[0], entry[1])
             replaced.append(entry[1])
             staged_tmps.remove(entry)
-        # Inside the `try`: a ledger that cannot be appended to rolls the board
-        # back with everything else, so no board lands without its row.
-        provenance.commit_write(out_path)
     except OSError as exc:
         rollback_errors = []
         for dst in reversed(replaced):
@@ -1989,9 +2024,6 @@ def _promote(staged: str, out_path: str, summary: Optional[Dict] = None, *,
         doc['rollback_errors'] = rollback_errors
         raise PoseRefusal(reason, code=2, summary=doc)
     finally:
-        # A no-op after a commit. Otherwise the write did not land, and its row
-        # must not stay pending for some later commit of this path to pick up.
-        provenance.discard_write(out_path)
         for backup in backups.values():
             if backup and backup not in recovery_paths:
                 try:

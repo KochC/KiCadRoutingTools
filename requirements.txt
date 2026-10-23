@@ -34,7 +34,7 @@ shapely>=2.0
 # the wx dialog opens in front of KiCad instead of behind it.
 pyobjc-framework-Cocoa; sys_platform == 'darwin'
 
-# Rasterization: board stills, review sheets, the routing movie and the film.
+# Rasterization: board stills and review sheets.
 # Listed because a fresh clone that followed the README could not render
 # anything without it -- but it is the RASTER path and nothing else, so its
 # absence DISABLES rendering rather than stopping anything (#943).
@@ -50,9 +50,9 @@ pyobjc-framework-Cocoa; sys_platform == 'darwin'
 # Routing does not touch it, and neither does the GUI plugin. On this branch
 # there is no `deps_check` (main's OPTIONAL_PACKAGES lives in the SWIG entry
 # point, deleted by the port) -- KiCad provisions the venv from this file, so
-# Pillow is simply present; if a hand-made venv lacks it, the movie checkbox
-# and the placement preview turn themselves off rather than raising a dialog
-# nobody can dismiss (#943).
+# Pillow is simply present; if a hand-made venv lacks it, the placement
+# preview turns itself off rather than raising a dialog nobody can dismiss
+# (#943).
 #
 # The floor is deliberately LOW: everything the renderer needs (alpha_composite,
 # LANCZOS, ImageChops, PngInfo) is far older than this, and a low floor keeps
@@ -67,8 +67,3 @@ pyobjc-framework-Cocoa; sys_platform == 'darwin'
 # dependency declaration, where "the version at which the intended path works"
 # would then have been false.)
 Pillow>=9.2.0
-
-# NOT listed, deliberately: imageio and imageio-ffmpeg. They are needed only to
-# write .mp4, they are imported inside a function, and their absence is AUDIBLE
-# -- animate_route prints "mp4 unavailable (...); falling back to GIF" and
-# writes a sibling .gif. For mp4:  pip install imageio imageio-ffmpeg

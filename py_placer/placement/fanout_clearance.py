@@ -47,7 +47,7 @@ from placement.utility import compute_footprint_bbox_local, snap_to_grid
 from placement.legality import (BoardOutlineGate, PadClearanceModel, PadFloor,
                                 footprint_side, side_of_layer,
                                 _pad_carries_copper, format_required_clause,
-                                pad_half_extents, point_to_seg_dist,
+                                pad_copper_box, pad_rect, point_to_seg_dist,
                                 rect_gap, ring_is_rect,
                                 rotate_local_bounds)
 
@@ -513,7 +513,7 @@ _point_to_seg_dist = point_to_seg_dist
 # graze_penalty) dominates everything, then pulling pads onto same-net balls,
 # then a mild displacement regularizer (so caps that are already fine and far
 # from a same-net ball stay put). Cap-cap / locked-part overlap is a HARD
-# constraint (see hard_blocked), not weighted.
+# constraint (cost() is inf there), not weighted.
 VIA_WEIGHT = 50.0
 ATTRACT_WEIGHT = 1.0
 DISPLACEMENT_WEIGHT = 0.3
@@ -709,7 +709,7 @@ class _Cap:
         # #725, mirroring PartPads (legality.py): the per-pad clearance FLOOR
         # rides in a parallel list index-aligned with self.pads, never widened
         # into the pad tuple -- pad_rects()' 5-tuple is unpacked positionally by
-        # tests and by animate_fanout_clearance.py. `max_floor` is the
+        # tests. `max_floor` is the
         # over-reach a broad phase must use (a .kicad_dru rule REPLACES, so it
         # can also LOWER a pair; a prune must never under-reach).
         # NOTE the copper filter below stays _Cap's own `endswith('.Cu')` test
@@ -746,10 +746,8 @@ class _Cap:
         for p in fp.pads:
             if not any(str(l).endswith('.Cu') for l in p.layers):
                 continue  # paste/mask-only aperture, not copper
-            off_x = p.global_x - fp.x
-            off_y = p.global_y - fp.y
-            half_x, half_y = pad_half_extents(p)
-            self.pads.append((off_x, off_y, half_x, half_y, p.net_id))
+            cx, cy, half_x, half_y = pad_copper_box(p)
+            self.pads.append((cx - fp.x, cy - fp.y, half_x, half_y, p.net_id))
             # The GEOMETRY filter above stays loose on purpose (see the
             # comment), but a FLOOR must not: PadClearanceModel.pad_floor
             # reads local_clearance unconditionally, and an np_thru_hole
@@ -871,14 +869,14 @@ class _Cap:
 def _candidate_positions(cap, max_disp, step, grid_step):
     """Candidate cap centres, snapped on the OFFSET rather than the position.
 
-    Same #708 correction as `quench._candidate_positions`: snapping
+    The #708 correction: snapping
     `cap.seed_x + ix*step` to a lattice through board ORIGIN discards the
     seed's residue and walks the part off whatever pitch the board was laid out
     on, for nothing -- at every step this tool ships, the absolute snap removed
     zero candidates.
 
-    Unlike quench, this site keeps the `grid_step` RASTER rather than the
-    board's inferred lattice, and that asymmetry is deliberate and measured.
+    This site keeps the `grid_step` RASTER rather than the board's inferred
+    lattice, deliberately and measured.
     This search IS the clearance repair: its whole job is to find the
     sub-millimetre pose that clears a foreign via. At `step=0.2` the candidate
     count is 81 on the raster, 29 on a 0.3175mm lattice and 9 on 0.635 -- so a
@@ -1125,12 +1123,12 @@ class _Repair:
         # cap pad must clear vias of a DIFFERENT net by this. Through-vias, so
         # they apply to caps on either board side.
         # #725: `keepout` is the OVER-REACH -- radius + max(clearance, this
-        # via's own upper-bound floor). It feeds the prunes, the locked-part
-        # warning and the animator's drawn disk, all of which may over-reach.
+        # via's own upper-bound floor). It feeds the prunes and the locked-part
+        # warning, both of which may over-reach.
         # The EXACT per-(cap pad, via) value is resolved in the eff lists
         # below, never from this slot. Byte-identical (radius + clearance) when
         # the model is inert. The 4-tuple shape is pinned: tests assign
-        # st.vias wholesale and animate_fanout_clearance.py unpacks it.
+        # st.vias wholesale and unpack it.
         self.vias: List[Tuple[float, float, int, float]] = []
         # The RADIUS, keyed on the tuple's identity. _via_effs has to strip the
         # over-reach back off element 3, and deriving the radius arithmetically
@@ -1221,9 +1219,6 @@ class _Repair:
                 if p.net_id > 0:
                     self.attract.setdefault(p.net_id, []).append(
                         (p.global_x, p.global_y))
-        # Kept for visualization (animate_fanout_clearance.py): the BGA ball-field
-        # bounding boxes that define the region of interest.
-        self.bga_bboxes = bga_bboxes
 
         # --- static obstacle rects (locked parts incl. BGAs) ---
         # and movable caps near a BGA. Courtyard collisions are checked
@@ -1351,11 +1346,7 @@ class _Repair:
                 through = (p.drill or 0) > 0
                 pside = None if through else (
                     'B' if any(str(l).startswith('B') for l in copper) else 'F')
-                half_x, half_y = pad_half_extents(p)
-                self.foreign_pads.append(
-                    (p.global_x - half_x, p.global_y - half_y,
-                     p.global_x + half_x, p.global_y + half_y,
-                     p.net_id, pside))
+                self.foreign_pads.append((*pad_rect(p), p.net_id, pside))
                 _fl = None if self._floors is None else self._floors.pad_floor(p)
                 self.foreign_pad_floors.append(_fl)
                 self.foreign_pad_mf.append(
@@ -1365,7 +1356,7 @@ class _Repair:
         # max_displacement_cap from its seed, so anything whose seed gap already
         # exceeds that (plus the relevant spans / clearance) can NEVER constrain
         # it -- excluding it is exact, not an approximation. This turns the
-        # per-candidate hard_blocked / penalty loops from O(all parts) into
+        # per-candidate gate / penalty loops from O(all parts) into
         # O(handful), the dominant cost on dense boards (#213 profiling).
         # #725: same identity-keyed map for foreign pads -- a pad's floor
         # depends on its own `(clearance ...)` and its copper layers, neither of
@@ -3032,31 +3023,6 @@ class _Repair:
         if self._tethers is not None:
             self._tethers.note_move()
 
-    def hard_blocked(self, ref, cap, x, y, rot):
-        """True if a placement leaves the board or introduces/worsens a
-        same-side courtyard overlap (with a locked part OR another movable
-        cap) beyond its baseline, or worsens a foreign track/pad graze past
-        its seed baseline. Caps may never overlap each other's footprints,
-        so any new cap-cap overlap is rejected outright."""
-        if self._blocked_geom(ref, cap, x, y, rot):
-            return True
-        # #441 per-net: no NEW/worse overlap with ANY foreign-net track -- forbid
-        # penetrating a net that was clear at the seed even if the summed shortfall
-        # drops (the zynq GND<->NetR2_2 butterfly). Same for foreign component pads.
-        if self._worsens_any_net(self._seg_shortfalls(ref, cap, x, y, rot),
-                                 self.base_seg.get(ref, {})):
-            return True
-        if self._worsens_any_net(self._pad_shortfalls(ref, cap, x, y, rot),
-                                 self.base_pad.get(ref, {})):
-            return True
-        # #445: same per-net gate for existing VIAS -- via_penalty alone is a
-        # weighted objective, and a big track-graze relief could pay for
-        # dropping a pad onto a via (zynq_ad9364 R2 onto DDR3_VREF).
-        if self._worsens_any_net(self._via_shortfalls(ref, cap, x, y, rot),
-                                 self.base_via.get(ref, {})):
-            return True
-        return self._tether_refuses(ref, x, y, rot)    # #1067
-
     def graze_penalty(self, ref, cap, x, y, rot):
         """Total foreign-copper clearance shortfall for a placement: via
         (#130) + same-side track (#278 PAD-SEGMENT) + component pad (#275
@@ -3074,7 +3040,7 @@ class _Repair:
         seg_by_net = self._seg_shortfalls(ref, cap, x, y, rot)
         pad_by_net = self._pad_shortfalls(ref, cap, x, y, rot)
         via_by_net = self._via_shortfalls(ref, cap, x, y, rot)
-        # #441/#445 per-net accept gate (mirror hard_blocked): reject a move
+        # #441/#445 per-net accept gate: reject a move
         # that penetrates any foreign net -- track, pad, or VIA -- beyond its
         # seed, even if the total improves.
         if (self._worsens_any_net(seg_by_net, self.base_seg.get(ref, {}))
@@ -3450,7 +3416,7 @@ def _repair_one_arm(pcb_data: PCBData, pcb_file: str,
 
     on_move, if given, is a callback invoked with the internal _Repair state
     once at the seed placement and again after every accepted cap move. It is
-    used purely for visualization (animate_fanout_clearance.py) and has no
+    an inspection hook (the tests read the repair state through it) and has no
     effect on the result.
     """
     extra_locked: Set[str] = set()
@@ -3585,9 +3551,7 @@ def _repair_one_arm(pcb_data: PCBData, pcb_file: str,
             # by (sqrt(2)-1)*half along the board axes -- 0.14mm on glasgow's
             # 45-degree R9. Converting the clearance term and leaving the shape
             # would be exactly the half-conversion this change is about.
-            ex, ey = pad_half_extents(p)
-            rect = (p.global_x - ex, p.global_y - ey,
-                    p.global_x + ex, p.global_y + ey)
+            rect = pad_rect(p)
             # Graded at the pair's REAL requirement, like everything else.
             # `keepout` is the prune over-reach, so re-form the pair's keep-out
             # from the via's radius. A locked fiducial's keep-clear override is
@@ -3886,8 +3850,8 @@ def _repair_one_arm(pcb_data: PCBData, pcb_file: str,
             st.refresh_cap_vias()
             # base_seg / base_pad / base_via are deliberately NOT re-seeded --
             # exactly as base_via is left alone by the line above, though via
-            # positions changed there too. They are read only by cost() /
-            # hard_blocked, neither of which runs past this point; and a
+            # positions changed there too. They are read only by cost(),
+            # which does not run past this point; and a
             # baseline means "the state at the SEED", which copper this pass
             # CREATED is not part of. Folding it in would license a later move
             # to sit on the pass's own connector for free -- the #441
