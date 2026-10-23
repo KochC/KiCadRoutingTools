@@ -16,6 +16,16 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, 'py_router'))  # #522
 
+# The attach tests read kipy's BoardLayer, so without kipy this died on an
+# ImportError -- the same exit as a real failure. Refuse by name instead, as
+# the other kipy tests here do.
+try:
+    import kipy.board_types  # noqa: F401
+except Exception as _e:                                          # noqa: BLE001
+    print(f"SKIP: kipy is not importable ({type(_e).__name__}: {_e}); install "
+          f"kicad-python, which requirements.txt lists on this branch")
+    sys.exit(77)
+
 from kicad_parser import (
     _kipy_pad_polygon_points, _attach_custom_pad_polygons, Pad,
 )
