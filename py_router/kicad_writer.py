@@ -1175,8 +1175,12 @@ def add_tracks_and_vias_to_pcb(input_path: str, output_path: str,
         for via_to_remove in remove_vias:
             x, y = via_to_remove['x'], via_to_remove['y']
             want_net = via_to_remove.get('net_id')
+            # #1438: KiCad writes the via TYPE as a bare keyword after the
+            # head -- `(via blind`, `(via buried`, `(via micro` -- so a
+            # head-then-newline pattern left every non-through via in place.
             pattern = re.compile(
-                rf'\t\(via\s*\n\s*\(at\s+{_num_pat(x)}\s+{_num_pat(y)}\)[\s\S]*?\n\t\)')
+                r'\t\(via(?:[ \t]+(?:blind|buried|micro|through))?[ \t]*\r?\n'
+                rf'\s*\(at\s+{_num_pat(x)}\s+{_num_pat(y)}\)[\s\S]*?\n\t\)')
             for m in pattern.finditer(content):
                 block = m.group(0)
                 # Net gate (was net-blind): never delete a DIFFERENT net's via
@@ -1543,6 +1547,41 @@ def swap_segment_nets_at_positions(content: str, positions: set,
     return result, count
 
 
+def _sexpr_block_end(content: str, start: int) -> int:
+    """Index just past the balanced s-expression opening at ``start``.
+
+    Quote-aware AND escape-aware (#1440): KiCad writes a quote inside a
+    string as ``\\"``, and a scan that took that quote as the closing
+    delimiter flipped in/out of string state for the rest of the block, so a
+    ``(`` in such a net name swallowed the NEXT block into this one. Returns
+    ``len(content)`` when the block never closes.
+    """
+    n = len(content)
+    depth = 0
+    in_str = False
+    esc = False
+    k = start
+    while k < n:
+        ch = content[k]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                return k + 1
+        k += 1
+    return n
+
+
 def assert_balanced_sexpr(text: str, label: str = 'board'):
     """#523 backstop: refuse to write a structurally broken board.
 
@@ -1661,24 +1700,7 @@ def remove_segments_from_content(content: str, segments: List,
             out.append(content[pos:])
             break
         out.append(content[pos:j])
-        depth = 0
-        in_str = False
-        k = j
-        while k < n:
-            ch = content[k]
-            if in_str:
-                if ch == '"':
-                    in_str = False
-            elif ch == '"':
-                in_str = True
-            elif ch == '(':
-                depth += 1
-            elif ch == ')':
-                depth -= 1
-                if depth == 0:
-                    k += 1
-                    break
-            k += 1
+        k = _sexpr_block_end(content, j)
         block = content[j:k]
         ms, me, ml = start_re.search(block), end_re.search(block), layer_re.search(block)
         keep = True
@@ -1768,24 +1790,7 @@ def remove_vias_from_content(content: str, vias: List,
             out.append(content[pos:])
             break
         out.append(content[pos:j])
-        depth = 0
-        in_str = False
-        k = j
-        while k < n:
-            ch = content[k]
-            if in_str:
-                if ch == '"':
-                    in_str = False
-            elif ch == '"':
-                in_str = True
-            elif ch == '(':
-                depth += 1
-            elif ch == ')':
-                depth -= 1
-                if depth == 0:
-                    k += 1
-                    break
-            k += 1
+        k = _sexpr_block_end(content, j)
         block = content[j:k]
         ma = at_re.search(block)
         keep = True
