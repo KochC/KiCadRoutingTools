@@ -57,17 +57,10 @@ def move_copper_text_to_silkscreen(content: str) -> str:
         if start == -1:
             break
 
-        # Find the matching closing paren by counting nesting
-        depth = 0
-        end = start
-        for j in range(start, len(content)):
-            if content[j] == '(':
-                depth += 1
-            elif content[j] == ')':
-                depth -= 1
-                if depth == 0:
-                    end = j + 1
-                    break
+        # Find the matching closing paren. #1437: string-aware -- a text
+        # like "note :(" used to be counted as nesting, the block swallowed
+        # the items after it, and their copper (layer ...) went to silk.
+        end = _sexpr_block_end(content, start)
 
         # Extract the gr_text block
         block = content[start:end]
@@ -1478,6 +1471,14 @@ def modify_segment_layers(content: str, segment_mods: List[Dict],
     return result, count
 
 
+# #1439: a locked segment is spelled `(segment locked (start ...` (bare head,
+# older files) or with a `(locked)` / `(locked yes)` child after `(width ...)`.
+# The swap's head pattern allowed neither, so locked copper silently kept its
+# old net. Same forms kicad_parser accepts.
+_SEG_LOCK_HEAD = r'(?:\s+locked)?'
+_SEG_LOCK_CHILD = r'(?:\(locked(?:\s+(?:yes|no|true|false))?\s*\)\s+)?'
+
+
 def swap_segment_nets_at_positions(content: str, positions: set,
                                    old_net_id: int, new_net_id: int,
                                    layer: str = None,
@@ -1503,10 +1504,10 @@ def swap_segment_nets_at_positions(content: str, positions: set,
 
     if use_names:
         # KiCad 10: match (net "name")
-        segment_pattern = r'\(segment\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\)\s+\(width[^)]*\)\s+\(layer\s+"?([^")]+)"?\).*?\(net\s+"((?:[^"\\]|\\.)*)"\)'
+        segment_pattern = r'\(segment' + _SEG_LOCK_HEAD + r'\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\)\s+\(width[^)]*\)\s+' + _SEG_LOCK_CHILD + r'\(layer\s+"?([^")]+)"?\).*?\(net\s+"((?:[^"\\]|\\.)*)"\)'
     else:
         # KiCad 9: match (net <id>)
-        segment_pattern = r'\(segment\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\)\s+\(width[^)]*\)\s+\(layer\s+"?([^")]+)"?\).*?\(net\s+(\d+)\)'
+        segment_pattern = r'\(segment' + _SEG_LOCK_HEAD + r'\s+\(start\s+([\d.-]+)\s+([\d.-]+)\)\s+\(end\s+([\d.-]+)\s+([\d.-]+)\)\s+\(width[^)]*\)\s+' + _SEG_LOCK_CHILD + r'\(layer\s+"?([^")]+)"?\).*?\(net\s+(\d+)\)'
 
     count = 0
 
